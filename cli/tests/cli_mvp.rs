@@ -17,6 +17,7 @@ fn create_vault(dir: &Path) -> PathBuf {
     fs::create_dir_all(&home).unwrap();
     agentero()
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .args(["vault", "create", dir.to_str().unwrap(), "--json"])
         .assert()
         .success()
@@ -96,6 +97,7 @@ fn vault_create_and_list() {
 
     let list = agentero()
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .args(["vault", "list", "--json"])
         .assert()
         .success()
@@ -127,6 +129,7 @@ fn describe_lists_ops_and_resolves_one() {
     let ops = v["data"]["ops"].as_array().unwrap();
     assert!(ops.iter().any(|o| o["id"] == "paper.list"));
     assert!(ops.iter().any(|o| o["id"] == "layout.list"));
+    assert!(ops.iter().any(|o| o["id"] == "paper.notes.fetch"));
     assert!(ops.iter().any(|o| o["mcpTool"] == "paper_list"));
 
     let one = agentero()
@@ -201,6 +204,35 @@ fn paper_list_empty_and_set_read_not_found() {
         .assert()
         .failure()
         .stdout(predicate::str::contains("paper_not_found"));
+}
+
+#[test]
+fn paper_notes_fetch_requires_notes_md() {
+    let tmp = tempdir().unwrap();
+    let vault = tmp.path().join("v");
+    create_vault(&vault);
+    fs::create_dir_all(vault.join("papers").join("demo")).unwrap();
+    seed_paper(&vault, "papers/demo", "demo", "Demo Paper");
+
+    // No NOTES.md means no network: fetch_notes rejects before resolving.
+    let out = agentero()
+        .args([
+            "--vault",
+            vault.to_str().unwrap(),
+            "paper",
+            "notes",
+            "fetch",
+            "papers/demo",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["ok"], false);
+    assert!(v["error"]["message"].as_str().unwrap().contains("NOTES.md"));
 }
 
 #[test]
@@ -859,6 +891,86 @@ fn paper_move_cross_vault_migrates_directory_and_catalog() {
     assert_eq!(dst_list["data"][0]["id"], "demo");
 }
 
+#[test]
+fn paper_add_links_inside_one_vault_and_copies_across_vaults() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dst = tmp.path().join("dst");
+    create_vault(&src);
+    create_vault(&dst);
+    fs::create_dir_all(src.join("papers/inbox/demo")).unwrap();
+    fs::write(src.join("papers/inbox/demo/NOTES.md"), "# Demo\n").unwrap();
+    fs::write(src.join("papers/inbox/demo/paper.pdf"), "pdf-bytes").unwrap();
+    seed_paper(&src, "papers/inbox/demo", "demo", "Demo");
+
+    let linked = agentero()
+        .args([
+            "--vault",
+            src.to_str().unwrap(),
+            "paper",
+            "add",
+            "papers/inbox/demo",
+            "papers/archive",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let linked: Value = serde_json::from_slice(&linked).unwrap();
+    assert_eq!(linked["data"]["mode"], "link");
+    assert_eq!(linked["data"]["newRel"], "papers/archive/demo");
+    assert!(src.join("papers/inbox/demo/NOTES.md").is_file());
+    assert_eq!(
+        fs::read_to_string(src.join("papers/archive/demo/NOTES.md")).unwrap(),
+        "# Demo\n"
+    );
+
+    let copied = agentero()
+        .args([
+            "paper",
+            "add",
+            src.join("papers/inbox/demo").to_str().unwrap(),
+            dst.join("papers/shelf").to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let copied: Value = serde_json::from_slice(&copied).unwrap();
+    assert_eq!(copied["data"]["mode"], "copy");
+    assert_eq!(copied["data"]["newRel"], "papers/shelf/demo");
+    assert_eq!(
+        fs::read_to_string(dst.join("papers/shelf/demo/paper.pdf")).unwrap(),
+        "pdf-bytes"
+    );
+    assert_eq!(
+        fs::read_to_string(src.join("papers/inbox/demo/paper.pdf")).unwrap(),
+        "pdf-bytes"
+    );
+
+    let conflict = agentero()
+        .args([
+            "--vault",
+            src.to_str().unwrap(),
+            "paper",
+            "add",
+            "papers/inbox/demo",
+            "papers/archive",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let conflict = String::from_utf8(conflict).unwrap();
+    assert!(conflict.contains("papers/archive/demo"), "{conflict}");
+}
+
 /// #166: create missing destination parent, reject conflict and path escape.
 #[test]
 fn paper_move_creates_parent_rejects_conflict_and_escape() {
@@ -973,6 +1085,161 @@ fn open_path_shorthand_and_explicit_dry_run() {
         .assert()
         .failure()
         .stdout(predicate::str::contains("does not exist"));
+}
+
+#[test]
+fn paper_open_dry_run_resolves_ref() {
+    let tmp = tempdir().unwrap();
+    let vault = tmp.path().join("v");
+    create_vault(&vault);
+    let paper = vault.join("papers/demo");
+    fs::create_dir_all(&paper).unwrap();
+    fs::write(paper.join("NOTES.md"), "# Demo\n").unwrap();
+    seed_paper(&vault, "papers/demo", "demo", "Demo Paper");
+
+    let out = agentero()
+        .env("AGENTERO_OPEN_DRY_RUN", "1")
+        .args([
+            "--vault",
+            vault.to_str().unwrap(),
+            "paper",
+            "open",
+            "demo",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["data"]["dryRun"], true);
+    assert_eq!(v["data"]["action"], "open-paper");
+    assert_eq!(v["data"]["path"], "papers/demo");
+    assert!(v["data"]["url"]
+        .as_str()
+        .unwrap()
+        .starts_with("agentero://ui?action=open-paper"));
+
+    agentero()
+        .env("AGENTERO_OPEN_DRY_RUN", "1")
+        .args([
+            "--vault",
+            vault.to_str().unwrap(),
+            "paper",
+            "open",
+            "nope",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("paper_not_found"));
+}
+
+#[test]
+fn ui_open_and_window_dry_run() {
+    let tmp = tempdir().unwrap();
+    let vault = tmp.path().join("v");
+    create_vault(&vault);
+    fs::create_dir_all(vault.join("notes")).unwrap();
+    fs::write(vault.join("notes/idea.md"), "# Idea\n").unwrap();
+
+    let out = agentero()
+        .env("AGENTERO_OPEN_DRY_RUN", "1")
+        .args([
+            "--vault",
+            vault.to_str().unwrap(),
+            "ui",
+            "open",
+            "notes/idea.md",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["data"]["action"], "open-path");
+    assert_eq!(v["data"]["path"], "notes/idea.md");
+
+    let out = agentero()
+        .env("AGENTERO_OPEN_DRY_RUN", "1")
+        .args(["ui", "window", "agent", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["data"]["action"], "open-window");
+    assert_eq!(v["data"]["window"], "agent");
+
+    // Unknown window is rejected before touching the App.
+    agentero()
+        .env("AGENTERO_OPEN_DRY_RUN", "1")
+        .args(["ui", "window", "nope", "--json"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("unknown window"));
+
+    // Split with no path → active pane; direction defaults to right.
+    let out = agentero()
+        .env("AGENTERO_OPEN_DRY_RUN", "1")
+        .args(["--vault", vault.to_str().unwrap(), "ui", "split", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["data"]["action"], "split");
+    assert_eq!(v["data"]["direction"], "right");
+    assert!(v["data"]["path"].is_null());
+
+    // Split a path down beside a reference panel.
+    let out = agentero()
+        .env("AGENTERO_OPEN_DRY_RUN", "1")
+        .args([
+            "--vault",
+            vault.to_str().unwrap(),
+            "ui",
+            "split",
+            "papers/demo",
+            "--direction",
+            "down",
+            "--reference",
+            "papers/other",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["data"]["action"], "split");
+    assert_eq!(v["data"]["direction"], "below");
+    assert_eq!(v["data"]["path"], "papers/demo");
+    assert_eq!(v["data"]["reference"], "papers/other");
+
+    // Bad direction is rejected before touching the App.
+    agentero()
+        .env("AGENTERO_OPEN_DRY_RUN", "1")
+        .args([
+            "--vault",
+            vault.to_str().unwrap(),
+            "ui",
+            "split",
+            "papers/demo",
+            "--direction",
+            "sideways",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("unsupported split direction"));
 }
 
 #[test]
@@ -1892,4 +2159,73 @@ fn import_pdf_single_and_batch() {
     let v: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(v["ok"], false);
     assert_eq!(v["error"]["code"], "import_failed");
+}
+
+#[test]
+fn paper_set_meta_updates_catalog_and_metadata_json() {
+    let tmp = tempdir().unwrap();
+    let vault = tmp.path().join("v");
+    create_vault(&vault);
+
+    let paper = vault.join("papers").join("demo");
+    fs::create_dir_all(&paper).unwrap();
+    fs::write(paper.join("NOTES.md"), "# Demo\n").unwrap();
+    seed_paper(&vault, "papers/demo", "demo", "Demo Paper");
+
+    // 1. Update metadata fields via set-meta
+    let out = agentero()
+        .args([
+            "--vault",
+            vault.to_str().unwrap(),
+            "paper",
+            "set-meta",
+            "papers/demo",
+            "--publication",
+            "NeurIPS 2024",
+            "--date",
+            "2024-08-14",
+            "--doi",
+            "10.1234/demo.2024",
+            "--authors",
+            "Alice, Bob",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["data"]["publication"], "NeurIPS 2024");
+    assert_eq!(v["data"]["date"], "2024-08-14");
+    assert_eq!(v["data"]["doi"], "10.1234/demo.2024");
+    assert_eq!(v["data"]["meta_source"], "manual");
+
+    // Verify sidecar metadata.json written
+    let meta_json_path = paper.join("metadata.json");
+    assert!(meta_json_path.is_file());
+    let meta_file: Value =
+        serde_json::from_str(&fs::read_to_string(&meta_json_path).unwrap()).unwrap();
+    assert_eq!(meta_file["publication"], "NeurIPS 2024");
+    assert_eq!(meta_file["doi"], "10.1234/demo.2024");
+
+    // 2. Error case: no fields specified
+    let out = agentero()
+        .args([
+            "--vault",
+            vault.to_str().unwrap(),
+            "paper",
+            "set-meta",
+            "papers/demo",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "message");
 }

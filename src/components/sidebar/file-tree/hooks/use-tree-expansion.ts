@@ -12,8 +12,9 @@ import {
 	useRef,
 	useState,
 } from "react";
-import { isPaperDirectory, isUnderPaperAttachments } from "@/lib/paper";
+import { isPaperDirectory, paperSurfacesChildPath } from "@/lib/paper";
 import type { FileNode } from "@/lib/vault";
+import { adjustAgentRevealAncestors } from "@/lib/vault/agent-tree";
 import {
 	ancestorPaths,
 	collectDefaultExpanded,
@@ -206,7 +207,11 @@ export function useTreeExpansion({
 	const expandAncestorsOf = useCallback(
 		(target: string) => {
 			if (isVirtualTreePath(target)) return;
-			const parents = ancestorPaths(target, vaultPath);
+			const parents = adjustAgentRevealAncestors(
+				target,
+				vaultPath,
+				ancestorPaths(target, vaultPath),
+			);
 			if (parents.length === 0) return;
 			setExpanded((prev) => {
 				let changed = false;
@@ -214,10 +219,11 @@ export function useTreeExpansion({
 				for (const parent of parents) {
 					const node = byPathKey.get(pathKey(parent));
 					if (node?.kind !== "directory") continue;
-					// Papers stay collapsed unless we are revealing an attachment.
+					// Papers stay collapsed unless we are revealing a surfaced child
+					// (root Markdown/HTML note or an attachment).
 					if (
 						isPaperDirectory(node.path, node.children) &&
-						!isUnderPaperAttachments(target, node.path)
+						!paperSurfacesChildPath(target, node)
 					) {
 						continue;
 					}

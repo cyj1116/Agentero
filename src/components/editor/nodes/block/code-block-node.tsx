@@ -2,7 +2,7 @@
 "use client";
 
 import { common } from "lowlight";
-import { CheckIcon, CopyIcon } from "lucide-react";
+import { CheckIcon, CopyIcon, PencilIcon, WorkflowIcon } from "lucide-react";
 import { NodeApi, type TCodeBlockElement, type TCodeSyntaxLeaf } from "platejs";
 import {
 	PlateElement,
@@ -12,9 +12,12 @@ import {
 	useEditorRef,
 	useElement,
 	useReadOnly,
+	useSelected,
 } from "platejs/react";
 import * as React from "react";
 import { useTranslation } from "react-i18next";
+import { useMarkdownExportMode } from "@/components/editor/markdown-export-mode-context";
+import { MermaidDiagram } from "@/components/markdown/mermaid-diagram";
 import {
 	Command,
 	CommandEmpty,
@@ -81,7 +84,7 @@ function CodeLanguageSelect() {
 						type="button"
 						aria-label={t("codeBlock.languageLabel")}
 						className={cn(
-							"flex h-6 items-center rounded-md bg-background/80 px-1.5 font-mono text-xs text-muted-foreground opacity-0 backdrop-blur transition-opacity hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none group-focus-within:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100",
+							"flex h-6 items-center rounded-md bg-background px-1.5 font-mono text-xs text-muted-foreground opacity-0 transition-opacity hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none group-focus-within:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100",
 						)}
 					>
 						{label}
@@ -90,7 +93,20 @@ function CodeLanguageSelect() {
 				<PopoverContent
 					align="end"
 					className="w-48 p-0"
-					onOpenAutoFocus={(e) => e.preventDefault()}
+					onOpenAutoFocus={(event) => {
+						// Keep the editor selection, then focus the language search
+						// so "Plain text" / 纯文本 opens ready to filter.
+						event.preventDefault();
+						const root = event.currentTarget;
+						if (!(root instanceof HTMLElement)) return;
+						const focusSearch = () => {
+							root
+								.querySelector<HTMLElement>("[data-slot='command-input']")
+								?.focus();
+						};
+						focusSearch();
+						window.requestAnimationFrame(focusSearch);
+					}}
 				>
 					<Command value={value}>
 						<CommandInput placeholder={t("codeBlock.search")} />
@@ -176,7 +192,7 @@ function CopyCodeButton({ element }: { element: TCodeBlockElement }) {
 							aria-label={t("codeBlock.copy")}
 							onClick={onCopy}
 							className={cn(
-								"flex size-6 items-center justify-center rounded-md bg-background/80 text-muted-foreground opacity-0 backdrop-blur transition-opacity hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none group-focus-within:opacity-100 group-hover:opacity-100",
+								"flex size-6 items-center justify-center rounded-md bg-background text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none group-focus-within:opacity-100 group-hover:opacity-100",
 							)}
 						>
 							{copied ? (
@@ -193,85 +209,88 @@ function CopyCodeButton({ element }: { element: TCodeBlockElement }) {
 	);
 }
 
-function MermaidPreview({ source }: { source: string }) {
+function MermaidModeButton({
+	showSource,
+	onEdit,
+	onPreview,
+}: {
+	showSource: boolean;
+	onEdit: () => void;
+	onPreview: () => void;
+}) {
 	const { t } = useTranslation("editor");
-	const previewId = React.useId().replace(/:/g, "");
-	const [svg, setSvg] = React.useState<string | null>(null);
-	const [renderError, setRenderError] = React.useState(false);
-	const renderVersionRef = React.useRef(0);
-
-	React.useEffect(() => {
-		const sourceText = source.trim();
-		const renderVersion = ++renderVersionRef.current;
-		if (!sourceText) {
-			setSvg(null);
-			setRenderError(false);
-			return;
-		}
-
-		let cancelled = false;
-		const timeout = window.setTimeout(() => {
-			void (async () => {
-				try {
-					// Mermaid drags in a multi-MB bundle, so it stays out of the editor
-					// chunk — notes without diagrams never pay for it.
-					const { mermaid } = await import("@streamdown/mermaid");
-					const result = await mermaid
-						.getMermaid()
-						.render(
-							`agentero-mermaid-${previewId}-${renderVersion}`,
-							sourceText,
-						);
-					if (cancelled || renderVersionRef.current !== renderVersion) return;
-					setSvg(result.svg);
-					setRenderError(false);
-				} catch {
-					if (cancelled || renderVersionRef.current !== renderVersion) return;
-					setSvg(null);
-					setRenderError(true);
-				}
-			})();
-		}, 160);
-
-		return () => {
-			cancelled = true;
-			window.clearTimeout(timeout);
-		};
-	}, [previewId, source]);
-
-	if (!svg && !renderError) return null;
+	const label = showSource
+		? t("codeBlock.showDiagram")
+		: t("codeBlock.editSource");
 
 	return (
-		<div
-			className="border-border/40 border-t bg-background/30 px-4 py-3 [&_svg]:mx-auto [&_svg]:h-auto [&_svg]:max-w-full"
-			contentEditable={false}
-		>
-			{svg ? (
-				<MermaidSvg svg={svg} label={t("codeBlock.mermaidPreview")} />
-			) : (
-				<p className="m-0 text-muted-foreground text-xs">
-					{t("codeBlock.mermaidPreviewError")}
-				</p>
-			)}
+		<div contentEditable={false}>
+			<TooltipProvider delayDuration={300}>
+				<Tooltip>
+					<TooltipTrigger asChild>
+						<button
+							type="button"
+							aria-label={label}
+							onClick={showSource ? onPreview : onEdit}
+							onMouseDown={(event) => {
+								// Keep the editor's focus: the caret is moved into the code
+								// block by the click handler, not by this button.
+								event.preventDefault();
+							}}
+							className="flex size-6 items-center justify-center rounded-md bg-background text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none group-focus-within:opacity-100 group-hover:opacity-100"
+						>
+							{showSource ? (
+								<WorkflowIcon className="size-3.5" />
+							) : (
+								<PencilIcon className="size-3.5" />
+							)}
+						</button>
+					</TooltipTrigger>
+					<TooltipContent>{label}</TooltipContent>
+				</Tooltip>
+			</TooltipProvider>
 		</div>
 	);
 }
 
-function MermaidSvg({ svg, label }: { svg: string; label: string }) {
+function MermaidPreview({ source }: { source: string }) {
+	const { t } = useTranslation("editor");
+	const exportMode = useMarkdownExportMode();
+
 	return (
-		<div
-			aria-label={label}
-			dangerouslySetInnerHTML={{ __html: svg }}
-			role="img"
-		/>
+		<div className="bg-background py-2" contentEditable={false}>
+			<MermaidDiagram
+				defer={!exportMode}
+				errorLabel={t("codeBlock.mermaidPreviewError")}
+				label={t("codeBlock.mermaidPreview")}
+				source={source}
+			/>
+		</div>
 	);
 }
 
 export function CodeBlockElement(props: PlateElementProps<TCodeBlockElement>) {
+	const editor = useEditorRef();
+	const readOnly = useReadOnly();
+	const selected = useSelected();
 	const isMermaid = props.element.lang?.toLowerCase() === "mermaid";
 	const source = isMermaid
 		? props.element.children.map((line) => NodeApi.string(line)).join("\n")
 		: "";
+	// Mermaid blocks read as diagrams: the source only appears while the block
+	// itself is being edited, so notes are not dominated by diagram code.
+	const showSource = !isMermaid || (!readOnly && selected);
+
+	const startEditing = React.useCallback(() => {
+		const at = editor.api.end(props.path);
+		if (!at) return;
+		editor.tf.select({ anchor: at, focus: at });
+		editor.tf.focus({ at: { anchor: at, focus: at } });
+	}, [editor, props.path]);
+
+	const showDiagram = React.useCallback(() => {
+		editor.tf.deselect();
+	}, [editor]);
 
 	return (
 		// Constrain width so long lines overflow inside <pre> (scroll), not the editor.
@@ -280,18 +299,35 @@ export function CodeBlockElement(props: PlateElementProps<TCodeBlockElement>) {
 		// input continue to the document scroller. whitespace-pre overrides editor
 		// break-spaces.
 		<PlateElement className="max-w-full min-w-0 py-1" {...props}>
-			<div className="agentero-codeblock group relative max-w-full min-w-0 overflow-hidden rounded-md bg-muted/50">
+			<div
+				className={cn(
+					"agentero-codeblock group relative max-w-full min-w-0 overflow-hidden rounded-md",
+					showSource ? "bg-muted/50" : "bg-background",
+				)}
+			>
 				<div
 					contentEditable={false}
 					className="absolute top-1.5 right-1.5 z-10 flex items-center gap-1"
 				>
+					{isMermaid && !readOnly ? (
+						<MermaidModeButton
+							onEdit={startEditing}
+							onPreview={showDiagram}
+							showSource={showSource}
+						/>
+					) : null}
 					<CodeLanguageSelect />
 					<CopyCodeButton element={props.element} />
 				</div>
-				<pre className="agentero-scroll-both agentero-scroll-x-only max-w-full overflow-x-auto p-4 font-mono text-sm leading-[normal] whitespace-pre [tab-size:2]">
+				<pre
+					className={cn(
+						"agentero-scroll-both agentero-scroll-x-only max-w-full overflow-x-auto p-4 font-mono text-sm leading-[normal] whitespace-pre [tab-size:2]",
+						!showSource && "hidden",
+					)}
+				>
 					<code className="block w-max min-w-full">{props.children}</code>
 				</pre>
-				{isMermaid ? <MermaidPreview source={source} /> : null}
+				{isMermaid && !showSource ? <MermaidPreview source={source} /> : null}
 			</div>
 		</PlateElement>
 	);

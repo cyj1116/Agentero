@@ -1,6 +1,5 @@
 "use client";
 
-import { MarkdownPlugin } from "@platejs/markdown";
 import { ImagePlugin } from "@platejs/media/react";
 import { Plate, usePlateEditor } from "platejs/react";
 import { memo, useMemo } from "react";
@@ -9,7 +8,7 @@ import { Editor } from "@/components/editor/editor-surface";
 import { WikiEmbedProjectionProvider } from "@/components/editor/embeds/projection-context";
 import { ImageElement } from "@/components/editor/nodes/block/image-node";
 import { MarkdownEditorKit } from "@/components/editor/plugins/markdown-editor-kit";
-import { prepareMarkdownForDeserialize } from "@/lib/markdown/deserialize";
+import { deserializeMarkdownBody } from "@/lib/markdown/deserialize-md";
 import { splitFrontmatter } from "@/lib/markdown/frontmatter";
 
 export const EmbeddedMarkdownProjection = memo(
@@ -28,9 +27,7 @@ export const EmbeddedMarkdownProjection = memo(
 			plugins,
 			value: (currentEditor) => {
 				const { body } = splitFrontmatter(markdown);
-				return currentEditor
-					.getApi(MarkdownPlugin)
-					.markdown.deserialize(prepareMarkdownForDeserialize(body || " "));
+				return deserializeMarkdownBody(currentEditor, body);
 			},
 		});
 
@@ -40,7 +37,8 @@ export const EmbeddedMarkdownProjection = memo(
 					<Plate editor={editor}>
 						<Editor
 							readOnly
-							className="min-h-0 w-full min-w-0 cursor-default break-words px-4 pt-2 pb-3 text-sm leading-relaxed [&>*:first-child]:mt-0"
+							className="min-h-0 w-full min-w-0 cursor-default break-words px-4 pt-2 pb-3 leading-relaxed [&>*:first-child]:mt-0"
+							style={{ fontSize: "var(--wiki-embed-font-size, 13px)" }}
 						/>
 					</Plate>
 				</MarkdownDocProvider>

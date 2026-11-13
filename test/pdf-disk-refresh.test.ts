@@ -26,6 +26,10 @@ vi.mock("@/lib/core/notify", () => ({
 }));
 
 // Import after the mocks: applyDiskChange reads through the mocked barrels.
+import {
+	clearBookmarkWrites,
+	noteBookmarkWrite,
+} from "@/lib/pdf/bookmark-echo";
 import { applyDiskChange } from "@/lib/workspace/actions";
 
 const PDF_PATH = "/Users/philfan/l/paper/plans/a.pdf";
@@ -77,81 +81,93 @@ describe("applyDiskChange pdf panes", () => {
 	beforeEach(() => {
 		readVaultFileMock.mockReset();
 		localFileToArrayBufferMock.mockReset();
+		clearBookmarkWrites();
 	});
 
+	/** Observed DiskChangeSink double: applies transforms to a local tab list. */
+	function makeSink(initial: DocTab[]) {
+		let tabs = initial;
+		const updateTabs = vi.fn((update: (prev: DocTab[]) => DocTab[]) => {
+			tabs = update(tabs);
+		});
+		return { getTabs: () => tabs, updateTabs };
+	}
+
 	it("re-reads the file and refreshes an open pdf pane", async () => {
-		const tab = makePdfTab(PDF_PATH);
-		const sink = {
-			getTabs: () => [tab],
-			refreshNotes: vi.fn(),
-			refreshMarkdown: vi.fn(),
-			refreshExcalidraw: vi.fn(),
-			refreshText: vi.fn(),
-			refreshPdf: vi.fn(),
-		};
+		const sink = makeSink([makePdfTab(PDF_PATH)]);
 		const bytes = new ArrayBuffer(16);
 		localFileToArrayBufferMock.mockResolvedValue(bytes);
 
 		await applyDiskChange(PDF_PATH, sink);
 
 		expect(localFileToArrayBufferMock).toHaveBeenCalledWith(PDF_PATH);
-		expect(sink.refreshPdf).toHaveBeenCalledWith(PDF_PATH, bytes);
+		expect(sink.updateTabs).toHaveBeenCalledTimes(1);
+		expect(sink.getTabs()[0]?.pdfBytes).toBe(bytes);
 		// No text editor owns the path: no UTF-8 read should happen.
 		expect(readVaultFileMock).not.toHaveBeenCalled();
 	});
 
-	it("keeps text reseeds working next to the pdf refresh", async () => {
-		const tab = makePdfTab(PDF_PATH);
+	it("skips the utf-8 read when no text tab owns the path", async () => {
 		const mdTab = {
 			...createPlaceholderTab("/vault/notes.md", "markdown"),
 			loaded: true,
 		};
-		const sink = {
-			getTabs: () => [tab, mdTab],
-			refreshNotes: vi.fn(),
-			refreshMarkdown: vi.fn(),
-			refreshExcalidraw: vi.fn(),
-			refreshText: vi.fn(),
-			refreshPdf: vi.fn(),
-		};
-		localFileToArrayBufferMock.mockResolvedValue(new ArrayBuffer(4));
+		const sink = makeSink([makePdfTab(PDF_PATH), mdTab]);
+		const bytes = new ArrayBuffer(4);
+		localFileToArrayBufferMock.mockResolvedValue(bytes);
 		readVaultFileMock.mockResolvedValue("# fresh");
 
 		await applyDiskChange(PDF_PATH, sink);
 
-		expect(sink.refreshPdf).toHaveBeenCalledTimes(1);
+		// Only the pdf transform lands; the markdown tab owns another path.
+		expect(sink.updateTabs).toHaveBeenCalledTimes(1);
+		expect(sink.getTabs()[0]?.pdfBytes).toBe(bytes);
+		expect(readVaultFileMock).not.toHaveBeenCalled();
 	});
 
-	it("does nothing when the byte read fails", async () => {
-		const tab = makePdfTab(PDF_PATH);
-		const sink = {
-			getTabs: () => [tab],
-			refreshNotes: vi.fn(),
-			refreshMarkdown: vi.fn(),
-			refreshExcalidraw: vi.fn(),
-			refreshText: vi.fn(),
-			refreshPdf: vi.fn(),
-		};
-		localFileToArrayBufferMock.mockResolvedValue(null);
-
-		await applyDiskChange(PDF_PATH, sink);
-
-		expect(sink.refreshPdf).not.toHaveBeenCalled();
-	});
-
-	it("ignores changes while no pdf pane is open", async () => {
-		const sink = {
-			getTabs: () => [makePdfTab("/vault/other.pdf")],
-			refreshNotes: vi.fn(),
-			refreshMarkdown: vi.fn(),
-			refreshExcalidraw: vi.fn(),
-			refreshText: vi.fn(),
-			refreshPdf: vi.fn(),
-		};
+	it("does not reload a pdf pane for this editor's own bookmark write", async () => {
+		const sink = makeSink([makePdfTab(PDF_PATH)]);
+		const previous = sink.getTabs()[0]?.pdfBytes;
+		noteBookmarkWrite(PDF_PATH);
 
 		await applyDiskChange(PDF_PATH, sink);
 
 		expect(localFileToArrayBufferMock).not.toHaveBeenCalled();
-		expect(sink.refreshPdf).not.toHaveBeenCalled();
+		expect(sink.updateTabs).not.toHaveBeenCalled();
+		expect(sink.getTabs()[0]?.pdfBytes).toBe(previous);
+	});
+
+	it("does nothing when the byte read fails", async () => {
+		const sink = makeSink([makePdfTab(PDF_PATH)]);
+		localFileToArrayBufferMock.mockResolvedValue(null);
+
+		await applyDiskChange(PDF_PATH, sink);
+
+		expect(sink.updateTabs).not.toHaveBeenCalled();
+	});
+
+	it("ignores changes while no pdf pane is open", async () => {
+		const sink = makeSink([makePdfTab("/vault/other.pdf")]);
+
+		await applyDiskChange(PDF_PATH, sink);
+
+		expect(localFileToArrayBufferMock).not.toHaveBeenCalled();
+		expect(sink.updateTabs).not.toHaveBeenCalled();
+	});
+
+	it("bumps a local html preview without reading the file as text", async () => {
+		const htmlPath = "/vault/notes/logic.html";
+		const tab = {
+			...createPlaceholderTab(htmlPath, "html"),
+			loaded: true,
+			htmlKey: 2,
+		};
+		const sink = makeSink([tab]);
+
+		await applyDiskChange(htmlPath, sink);
+
+		expect(sink.getTabs()[0]?.htmlKey).toBe(3);
+		expect(readVaultFileMock).not.toHaveBeenCalled();
+		expect(localFileToArrayBufferMock).not.toHaveBeenCalled();
 	});
 });

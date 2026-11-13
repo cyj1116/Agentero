@@ -49,6 +49,8 @@ export type UsePdfLayoutClusterOptions = {
 	paperKey: string | null;
 	/** Vault root passed to the Agent as its cwd. */
 	vaultPath: string | null;
+	/** Viewer PDF bytes; hashed into the reflow IR cache key. */
+	pdfBytes?: ArrayBuffer | null;
 	/** Layout capability value gates the auto-run effect; the ref is never a dep. */
 	layoutCap: LayoutCapability;
 	layoutCapRef: RefObject<LayoutCapability>;
@@ -67,7 +69,7 @@ export type UsePdfLayoutClusterOptions = {
 	plainViewer?: boolean;
 };
 
-export type PdfLayoutCluster = Omit<PdfLayoutRegions, "layoutDocRegions"> &
+export type PdfLayoutCluster = PdfLayoutRegions &
 	ReturnType<typeof usePdfLayoutRun> &
 	ReturnType<typeof usePdfVisualDraft> &
 	ReturnType<typeof usePdfLayoutTranslate> & {
@@ -90,6 +92,7 @@ export function usePdfLayoutCluster({
 	paperRelPath,
 	paperKey,
 	vaultPath,
+	pdfBytes,
 	layoutCap,
 	layoutCapRef,
 	docCap,
@@ -104,6 +107,7 @@ export function usePdfLayoutCluster({
 	// mutually exclusive hover cards) and the bulk-translate job.
 	const {
 		layoutOverlayVisible,
+		layoutDocRegions,
 		layoutRawRegions,
 		hoverableRegionsByPage,
 		rawRegionsByPage,
@@ -178,15 +182,32 @@ export function usePdfLayoutCluster({
 	const { screenPointForRegion } = usePdfVisualDraft({ hostRef });
 
 	const {
+		reflowBusy,
+		reflowReady,
+		reflowOutput,
+		exportTranslatedPdf,
 		layoutTranslateItemsByPage,
 		layoutTranslatePageStateByPage,
 		layoutTranslateRunning,
+		layoutTranslatePreparing,
 		layoutTranslateWaiting,
+		layoutTranslateQueued,
 		layoutTranslateActive,
 		layoutTranslateLabel,
+		layoutTranslatePendingRequired,
+		layoutTranslateFromCache,
+		layoutTranslateStatus,
+		layoutTranslatePartial,
+		layoutTranslateProgress,
+		layoutTranslatePageCounts,
 		toggleLayoutTranslate,
 		togglePageLayoutTranslate,
 	} = usePdfLayoutTranslate({
+		reflowContext: () => {
+			const engine = engineRef.current,
+				document = docCapRef.current?.getDocument(docId);
+			return engine && document ? { engine, document } : null;
+		},
 		docId,
 		layoutRawRegions,
 		translationPane,
@@ -194,14 +215,20 @@ export function usePdfLayoutCluster({
 		paperRelPath,
 		paperKey,
 		vaultPath,
+		pdfBytes,
 	});
 
 	return {
+		reflowBusy,
+		reflowReady,
+		reflowOutput,
+		exportTranslatedPdf,
 		layoutOverlayVisible,
 		layoutRawRegions,
 		hoverableRegionsByPage,
 		rawRegionsByPage,
 		startLayoutAnalysisRef,
+		layoutDocRegions,
 		layoutTaskRef,
 		handleAnalyzeLayout,
 		handleJumpToLayoutRegion,
@@ -210,9 +237,17 @@ export function usePdfLayoutCluster({
 		layoutTranslateItemsByPage,
 		layoutTranslatePageStateByPage,
 		layoutTranslateRunning,
+		layoutTranslatePreparing,
 		layoutTranslateWaiting,
+		layoutTranslateQueued,
 		layoutTranslateActive,
 		layoutTranslateLabel,
+		layoutTranslatePendingRequired,
+		layoutTranslateFromCache,
+		layoutTranslateStatus,
+		layoutTranslatePartial,
+		layoutTranslateProgress,
+		layoutTranslatePageCounts,
 		toggleLayoutTranslate,
 		togglePageLayoutTranslate,
 	};

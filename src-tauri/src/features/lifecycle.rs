@@ -5,7 +5,7 @@
 //! stable. This file keeps the desktop job events, which depend on the
 //! JobCenter snapshot types.
 //!
-//! @see docs/development/lifecycle-events.md
+//! @see docs/architecture.md
 
 pub use agentero_core::features::lifecycle::*;
 
@@ -27,6 +27,13 @@ pub const JOB_FAILED_EVENT: &str = "job:failed";
 struct JobEventPayload {
     job_id: String,
     kind: crate::features::jobs::JobKind,
+    /// Vault root as passed by the job's enqueuing caller (`JobSnapshot.vault_id`):
+    /// frontend-initiated jobs carry the exact `getVaultPath()` string, so
+    /// consumers can filter by active vault. Host-internal jobs (watcher /
+    /// recognize) carry the Host's own form, usually canonical — on Windows
+    /// that includes the `\\?\` prefix, so comparisons must tolerate both
+    /// spellings (see `docs/backend/api.md`, `job:completed`).
+    vault_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     paper_id: Option<String>,
     timestamp: i64,
@@ -54,7 +61,12 @@ pub fn emit_job_terminal(app: &AppHandle, job: &crate::features::jobs::JobSnapsh
     {
         if let Some(pid) = paper_id.as_deref() {
             let host_app = crate::features::host_hooks::wrap(app);
-            emit_paper_assets_ready(Some(&host_app), Path::new(&job.vault_path), pid);
+            emit_paper_assets_ready(
+                Some(&host_app),
+                Path::new(&job.vault_id),
+                pid,
+                job.paper_path.as_deref().unwrap_or(""),
+            );
         }
     }
     emit_or_log(
@@ -63,6 +75,7 @@ pub fn emit_job_terminal(app: &AppHandle, job: &crate::features::jobs::JobSnapsh
         JobEventPayload {
             job_id: job.id.clone(),
             kind: job.kind,
+            vault_id: job.vault_id.clone(),
             paper_id,
             timestamp: now_ms(),
             error,
@@ -95,6 +108,7 @@ mod events_contract_shape_tests {
             JobEventPayload {
                 job_id: "job-1".to_string(),
                 kind: JobKind::ParseBody,
+                vault_id: "/tmp/vault".to_string(),
                 paper_id: Some("paper-1".to_string()),
                 timestamp: 1_700_000_000_000,
                 error: Some("boom".to_string()),
@@ -102,6 +116,7 @@ mod events_contract_shape_tests {
             JobTerminalPayload {
                 job_id: "job-1".to_string(),
                 kind: JobKind::ParseBody,
+                vault_id: "/tmp/vault".to_string(),
                 paper_id: Some("paper-1".to_string()),
                 timestamp: 1_700_000_000_000,
                 error: Some("boom".to_string()),
@@ -140,6 +155,7 @@ mod events_contract_shape_tests {
         let (real, mirror) = samples();
         eq_type(&real.job_id, &mirror.job_id);
         eq_type(&real.kind, &mirror.kind);
+        eq_type(&real.vault_id, &mirror.vault_id);
         eq_type(&real.paper_id, &mirror.paper_id);
         eq_type(&real.timestamp, &mirror.timestamp);
         eq_type(&real.error, &mirror.error);

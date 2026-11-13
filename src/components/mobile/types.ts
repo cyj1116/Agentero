@@ -19,6 +19,7 @@ export type AgentPermissionRequest = {
 	title: string;
 	paths: string[];
 	options: AgentPermissionOption[];
+	host?: string | null;
 };
 
 export type AgentStreamEvent = {
@@ -55,6 +56,12 @@ export type AcpSessionInfo = {
 export type AcpListSessionsResult = {
 	sessions: AcpSessionInfo[];
 	supported: boolean;
+};
+
+export type AcpDeleteSessionResult = {
+	sessionId: string;
+	deletedOnAgent: boolean;
+	agentError?: string | null;
 };
 
 export type AcpHistoryLine = {

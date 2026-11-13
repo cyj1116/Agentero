@@ -4,17 +4,22 @@
 //! branch does not duplicate the common list.
 
 /// Commands available on every platform (including iOS).
-/// Desktop-only extras are appended by the caller.
+/// Desktop-only extras are appended by the caller; `$extra` stays a raw token
+/// stream so individual entries can carry `#[cfg(...)]` (e.g. features that
+/// need the desktop PDFium stack and are absent on mobile targets).
 macro_rules! common_commands {
-    ($($extra:path),* $(,)?) => {
+    ($($extra:tt)*) => {
         ::tauri::generate_handler![
             crate::features::system::settings::commands::settings_get,
             crate::features::system::settings::commands::settings_set,
             crate::features::system::settings::commands::network_system_proxy,
             crate::features::system::settings::commands::list_system_fonts,
             crate::features::system::settings::commands::easy_scholar_probe,
-            crate::features::system::settings::commands::easy_scholar_get_rank,
+            crate::features::system::settings::commands::institution_proxy_probe,
+            crate::features::system::settings::commands::institution_proxy_presets,
+            crate::features::system::settings::commands::institution_proxy_login_open,
             crate::features::system::builtin::builtin_provider_status,
+            crate::features::decision::commands::decision_gateway_decide,
             crate::features::paper::analyze::layout::model_assets::commands::layout_model_status,
             crate::features::paper::analyze::layout::hosted::commands::layout_remote_analyze_pdf,
             crate::features::paper::analyze::layout::hosted::commands::layout_remote_probe,
@@ -26,7 +31,6 @@ macro_rules! common_commands {
             crate::features::agent::commands::agent_ensure_catalog,
             crate::features::agent::commands::agent_remove_agent,
             crate::features::agent::commands::agent_set_default,
-            crate::features::agent::commands::agent_set_enabled,
             crate::features::agent::commands::agent_set_user_agent,
             crate::features::agent::commands::agent_probe,
             crate::features::agent::commands::agent_probe_catalog,
@@ -34,10 +38,14 @@ macro_rules! common_commands {
             crate::features::agent::commands::doctor_install_node,
             crate::features::agent::commands::doctor_check_agents,
             crate::features::system::network::commands::doctor_check_network,
+            crate::features::system::desktop_apps::commands::desktop_apps_probe,
+            crate::features::system::desktop_apps::commands::desktop_app_open,
             crate::features::agent::commands::agent_cancel_run,
             crate::features::jobs::commands::job_parse_refs_enqueue,
             crate::features::jobs::commands::job_parse_body_enqueue,
             crate::features::jobs::commands::job_layout_analyze_enqueue,
+            crate::features::jobs::commands::job_layout_translate_enqueue,
+            crate::features::jobs::commands::job_layout_translate_claim,
             crate::features::jobs::commands::job_download_assets_enqueue,
             crate::features::jobs::commands::job_import_enqueue,
             crate::features::jobs::commands::job_connector_sync_enqueue,
@@ -47,10 +55,12 @@ macro_rules! common_commands {
             crate::features::jobs::commands::job_model_download_enqueue,
             crate::features::jobs::commands::job_paper_assets_status,
             crate::features::jobs::commands::job_reconcile_paper,
-            crate::features::jobs::commands::job_reconcile_vault,
+            crate::features::jobs::commands::job_backfill_preview,
+            crate::features::jobs::commands::job_backfill_enqueue,
             crate::features::paper::ingest::commands::paper_ingest_reconcile,
             crate::features::jobs::commands::job_papers_needing_assets,
             crate::features::jobs::commands::job_focus_paper,
+            crate::features::jobs::commands::job_reorder,
             crate::features::jobs::commands::job_cancel,
             crate::features::jobs::commands::job_report,
             crate::features::jobs::commands::job_list,
@@ -66,7 +76,7 @@ macro_rules! common_commands {
             crate::features::markdown::wiki::commands::wiki_search,
             crate::features::markdown::wiki::commands::wiki_rename_heading,
             crate::features::markdown::wiki::commands::graph_rebuild,
-            crate::features::markdown::wiki::commands::wiki_cache_rebuild,
+            crate::features::markdown::wiki::commands::graph_apply_paths,
             crate::features::vault::doctor::commands::doctor_check,
             crate::features::vault::doctor::commands::doctor_apply_aliases,
             crate::features::vault::doctor::commands::doctor_ignore_aliases,
@@ -78,6 +88,7 @@ macro_rules! common_commands {
             crate::features::vault::commands::vault_create,
             crate::features::vault::commands::vault_ensure,
             crate::app::vault_session::fs_scope::vault_allow_fs_scope,
+            crate::app::vault_session::lifecycle::vault_hold,
             crate::app::vault_session::lifecycle::vault_release,
             crate::features::vault::commands::vault_tree_build,
             crate::features::vault::commands::vault_tree_children,
@@ -90,12 +101,12 @@ macro_rules! common_commands {
             crate::features::vault::trash::commands::path_purge_item,
             crate::features::vault::trash::commands::path_purge_trash,
             crate::features::translate::commands::translate_text,
+            crate::features::translate::layout_cache::layout_translate_cache_write,
             crate::features::paper::import::commands::lookup_import_batch,
+            crate::features::paper::import::commands::chat_import_extract,
             crate::features::paper::import::commands::skill_install,
             crate::features::paper::import::commands::skill_discard,
-            crate::features::paper::import::commands::paper_download_assets,
             crate::features::paper::import::commands::paper_import_local_pdf,
-            crate::features::paper::import::commands::paper_parse_body,
             crate::features::paper::import::commands::paper_resolve_identifier,
             crate::features::paper::import::commands::paper_stage_import_file,
             crate::features::paper::import::commands::notes_template_seed,
@@ -106,22 +117,32 @@ macro_rules! common_commands {
             crate::features::paper::analyze::refs::commands::library_citing_scan,
             crate::features::paper::discovery::coolpapers::commands::paper_coolpapers_notes,
             crate::features::paper::discovery::coolpapers::commands::paper_coolpapers_import,
+                        crate::features::paper::catalog::commands::catalog_list_properties,
+            crate::features::paper::catalog::commands::catalog_create_property,
+            crate::features::paper::catalog::commands::catalog_update_property,
+            crate::features::paper::catalog::commands::catalog_delete_property,
+            crate::features::paper::catalog::commands::catalog_set_paper_property,
+            crate::features::paper::catalog::commands::catalog_create_option_and_set,
+            crate::features::paper::catalog::commands::catalog_delete_property_option,
             crate::features::paper::catalog::commands::paper_open_bundle,
             crate::features::paper::catalog::commands::paper_get,
             crate::features::paper::catalog::commands::paper_list,
             crate::features::paper::catalog::commands::paper_move,
+            crate::features::paper::catalog::commands::paper_copy,
             crate::features::paper::catalog::commands::paper_repath,
             crate::features::paper::catalog::commands::paper_set_is_read,
             crate::features::paper::catalog::commands::paper_update_meta,
             crate::features::paper::catalog::commands::paper_set_tags,
+            crate::features::paper::catalog::commands::paper_sync_publication,
             crate::features::paper::catalog::commands::paper_rescan,
+            crate::features::paper::catalog::commands::paper_ensure_rows,
             crate::features::paper::catalog::commands::paper_page_counts,
             crate::features::paper::catalog::commands::paper_set_page_counts,
             crate::features::paper::catalog::commands::paper_reading_activity_batch,
             crate::features::markdown::search::commands::vault_search,
+            crate::features::markdown::tables::commands::research_table_list,
+            crate::features::markdown::tables::commands::research_table_backlinks,
             crate::core::usage::commands::activity_record_events,
-            crate::core::usage::commands::usage_list,
-            crate::core::usage::commands::usage_summary,
             crate::core::usage::commands::usage_clear,
             crate::app::logging::logs_clear,
             crate::features::paper::discovery::feeds::commands::feeds_list,
@@ -130,7 +151,9 @@ macro_rules! common_commands {
             crate::features::paper::discovery::feeds::commands::feeds_rename,
             crate::features::paper::discovery::feeds::commands::feeds_refresh,
             crate::features::paper::discovery::feeds::commands::feeds_items,
+            crate::features::paper::discovery::feeds::commands::feeds_set_read,
             crate::features::paper::discovery::feeds::commands::feeds_mark_imported,
+            crate::features::paper::discovery::pwc::commands::paper_pwc_import,
             crate::features::paper::discovery::scratch::plaza_scratch_prepare,
             crate::features::paper::discovery::scratch::plaza_scratch_stats,
             crate::features::paper::discovery::scratch::plaza_scratch_clear,
@@ -140,7 +163,8 @@ macro_rules! common_commands {
             crate::features::paper::discovery::recommend::commands::recommend_arxiv_last,
             crate::features::paper::discovery::recommend::commands::probe_embedding,
             crate::app::menu::set_locale,
-            $($extra),*
+            crate::app::menu::set_menu_shortcut_recording,
+            $($extra)*
         ]
     };
 }
@@ -150,6 +174,26 @@ pub fn attach_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<ta
     #[cfg(not(target_os = "ios"))]
     {
         builder.invoke_handler(common_commands![
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::integration::plugins::plugin_editor_state,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::integration::plugins::plugin_list,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::integration::plugins::plugin_inspect,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::integration::plugins::plugin_install,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::integration::plugins::plugin_configure,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::integration::plugins::plugin_remove,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::integration::plugins::plugin_activate,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::integration::plugins::plugin_dev_load,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::integration::plugins::plugin_unload,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::integration::plugins::plugin_run,
             crate::integration::bridge::commands::bridge_start,
             crate::integration::bridge::commands::bridge_stop,
             crate::integration::bridge::commands::bridge_status,
@@ -157,6 +201,9 @@ pub fn attach_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<ta
             crate::integration::bridge::commands::bridge_pair_respond,
             crate::integration::bridge::commands::bridge_devices,
             crate::integration::bridge::commands::bridge_revoke_device,
+            crate::features::zhihu::commands::zhihu_probe,
+            crate::features::zhihu::commands::zhihu_search,
+            crate::features::zhihu::commands::zhihu_question_draft,
             crate::features::agent::commands::agent_run_tool_lifecycle,
             crate::features::agent::commands::agent_run_partial_uninstall,
             crate::features::agent::commands::agent_lifecycle_cancel,
@@ -164,8 +211,12 @@ pub fn attach_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<ta
             crate::features::agent::commands::agent_run_once,
             crate::features::agent::commands::agent_list_sessions,
             crate::features::agent::commands::agent_load_session,
+            crate::features::agent::commands::agent_delete_session,
             crate::features::agent::commands::agent_warm,
+            crate::features::agent::commands::agent_pi_project_trust_status,
+            crate::features::agent::commands::agent_pi_project_trust_grant,
             crate::features::agent::commands::doctor_open_agent_login_terminal,
+            crate::features::agent::commands::doctor_open_agent_cli_terminal,
             crate::integration::remote::commands::remote_connect,
             crate::integration::remote::commands::remote_ssh_config_hosts,
             crate::integration::remote::commands::remote_disconnect,
@@ -182,12 +233,12 @@ pub fn attach_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<ta
             crate::integration::remote::commands::remote_paper_set_tags,
             crate::integration::remote::commands::remote_paper_set_is_read,
             crate::integration::remote::commands::remote_cache_file,
-            crate::integration::remote::commands::remote_cache_stats,
             crate::integration::remote::commands::remote_cache_clear,
             crate::features::agent::commands::remote_agent_scan,
             crate::features::agent::commands::remote_agent_probe,
             crate::features::agent::commands::remote_agent_open_install_terminal,
             crate::app::terminal::commands::path_open_in_terminal,
+            crate::app::terminal::commands::terminal_apps_probe,
             crate::app::window::commands::window_new,
             crate::app::window::commands::settings_window_open,
             crate::app::window::commands::feature_window_open,
@@ -200,8 +251,13 @@ pub fn attach_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<ta
             crate::integration::sync::commands::sync_disconnect,
             crate::integration::sync::commands::sync_now,
             crate::integration::sync::commands::sync_scope_sizes,
+            crate::integration::sync::commands::sync_cloud_usage,
             crate::features::vault::watcher::commands::fs_watch_start,
             crate::features::vault::watcher::commands::fs_watch_stop,
+            crate::integration::word::word_get_status,
+            crate::integration::word::word_set_enabled,
+            crate::integration::word::word_cancel,
+            crate::integration::word::word_submit,
             crate::integration::connector::commands::connector_get_status,
             crate::integration::connector::commands::connector_set_enabled,
             crate::integration::connector::commands::connector_set_vault,
@@ -211,24 +267,68 @@ pub fn attach_handlers(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<ta
             crate::integration::mcp::commands::mcp_set_enabled,
             crate::integration::mcp::commands::mcp_set_port,
             crate::integration::mcp::commands::mcp_set_vault,
+            crate::integration::mcp::commands::mcp_set_known_vaults,
             crate::integration::mcp::commands::mcp_set_parent_dir,
             crate::integration::mcp::commands::mcp_tunnel_status,
             crate::integration::mcp::commands::mcp_tunnel_start,
             crate::integration::mcp::commands::mcp_tunnel_stop,
             crate::app::open_request::commands::vault_open_take_pending,
+            crate::app::open_request::commands::ui_request_take_pending,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::features::system::updater::app_update_check,
             crate::features::cli_install::commands::cli_install_status,
             crate::features::cli_install::commands::cli_install_command,
             crate::features::cli_install::commands::cli_uninstall_command,
             crate::app::finder_service::commands::finder_service_status,
             crate::app::finder_service::commands::finder_service_install,
             crate::app::finder_service::commands::finder_service_uninstall,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::core::telemetry::commands::feedback_submit,
             crate::features::pdf::export::commands::export_system_cjk_font,
+            crate::features::pdf::bookmarks::pdf_save_bookmarks,
             crate::features::web::commands::web_proxy_allow_host,
+            crate::features::web::commands::html_preview_grant,
             crate::features::compile::detect_latex_engines,
             crate::features::compile::clean_latex_aux_files,
             crate::features::compile::chktex_lint,
             crate::features::compile::root::resolve_latex_root,
+            crate::features::compile::types::latex_build_artifacts,
+            crate::features::compile::project::latex_project_inspect,
+            crate::features::compile::tools::latex_synctex_forward,
+            crate::features::compile::tools::latex_synctex_backward,
+            crate::features::compile::tools::latex_clean,
+            crate::features::writing::cloud::writing_cloud_state,
+            crate::features::writing::sync::writing_sync_project,
+            crate::features::writing::sync::writing_git_log,
+            crate::features::writing::sync::writing_git_diff,
+            crate::features::writing::sync::writing_git_restore,
+            // Real-time preview shells out to LuaLaTeX and is desktop-only
+            // (see `features::rtex`'s cfg gate).
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::features::rtex::rtex_status,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::features::rtex::rtex_start,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::features::rtex::rtex_edit,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::features::rtex::rtex_set_document,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::features::rtex::rtex_request_layout,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::features::rtex::rtex_pause_background,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::features::rtex::rtex_stop,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::features::rtex::rtex_kpsewhich,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::features::rtex::rtex_read_tex_file,
             crate::features::jobs::commands::job_latex_compile_enqueue,
+            // jEV smart highlights need the desktop PDFium stack (see
+            // `features::jev`), so they are absent on mobile targets.
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::features::jobs::commands::job_jev_smart_highlights_enqueue,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::features::jev::commands::jev_probe_health,
         ])
     }
     #[cfg(target_os = "ios")]

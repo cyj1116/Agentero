@@ -5,11 +5,22 @@
  */
 import type { ReactNode } from "react";
 import type { PaperLibraryRow, PaperMetadata } from "@/lib/paper";
+import {
+	customPropertiesStore,
+	propertyType,
+} from "@/lib/paper/custom-properties-store";
 import { publicationDateSortKey } from "@/lib/paper/publication-date";
 import type { ReadingHeatmap } from "@/lib/paper/reading-heatmap";
-import { type PaperTag, visiblePaperTags } from "@/lib/paper/tags";
+import {
+	editablePaperTags,
+	type PaperTag,
+	visiblePaperTags,
+} from "@/lib/paper/tags";
+import { venueInfo } from "@/lib/paper/venue-info";
 import type { LibraryColumnKey, LibraryColumnPref } from "@/lib/settings";
 
+export type BuiltinLibraryColumnKey =
+	import("@/lib/settings").BuiltinLibraryColumnKey;
 export type SortKey = LibraryColumnKey;
 export type SortDir = "asc" | "desc";
 
@@ -50,40 +61,67 @@ export type PaperRow = {
 	sort: Record<SortKey, string | number>;
 };
 
+/**
+ * PERF: cache built rows keyed by paper object identity. Library store updates
+ * replace only changed rows (`setLibraryPapers` maps and keeps untouched
+ * objects by reference), so the unchanged majority reuses its PaperRow
+ * instead of rebuilding searchText + sort keys on every array update.
+ * Any field change arrives as a fresh object (spread or full reload), so a
+ * cached entry can never go stale; GC drops rows of removed papers.
+ */
+const paperRowCache = new WeakMap<PaperLibraryRow, PaperRow>();
+
+/**
+ * Per-paper filter text (title / identifiers / path / authors / visible
+ * tags, lowercased) — the single source shared by the library table rows
+ * and the command palette quick-open so neither rebuilds a haystack per
+ * keystroke.
+ */
+export function buildPaperSearchText(p: PaperMetadata): string {
+	const tagSearch = visiblePaperTags(p.tags)
+		.map((t) => t.name)
+		.join(" ")
+		.toLocaleLowerCase();
+	return [
+		p.title,
+		p.id,
+		identifierValue(p) ?? "",
+		p.path,
+		p.doi,
+		p.arxiv_id,
+		p.pmid ? `PMID:${p.pmid}` : null,
+		p.isbn,
+		p.publication,
+		p.publisher,
+		...(p.authors ?? []),
+		tagSearch,
+	]
+		.filter((value): value is string => Boolean(value?.trim()))
+		.join(" ")
+		.toLocaleLowerCase();
+}
+
 export function buildPaperRow(p: PaperLibraryRow): PaperRow {
-	const tags = visiblePaperTags(p.tags);
+	const cached = paperRowCache.get(p);
+	if (cached) return cached;
+	const tags = editablePaperTags(p.tags);
+	const venue = venueInfo(p);
 	const id = identifierValue(p) ?? "";
 	const tagSearch = tags
 		.map((t) => t.name)
 		.join(" ")
 		.toLocaleLowerCase();
-	return {
+	const row: PaperRow = {
 		paper: p,
 		tags,
 		tagSearch,
-		searchText: [
-			p.title,
-			p.id,
-			id,
-			p.path,
-			p.doi,
-			p.arxiv_id,
-			p.pmid ? `PMID:${p.pmid}` : null,
-			p.isbn,
-			p.publication,
-			p.publisher,
-			...(p.authors ?? []),
-			tagSearch,
-		]
-			.filter((value): value is string => Boolean(value?.trim()))
-			.join(" ")
-			.toLocaleLowerCase(),
+		searchText: buildPaperSearchText(p),
 		sort: {
 			title: (p.title ?? "").toLocaleLowerCase(),
 			authors: (p.authors?.[0] ?? "").toLocaleLowerCase(),
 			date: publicationDateSortKey(p) ?? Number.NEGATIVE_INFINITY,
 			addedAt: addedDate(p.added_at)?.getTime() ?? Number.NEGATIVE_INFINITY,
-			publication: (p.publication ?? "").toLocaleLowerCase(),
+			publication: (venue.name ?? "").toLocaleLowerCase(),
 			id: id.toLocaleLowerCase(),
 			tags: tags
 				.map((t) => t.name)
@@ -92,6 +130,19 @@ export function buildPaperRow(p: PaperLibraryRow): PaperRow {
 			citations: p.citation_count ?? Number.NEGATIVE_INFINITY,
 		},
 	};
+	const customProps = customPropertiesStore.getState().properties;
+	for (const prop of customProps) {
+		const raw = p.custom_props?.[prop.id];
+		// Select stores an option id, text stores the raw text: resolve both to
+		// the string the user actually sees before sorting.
+		const label =
+			propertyType(prop) === "text"
+				? (raw ?? "")
+				: (prop.options.find((o) => o.id === raw)?.name ?? "");
+		row.sort[`prop:${prop.id}`] = label.toLocaleLowerCase();
+	}
+	paperRowCache.set(p, row);
+	return row;
 }
 
 export function comparePaperRows(

@@ -12,6 +12,7 @@
 		"core:window:allow-minimize",
 		"core:window:allow-toggle-maximize",
 		"core:window:allow-close",
+		"core:window:allow-destroy",
 		"core:window:allow-is-maximized",
 		"core:window:allow-is-fullscreen",
 		"core:window:allow-set-fullscreen",
@@ -21,7 +22,7 @@
 		"opener:default",
 		{
 			"identifier": "opener:allow-open-path",
-			"allow": [{ "path": "$APPLOG" }]
+			"allow": [{ "path": "$APPLOG" }, { "path": "$APPCACHE" }]
 		},
 		"fs:default",
 		"fs:allow-read-dir",
@@ -31,7 +32,10 @@
 		"fs:allow-write-file",
 		"fs:allow-mkdir",
 		"fs:allow-remove",
+		"fs:allow-rename",
 		"fs:allow-stat",
+		"fs:allow-lstat",
+
 		"fs:allow-exists",
 		{
 			"identifier": "fs:scope",
@@ -42,8 +46,6 @@
 				{ "path": "$DOWNLOAD/**" }
 			]
 		},
-		"shell:default",
-		"store:default",
 		"dialog:default",
 		"log:default"
 	]

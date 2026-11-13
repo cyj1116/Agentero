@@ -5,12 +5,13 @@
  */
 
 import { createStore } from "zustand/vanilla";
+import { perfWait } from "@/lib/core/perf";
 import { isTauri } from "@/lib/core/tauri";
-import type { PaperLibraryRow, PaperMetadata } from "@/lib/paper";
 import { listPapers, rescanPapers, setPaperTags } from "@/lib/paper/api";
 import type { LocalPdfImportEntry } from "@/lib/paper/lookup";
 import type { CitingScanResult } from "@/lib/paper/refs";
 import type { PaperTagInput } from "@/lib/paper/tags";
+import type { PaperLibraryRow, PaperMetadata } from "@/lib/paper/types";
 import { watchRefreshDelayMs } from "@/lib/vault/shell-activity";
 import { getVaultPath } from "@/lib/vault/store";
 
@@ -92,12 +93,31 @@ function samePapers(a: PaperLibraryRow[], b: PaperLibraryRow[]): boolean {
 			x.is_read !== y.is_read ||
 			x.has_pdf !== y.has_pdf ||
 			x.title !== y.title ||
-			tagsFingerprint(x.tags) !== tagsFingerprint(y.tags)
+			(x.code_repo ?? "") !== (y.code_repo ?? "") ||
+			tagsFingerprint(x.tags) !== tagsFingerprint(y.tags) ||
+			JSON.stringify(x.custom_props ?? {}) !==
+				JSON.stringify(y.custom_props ?? {})
 		) {
 			return false;
 		}
 	}
 	return true;
+}
+
+/**
+ * Open-bundle fill writes `code_repo` after the library snapshot. Paper Info
+ * prefers this map over the tab copy, so patch the row or the chip stays empty.
+ */
+export function adoptLibraryCodeRepo(paper: PaperMetadata): void {
+	const repo = paper.code_repo?.trim();
+	if (!repo || !paper.path) return;
+	setLibraryPapers((prev) =>
+		prev.map((row) =>
+			row.path === paper.path && (row.code_repo ?? "") !== repo
+				? { ...row, code_repo: repo, updated_at: paper.updated_at }
+				: row,
+		),
+	);
 }
 
 export function setLibraryPapers(
@@ -210,10 +230,12 @@ export async function runLibraryRefresh(): Promise<void> {
  */
 export function scheduleLibraryRefresh(): void {
 	if (libraryRefreshTimer) clearTimeout(libraryRefreshTimer);
-	libraryRefreshTimer = setTimeout(
-		runLibraryRefresh,
-		watchRefreshDelayMs("library"),
-	);
+	const scheduledAt = performance.now();
+	const delay = watchRefreshDelayMs("library");
+	libraryRefreshTimer = setTimeout(() => {
+		perfWait("watch_wait.library", performance.now() - scheduledAt);
+		void runLibraryRefresh();
+	}, delay);
 }
 
 /**

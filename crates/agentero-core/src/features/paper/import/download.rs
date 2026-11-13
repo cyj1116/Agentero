@@ -9,9 +9,10 @@
 //! - Always try PDF; arXiv IDs also try e-print TeX; caller runs liteparse when
 //!   no TeX is available.
 
-use super::{AppHandle, PaperDownloadAssetsArgs};
+use super::{institution_proxy, AppHandle, PaperDownloadAssetsArgs};
 use crate::error::AppError;
 use crate::features::catalog::{papers, probe_paper_caps, CapsCache};
+use crate::features::paper::source::{self, SourceStatus};
 use crate::features::scholar_api::identifiers::{extract_arxiv_id, strip_arxiv_version};
 use crate::http;
 use flate2::read::GzDecoder;
@@ -39,6 +40,10 @@ pub struct AssetDownloadResult {
     #[serde(default)]
     pub paper_md: bool,
     pub messages: Vec<String>,
+    /// Follow-up steps for this download. Not part of the IPC payload.
+    #[serde(skip)]
+    #[specta(skip)]
+    pub preparation: super::preparation::PreparationPlan,
 }
 
 /// Byte/count progress wire event for projected JobCenter rows. `task_id`
@@ -149,7 +154,7 @@ fn merged_progress(slots: &[ProgressSlot]) -> (u64, Option<u64>, Option<u8>) {
 
 /// Merges the byte progress of every stream that shares one JobCenter row.
 ///
-/// PDF and TeX download concurrently under a single `task_id`, so per-phase
+/// PDF and TeX share a single `task_id`, so per-phase
 /// percentages cannot be weighted on the frontend: whichever stream finished
 /// first pinned the shared bar at 100% while the other was still fetching.
 /// The slot count fixed at construction is the denominator, which also keeps a
@@ -279,8 +284,8 @@ impl<'agg, 'ctx> StreamProgress<'agg, 'ctx> {
 /// - **PDF** → paper folder root: `{paper}/{id}.pdf` (not under `source/`)
 /// - **TeX** (arXiv e-print) → `{paper}/source/`
 ///
-/// Both streams download concurrently and their byte progress is merged into
-/// one overall value. Caller runs liteparse when `!tex && pdf`.
+/// PDF lands first to pin the source to its arXiv version stamp; both streams
+/// share byte progress. The body preparation chooses TeX before PDF parsing.
 pub async fn ensure_paper_assets(
     paper_dir: &Path,
     id: &str,
@@ -308,6 +313,7 @@ pub async fn ensure_paper_assets_with_progress(
         PAPER_ASSET_TIMEOUT,
         ensure_paper_assets_impl(
             paper_dir, vault, paper_path, id, arxiv_id, pdf_url, doi, cookies, cache, progress,
+            true,
         ),
     )
     .await
@@ -345,6 +351,7 @@ pub async fn ensure_paper_assets_with_cookies(
                 app: None,
                 task_id: None,
             },
+            false,
         ),
     )
     .await
@@ -364,8 +371,8 @@ struct PdfAssetResult {
 
 #[derive(Debug, Default)]
 struct TexAssetResult {
-    ok: bool,
     messages: Vec<String>,
+    error: Option<AppError>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -380,17 +387,17 @@ async fn ensure_paper_assets_impl(
     cookies: Option<&str>,
     cache: Option<&CapsCache>,
     progress: AssetProgressContext<'_>,
+    retry_source: bool,
 ) -> Result<AssetDownloadResult, AppError> {
     super::check_task_not_cancelled(progress.task_id)?;
     let mut out = AssetDownloadResult::default();
     fs::create_dir_all(paper_dir)?;
 
-    let before = cache
-        .map(|c| c.caps_for(vault, paper_path))
-        .unwrap_or_else(|| probe_paper_caps(paper_dir));
+    let before = probe_paper_caps(paper_dir);
     let need_pdf = !before.has_pdf();
     let need_tex = !before.has_tex;
-    let tex_arxiv_id = arxiv_id.filter(|a| !a.trim().is_empty());
+    let request = source::asset_request(arxiv_id, pdf_url, None);
+    let tex_arxiv_id = request.as_deref();
 
     // Both streams share one JobCenter row, so their byte progress is merged
     // here instead of being weighted per phase in the frontend. The slot count
@@ -419,8 +426,16 @@ async fn ensure_paper_assets_impl(
                 messages: vec!["pdf already present".into()],
             };
         }
-        let res =
-            fetch_pdf_assets(paper_dir, id, arxiv_id, pdf_url, doi, cookies, pdf_stream).await;
+        let res = fetch_pdf_assets(
+            paper_dir,
+            id,
+            tex_arxiv_id,
+            pdf_url,
+            doi,
+            cookies,
+            pdf_stream,
+        )
+        .await;
         // The candidate loop may have given up before any byte landed.
         pdf_stream.finish();
         res
@@ -429,19 +444,38 @@ async fn ensure_paper_assets_impl(
     let tex_task = async {
         if !need_tex {
             return TexAssetResult {
-                ok: true,
                 messages: vec!["tex already present".into()],
+                ..Default::default()
             };
         }
         let Some(aid) = tex_arxiv_id else {
             return TexAssetResult::default();
         };
-        let res = fetch_tex_assets(paper_dir, aid, tex_stream).await;
+        let res = match prepare_arxiv_source_with_progress(paper_dir, aid, tex_stream, retry_source)
+            .await
+        {
+            Ok(tex) => TexAssetResult {
+                messages: vec![if tex {
+                    "tex ready"
+                } else {
+                    "e-print has no TeX"
+                }
+                .into()],
+                ..Default::default()
+            },
+            Err(error) => TexAssetResult {
+                messages: vec![format!("tex failed: {error}")],
+                error: Some(error),
+            },
+        };
         tex_stream.finish();
         res
     };
 
-    let (pdf_res, tex_res) = tokio::join!(pdf_task, tex_task);
+    // Land the PDF first so its native arXiv version stamp can pin the source.
+    let pdf_res = pdf_task.await;
+    let tex_res = tex_task.await;
+    let tex_error = tex_res.error;
     out.messages.extend(pdf_res.messages);
     out.messages.extend(tex_res.messages);
 
@@ -459,8 +493,18 @@ async fn ensure_paper_assets_impl(
     if after.has_tex {
         out.tex = true;
     }
+    out.paper_md = after.has_paper_md;
+    if !paper_path.is_empty() {
+        source::reconcile_body(vault, paper_path)?;
+    }
+    if after.has_pdf() && !paper_path.is_empty() {
+        super::code_repo::fill_code_repo_from_pdf(vault, paper_path).await;
+    }
     super::check_task_not_cancelled(progress.task_id)?;
 
+    if let Some(error) = tex_error {
+        return Err(error);
+    }
     Ok(out)
 }
 
@@ -534,6 +578,37 @@ async fn fetch_pdf_assets(
             }
         }
     }
+    // Institution proxy fallback (EZProxy/WebVPN): rewrite the DOI target
+    // through the user's proxy prefix + session cookie. Only active when the
+    // host configured one; uses the user's own institution subscription.
+    if !ok {
+        if let Err(e) = super::check_task_not_cancelled(progress.task_id()) {
+            out.messages.push(format!("pdf cancelled: {e}"));
+            return out;
+        }
+        if let Some(doi) = doi.map(str::trim).filter(|s| !s.is_empty()) {
+            // Direct connection first: on campus networks the institution IP
+            // carries the subscription, so this needs zero configuration.
+            // Falls back to the configured gateway (if any) when it fails.
+            let outcome = institution_proxy::fetch_pdf(doi).await;
+            out.messages.extend(outcome.messages);
+            if let Some(bytes) = outcome.bytes {
+                let name = safe_filename(id, "pdf");
+                match fs::write(paper_dir.join(name), &bytes) {
+                    Ok(()) => {
+                        if let Some(source) = outcome.source {
+                            out.messages
+                                .push(format!("pdf ok via institution proxy ({source})"));
+                        }
+                        ok = true;
+                    }
+                    Err(e) => out
+                        .messages
+                        .push(format!("institution proxy write failed: {e}")),
+                }
+            }
+        }
+    }
     if !ok && candidates.is_empty() {
         out.messages.push("pdf: no url".into());
     }
@@ -541,33 +616,131 @@ async fn fetch_pdf_assets(
     out
 }
 
-async fn fetch_tex_assets(
+/// Pick the e-print id. A stamp read from the local PDF pins the download,
+/// including when the save itself was unversioned. An explicit version that
+/// disagrees with that stamp is refused. With no stamp the request is kept:
+/// a bare id is arXiv's latest version.
+fn resolve_eprint_request(requested: &str, stamp: Option<&str>) -> Result<String, String> {
+    let bare = strip_arxiv_version(requested);
+    if let Some(versioned) = stamp {
+        if requested != bare && requested != versioned {
+            return Err(format!(
+                "arXiv source version {requested} does not match local PDF {versioned}"
+            ));
+        }
+        return Ok(versioned.to_string());
+    }
+    Ok(requested.to_string())
+}
+
+/// Papers saved before unversioned requests fell through to latest recorded
+/// this refusal. It is no longer a failure, so the retry backoff must not
+/// keep replaying it.
+fn is_retired_unversioned_stamp_refusal(error: &str) -> bool {
+    error.contains("Cannot determine the local PDF's arXiv version")
+}
+
+pub async fn prepare_arxiv_source(
+    paper_dir: &Path,
+    arxiv_id: &str,
+    task_id: Option<&str>,
+) -> Result<bool, AppError> {
+    let aggregator = AssetProgressAggregator::new(None, task_id, "tex", 1);
+    prepare_arxiv_source_with_progress(paper_dir, arxiv_id, aggregator.stream(0), false).await
+}
+
+async fn prepare_arxiv_source_with_progress(
     paper_dir: &Path,
     arxiv_id: &str,
     progress: StreamProgress<'_, '_>,
-) -> TexAssetResult {
-    let mut out = TexAssetResult::default();
-    if let Err(e) = super::check_task_not_cancelled(progress.task_id()) {
-        out.messages.push(format!("tex cancelled: {e}"));
-        return out;
+    retry: bool,
+) -> Result<bool, AppError> {
+    let _guard = source::lock(paper_dir, progress.task_id()).await?;
+    if source::read_tex(paper_dir).is_some() {
+        return Ok(true);
+    }
+    if let Some(state) =
+        source::state(paper_dir).filter(|s| source::matches_request(arxiv_id, &s.arxiv_id))
+    {
+        if state.status == SourceStatus::Unavailable {
+            return Ok(false);
+        }
+        if !retry
+            && state.status == SourceStatus::RetryableError
+            && !source::retry_due(paper_dir, arxiv_id)
+            && !state
+                .error
+                .as_deref()
+                .is_some_and(is_retired_unversioned_stamp_refusal)
+        {
+            return Err(AppError::message(
+                state
+                    .error
+                    .unwrap_or_else(|| "arXiv source download needs retry".into()),
+            ));
+        }
+    }
+    let mut request = arxiv_id.to_string();
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    if let Some(pdf) = probe_paper_caps(paper_dir).pdf_path {
+        let bare = strip_arxiv_version(&request);
+        if let Ok(pages) =
+            crate::features::paper::analyze::parse::run_liteparse_probe(&pdf, progress.task_id())
+                .await
+        {
+            let text = pages
+                .iter()
+                .flat_map(|page| &page.lines)
+                .flat_map(|line| &line.words)
+                .map(|word| word.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Some(versioned) = source::version_from_text(&text, &bare) {
+                request = match resolve_eprint_request(&request, Some(&versioned)) {
+                    Ok(request) => request,
+                    Err(message) => {
+                        source::record_state(
+                            paper_dir,
+                            arxiv_id,
+                            SourceStatus::RetryableError,
+                            Some(message.clone()),
+                        )?;
+                        return Err(AppError::message(message));
+                    }
+                };
+            }
+        }
+        super::check_task_not_cancelled(progress.task_id())?;
+        // No readable stamp: an unversioned id stays bare and downloads latest.
     }
     let source = paper_dir.join("source");
-    if let Err(e) = fs::create_dir_all(&source) {
-        out.messages.push(format!("tex failed: {e}"));
-        return out;
-    }
-    match download_arxiv_source(&source, paper_dir, arxiv_id, progress).await {
+    fs::create_dir_all(&source)?;
+    match download_arxiv_source(&source, paper_dir, &request, progress).await {
         Ok(()) => {
-            // A PDF-only e-print also returns Ok (the PDF is written to
-            // the paper root and no TeX is extracted), so success here
-            // does not guarantee TeX. The capability refresh below
-            // sets `tex` from what actually landed on disk.
-            out.messages.push("tex ok".into());
-            out.ok = true;
+            let ready = source::read_tex(paper_dir).is_some();
+            source::record_state(
+                paper_dir,
+                &request,
+                if ready {
+                    SourceStatus::Ready
+                } else {
+                    SourceStatus::Unavailable
+                },
+                None,
+            )?;
+            Ok(ready)
         }
-        Err(e) => out.messages.push(format!("tex failed: {e}")),
+        Err(error) => {
+            super::check_task_not_cancelled(progress.task_id())?;
+            source::record_state(
+                paper_dir,
+                arxiv_id,
+                SourceStatus::RetryableError,
+                Some(error.to_string()),
+            )?;
+            Err(error)
+        }
     }
-    out
 }
 
 /// Build ordered PDF URL candidates (first success wins).
@@ -585,11 +758,11 @@ fn pdf_url_candidates(id: &str, arxiv_id: Option<&str>, pdf_url: Option<&str>) -
     }
 
     let bare_arxiv = arxiv_id
-        .map(strip_arxiv_version)
+        .and_then(crate::features::scholar_api::identifiers::extract_arxiv_request)
         .filter(|s| !s.is_empty())
         .or_else(|| {
             // Folder / id often is the arXiv id
-            let s = strip_arxiv_version(id);
+            let s = id.trim().to_string();
             if looks_like_arxiv_id(&s) {
                 Some(s)
             } else {
@@ -755,7 +928,7 @@ async fn download_arxiv_source(
 ) -> Result<(), AppError> {
     let bare = strip_arxiv_version(arxiv_id);
     // Prefer e-print; /src/ is an alias
-    let url = format!("https://arxiv.org/e-print/{bare}");
+    let url = format!("https://arxiv.org/e-print/{arxiv_id}");
     let bytes =
         http_get_bytes_with_progress(&url, Duration::from_secs(180), None, progress).await?;
     unpack_arxiv_eprint(source_dir, paper_dir, &bare, &bytes)
@@ -771,62 +944,116 @@ fn unpack_arxiv_eprint(
         return Err(AppError::message("empty e-print response"));
     }
 
-    // PDF-only submissions → paper folder root (not source/)
-    if bytes.len() >= 4 && &bytes[..4] == b"%PDF" {
-        // Use create_new to avoid racing with a concurrent independent PDF download.
-        // If the file already exists we discard the e-print PDF and keep the existing one.
-        let dest = paper_dir.join(safe_filename(bare_id, "pdf"));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&dest)
-        {
-            Ok(mut file) => {
-                file.write_all(bytes)
-                    .map_err(|e| AppError::message(format!("write PDF-only e-print: {e}")))?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(AppError::message(format!("create PDF-only e-print: {e}"))),
-        }
-        return Ok(());
-    }
-
-    let payload = if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
-        let mut decoder = GzDecoder::new(Cursor::new(bytes));
+    const MAX_SOURCE: u64 = 128 * 1024 * 1024;
+    let payload = if bytes.starts_with(&[0x1f, 0x8b]) {
         let mut inflated = Vec::new();
-        decoder
-            .read_to_end(&mut inflated)
-            .map_err(|e| AppError::message(format!("gzip decode: {e}")))?;
+        GzDecoder::new(Cursor::new(bytes))
+            .take(MAX_SOURCE + 1)
+            .read_to_end(&mut inflated)?;
         inflated
     } else {
         bytes.to_vec()
     };
-
-    // Prefer tar when it looks like one; fall back to single .tex file
-    if looks_like_tar(&payload) {
-        match extract_tar_safe(source_dir, &payload) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                // Rare: not a real tar — store as tex
-                let _ = e;
-            }
-        }
+    if payload.len() as u64 > MAX_SOURCE {
+        return Err(AppError::message("arXiv source exceeds unpack limit"));
     }
-
-    let sample = String::from_utf8_lossy(&payload[..payload.len().min(400)]);
-    if sample.contains('\\')
-        || sample.contains("\\documentclass")
-        || sample.contains("\\begin{document}")
-        || sample.contains("\\section")
-        || payload.len() < 512
-    {
-        fs::write(source_dir.join(safe_filename(bare_id, "tex")), &payload)?;
+    if payload.starts_with(b"%PDF") {
+        let dest = paper_dir.join(safe_filename(bare_id, "pdf"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dest)
+        {
+            Ok(mut file) => file.write_all(&payload)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        return Ok(());
+    }
+    if payload.starts_with(b"%!PS") {
         return Ok(());
     }
 
-    Err(AppError::message(
-        "unrecognized arXiv e-print format (expected gzip/tar/tex/pdf)",
-    ))
+    // Validate the whole archive before publishing any source file. The staging
+    // directory is outside source/ and ignored by capability/tree/sync scans.
+    let staging = tempfile::Builder::new()
+        .prefix(".agentero-source-")
+        .tempdir_in(paper_dir)?;
+    if looks_like_tar(&payload) {
+        extract_tar_safe(staging.path(), &payload)?;
+    } else {
+        let text = String::from_utf8_lossy(&payload);
+        if payload.contains(&0) || !source::tex::has_indicator(&source::tex::strip_comments(&text))
+        {
+            return Err(AppError::message(
+                "arXiv e-print is not a TeX document or PDF",
+            ));
+        }
+        fs::write(staging.path().join(safe_filename(bare_id, "tex")), &payload)?;
+    }
+    if source::read_tex(staging.path()).is_none() {
+        // A successfully decoded archive with no TeX is a known unsupported
+        // submission, unlike a broken/incomplete TeX project.
+        if !source::contains_tex_files(staging.path()) {
+            return Ok(());
+        }
+        return Err(AppError::message(
+            "arXiv source has no readable main TeX document or has missing inputs",
+        ));
+    }
+    // Preserve user edits and derived sidecars. Publish only new files, and roll
+    // those back if a later file conflicts or fails. Never replace source/ whole.
+    let mut created = Vec::new();
+    let result = publish_source(staging.path(), source_dir, &mut created);
+    if let Err(error) = result {
+        for path in created.iter().rev() {
+            let _ = fs::remove_file(path);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn publish_source(from: &Path, to: &Path, created: &mut Vec<PathBuf>) -> Result<(), AppError> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            if target.is_symlink() {
+                return Err(AppError::message("source directory is a symlink"));
+            }
+            publish_source(&entry.path(), &target, created)?;
+        } else {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("agentero-")
+                || matches!(name.as_str(), "layout.json" | "layout-index.json")
+            {
+                continue;
+            }
+            let bytes = fs::read(entry.path())?;
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+            {
+                Ok(mut file) => {
+                    created.push(target);
+                    file.write_all(&bytes)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if target.is_symlink() || fs::read(&target)? != bytes {
+                        return Err(AppError::message(format!(
+                            "source conflicts with existing file: {}",
+                            target.display()
+                        )));
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn looks_like_tar(bytes: &[u8]) -> bool {
@@ -851,8 +1078,14 @@ pub(crate) fn extract_tar_safe(dest: &Path, tar_bytes: &[u8]) -> Result<(), AppE
         .entries()
         .map_err(|e| AppError::message(format!("tar entries: {e}")))?;
 
-    for entry in entries {
+    for (index, entry) in entries.enumerate() {
+        if index >= 10_000 {
+            return Err(AppError::message("source archive has too many entries"));
+        }
         let mut entry = entry.map_err(|e| AppError::message(format!("tar entry: {e}")))?;
+        if entry.size() > 128 * 1024 * 1024 {
+            return Err(AppError::message("source archive entry exceeds limit"));
+        }
         let path = entry
             .path()
             .map_err(|e| AppError::message(format!("tar path: {e}")))?
@@ -867,6 +1100,11 @@ pub(crate) fn extract_tar_safe(dest: &Path, tar_bytes: &[u8]) -> Result<(), AppE
         if entry.header().entry_type().is_dir() {
             fs::create_dir_all(&out_path)?;
             continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err(AppError::message(
+                "source archive contains unsupported link or special file",
+            ));
         }
 
         if let Some(parent) = out_path.parent() {
@@ -977,7 +1215,8 @@ pub async fn download_paper_assets_with_progress(
             let (paper_dir, path_rel) = crate::fs::resolve_paper_dir(&vault, &path_arg)?;
 
             let resolved = if let Ok(Some(row)) = papers::get_by_path(&vault, &path_rel) {
-                (row.id, row.arxiv_id, row.pdf_url, row.doi, None)
+                let request = source::arxiv_request(&row);
+                (row.id, request, row.pdf_url, row.doi, None)
             } else if let Ok(Some(row)) = papers::ensure_row_for_path(&vault, &path_rel) {
                 // Orphaned folder (import failed after shell + folder were written but
                 // before the catalog row landed): rebuild the row so the Library sees it.
@@ -1017,10 +1256,10 @@ pub async fn download_paper_assets_with_progress(
         .map_err(|e| AppError::message(format!("blocking task failed: {e}")))??;
 
     if let Some(row_id) = rebuilt_row {
-        crate::features::lifecycle::emit_paper_imported(app, &vault, &row_id);
+        crate::features::lifecycle::emit_paper_imported(app, &vault, &row_id, &path_rel);
     }
 
-    let result = ensure_paper_assets_with_progress(
+    let mut result = ensure_paper_assets_with_progress(
         &paper_dir,
         &vault,
         &path_rel,
@@ -1038,34 +1277,15 @@ pub async fn download_paper_assets_with_progress(
     .await?;
     super::check_task_not_cancelled(args.task_id.as_deref())?;
 
-    // When TeX was downloaded into source/, record body_source = "latex" in catalog
-    // so the frontend doesn't show "download TeX" even though source/ is lazy-loaded.
-    // The catalog read/write acquires the process-wide catalog lock, so run it on
-    // the blocking pool. Errors were already ignored; a blocking join error is too.
-    if result.tex {
-        let vault_owned = vault.clone();
-        let path_owned = path_rel.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(Some(mut row)) = papers::get_by_path(&vault_owned, &path_owned) {
-                let changed = row.body_source.as_deref() != Some("latex");
-                if changed {
-                    row.body_source = Some("latex".to_string());
-                    row.body_quality = Some("high".to_string());
-                    row.updated_at = crate::time::now_rfc3339_millis();
-                    let _ = papers::upsert_paper(&vault_owned, &row);
-                }
-            }
-        })
-        .await;
-    }
+    source::reconcile_body(&vault, &path_rel)?;
 
-    if result.pdf && !result.tex && !result.paper_md {
-        if let Some(app) = app {
-            app.spawn_parse_body_after_assets(&vault, &path_rel, false);
-        }
-    }
-
-    crate::features::refs::spawn_parse_after_import(app, &vault, &path_rel);
+    result.preparation = super::preparation::plan_after_assets(
+        &path_rel,
+        result.pdf,
+        result.tex,
+        result.paper_md,
+        false,
+    );
     Ok(result)
 }
 
@@ -1321,6 +1541,76 @@ mod tests {
     }
 
     #[test]
+    fn rejects_error_pages_and_corrupt_archives_without_publishing_partial_tex() {
+        let paper = tempfile::tempdir().unwrap();
+        let source = paper.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("layout.json"), "KEEP-SIDECAR").unwrap();
+        assert!(unpack_arxiv_eprint(
+            &source,
+            paper.path(),
+            "1706.03762",
+            b"<html>Unavailable</html>"
+        )
+        .is_err());
+        let mut builder = tar::Builder::new(Vec::new());
+        let tex = b"\\documentclass{article}\\begin{document}Body\\end{document}";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(tex.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "main.tex", Cursor::new(tex))
+            .unwrap();
+        let mut broken = builder.into_inner().unwrap();
+        broken.truncate(1024);
+        broken.extend_from_slice(&[b'x'; 512]);
+        assert!(unpack_arxiv_eprint(&source, paper.path(), "1706.03762", &broken).is_err());
+        assert!(!source.join("main.tex").exists());
+        assert!(!source.join("1706.03762.tex").exists());
+        assert_eq!(
+            fs::read_to_string(source.join("layout.json")).unwrap(),
+            "KEEP-SIDECAR"
+        );
+    }
+
+    #[test]
+    fn gzipped_pdf_is_pdf_only_and_valid_tar_preserves_user_sources() {
+        let paper = tempfile::tempdir().unwrap();
+        let source = paper.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"%PDF-1.4 test").unwrap();
+        unpack_arxiv_eprint(
+            &source,
+            paper.path(),
+            "1706.03762",
+            &encoder.finish().unwrap(),
+        )
+        .unwrap();
+        assert!(paper.path().join("1706.03762.pdf").is_file());
+        assert!(!probe_paper_caps(paper.path()).has_tex);
+        let mut builder = tar::Builder::new(Vec::new());
+        let tex = b"\\documentclass{article}\\begin{document}Body\\end{document}";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(tex.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "main.tex", Cursor::new(tex))
+            .unwrap();
+        let archive = builder.into_inner().unwrap();
+        unpack_arxiv_eprint(&source, paper.path(), "1706.03762", &archive).unwrap();
+        assert!(probe_paper_caps(paper.path()).has_tex);
+        fs::write(source.join("main.tex"), "USER EDIT").unwrap();
+        assert!(unpack_arxiv_eprint(&source, paper.path(), "1706.03762", &archive).is_err());
+        assert_eq!(
+            fs::read_to_string(source.join("main.tex")).unwrap(),
+            "USER EDIT"
+        );
+    }
+
+    #[test]
     fn pdf_candidates_include_arxiv() {
         let c = pdf_url_candidates(
             "1412.6980",
@@ -1329,6 +1619,26 @@ mod tests {
         );
         assert!(c.iter().any(|u| u.contains("arxiv.org/pdf/1412.6980")));
         assert!(c.len() >= 2);
+    }
+
+    #[test]
+    fn unversioned_arxiv_without_stamp_downloads_latest() {
+        assert_eq!(
+            resolve_eprint_request("2505.02387", None).as_deref(),
+            Ok("2505.02387")
+        );
+        assert_eq!(
+            resolve_eprint_request("2505.02387", Some("2505.02387v4")).as_deref(),
+            Ok("2505.02387v4")
+        );
+        assert_eq!(
+            resolve_eprint_request("2505.02387v4", None).as_deref(),
+            Ok("2505.02387v4")
+        );
+        assert!(resolve_eprint_request("2505.02387v1", Some("2505.02387v4")).is_err());
+        assert!(is_retired_unversioned_stamp_refusal(
+            "Cannot determine the local PDF's arXiv version; set a versioned arXiv PDF/source URL before supplementing LaTeX"
+        ));
     }
 
     #[test]

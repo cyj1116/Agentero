@@ -113,6 +113,21 @@ pub(crate) fn windows_cmd_cwd_env_value(cwd: &Path) -> String {
     format!("\"{}\"", windows_cmd_cwd(cwd))
 }
 
+/// Templates whose Windows process must start in the Vault.
+///
+/// ACP stdio has no cwd field. Pi and Custom already used a `cmd` `cd`.
+/// Zcode's `server` mode ignores the ACP session cwd and indexes
+/// `.agents/skills` from the process cwd, so a direct spawn never sees the
+/// Vault. Other templates stay direct children: wrapping them changes
+/// quoting, `cd /d` rejects UNC, and the SDK only kills the direct child.
+#[cfg(any(windows, test))]
+fn windows_process_cwd_template(template: &AgentTemplate) -> bool {
+    matches!(
+        template,
+        AgentTemplate::Pi | AgentTemplate::Custom | AgentTemplate::Zcode
+    )
+}
+
 /// Windows launch policy and command construction. Kept available to unit
 /// tests on Unix so changes to the wrapper policy are checked on every CI run.
 #[cfg(any(windows, test))]
@@ -122,12 +137,7 @@ fn windows_launch_command(
     env: &mut HashMap<String, String>,
     cwd: Option<&Path>,
 ) -> (PathBuf, Vec<String>) {
-    // Keep the pre-#570 Windows policy: adding cmd around native launchers
-    // changes quoting, breaks UNC cwd, and prevents the SDK (which only kills
-    // its direct child on Windows) from forcibly reaping the real agent.
-    let Some(cwd) =
-        cwd.filter(|_| matches!(desc.template, AgentTemplate::Pi | AgentTemplate::Custom))
-    else {
+    let Some(cwd) = cwd.filter(|_| windows_process_cwd_template(&desc.template)) else {
         return (command, desc.args.clone());
     };
     env.insert(
@@ -238,11 +248,27 @@ pub(crate) fn build_child_env(
         child_env.insert("PATH".to_string(), path.to_string_lossy().to_string());
     }
 
+    // AppImage's loader overrides make a host Node load the bundle's older
+    // libraries and die before ACP starts (#1002). Done after merging so the
+    // login shell cannot reintroduce them.
+    crate::core::process::strip_appimage_library_env(&mut child_env);
+
     child_env
 }
 
 pub(crate) fn effective_local_agent_env(desc: &AgentDescriptor) -> HashMap<String, String> {
-    build_child_env(std::env::vars(), login_shell_env(), &desc.env)
+    build_child_env(std::env::vars(), login_shell_env().as_deref(), &desc.env)
+}
+
+/// Merged process + login-shell environment without any per-agent overrides.
+/// Used when resolving a template-owned command (e.g. the login terminal) that
+/// is not tied to a registered `AgentDescriptor`.
+pub(crate) fn local_login_shell_env() -> HashMap<String, String> {
+    build_child_env(
+        std::env::vars(),
+        login_shell_env().as_deref(),
+        &HashMap::new(),
+    )
 }
 
 pub(crate) fn resolve_command_in_agent_env(
@@ -254,6 +280,19 @@ pub(crate) fn resolve_command_in_agent_env(
         .map(|value| std::env::split_paths(value).collect::<Vec<_>>())
         .unwrap_or_default();
     crate::core::process::resolve_command_in_paths(command, &paths)
+}
+
+/// Resolve a template's ACP entrypoint: PATH first, then a CLI that ships
+/// inside an already-installed desktop app (QwenWork bundles the Qoder /
+/// Qoder CN engine). Availability checks, catalog scan and the actual spawn all
+/// resolve through here, so a desktop-bundled engine never reports "installed"
+/// on one path and fails to spawn on another.
+pub(crate) fn resolve_acp_entry(
+    command: &str,
+    environment: &HashMap<String, String>,
+) -> Option<PathBuf> {
+    resolve_command_in_agent_env(command, environment)
+        .or_else(|| crate::features::system::desktop_apps::bundled_cli(command))
 }
 
 /// Resolve the ACP session cwd, also used by cwd-aware process launchers.
@@ -309,13 +348,13 @@ type BundledSpawnFn = fn(
 ///    env) — always wins when present;
 /// 2. the bundled adapter tier — spawn `node <entry.js> [desc args…]` and
 ///    point the stripped adapter at the user's host CLI
-///    (`CLAUDE_CODE_EXECUTABLE` / `CODEX_PATH`, or_insert so user env wins);
+///    (`CLAUDE_CODE_EXECUTABLE` / `CODEX_PATH`, validating user overrides);
 /// 3. today's behavior — the raw descriptor command, letting the spawn
 ///    surface the OS error.
 pub(crate) fn plan_local_launch(
     desc: &AgentDescriptor,
     child_env: &mut HashMap<String, String>,
-) -> (AgentDescriptor, PathBuf) {
+) -> Result<(AgentDescriptor, PathBuf), AppError> {
     plan_local_launch_with(desc, child_env, registry_bundled_spawn)
 }
 
@@ -333,16 +372,33 @@ fn plan_local_launch_with(
     desc: &AgentDescriptor,
     child_env: &mut HashMap<String, String>,
     bundled_spawn: BundledSpawnFn,
-) -> (AgentDescriptor, PathBuf) {
-    if let Some(path) = resolve_command_in_agent_env(&desc.command, child_env) {
-        return (desc.clone(), path);
+) -> Result<(AgentDescriptor, PathBuf), AppError> {
+    if let Some(path) = resolve_acp_entry(&desc.command, child_env) {
+        #[cfg(windows)]
+        if desc.template == AgentTemplate::Dsh {
+            if let Some((node, entry)) = crate::features::agent::registry::dsh::npm_launch(
+                &path,
+                resolve_command_in_agent_env("node", child_env),
+            )
+            .map_err(AppError::message)?
+            {
+                let mut launch_desc = desc.clone();
+                launch_desc.args.insert(0, entry.display().to_string());
+                return Ok((launch_desc, node));
+            }
+        }
+        return Ok((desc.clone(), path));
     }
     if let Some((node, adapter)) = bundled_spawn(desc.template.as_str(), child_env) {
         for (key, value) in crate::features::agent::registry::bundled::host_env_injection(
             desc.template.as_str(),
             child_env,
-        ) {
-            child_env.entry(key).or_insert(value);
+        )
+        .map_err(AppError::message)?
+        {
+            // Resolution honors explicit overrides, but npm shims must be
+            // replaced by their SDK-compatible entrypoint even when explicit.
+            child_env.insert(key, value);
         }
         let mut launch_desc = desc.clone();
         let mut args = Vec::with_capacity(desc.args.len() + 1);
@@ -351,9 +407,9 @@ fn plan_local_launch_with(
         args.push(windows_shell_path(&adapter.entry_js).display().to_string());
         args.extend(desc.args.iter().cloned());
         launch_desc.args = args;
-        return (launch_desc, node);
+        return Ok((launch_desc, node));
     }
-    (desc.clone(), PathBuf::from(&desc.command))
+    Ok((desc.clone(), PathBuf::from(&desc.command)))
 }
 
 pub(crate) fn to_acp_agent_local(
@@ -370,11 +426,12 @@ pub(crate) fn to_acp_agent_local(
             child_env.entry(key).or_insert(value);
         }
     }
-    let (launch_desc, command) = plan_local_launch(desc, &mut child_env);
+    let (launch_desc, command) = plan_local_launch(desc, &mut child_env)?;
 
     // Unix agents must not inherit `/` from a Finder-launched app (#570).
-    // Windows retains its existing Pi/Custom-only wrapping policy until the
-    // transport supports native cwd + tree teardown.
+    // Windows wraps only Pi, Custom, and Zcode. Zcode's serve mode reads the
+    // process cwd; the rest stay direct children until native cwd and process
+    // tree teardown exist.
     let (command, args) = local_launch_command(&launch_desc, command, &mut child_env, cwd);
 
     let env: Vec<EnvVariable> = child_env
@@ -444,6 +501,56 @@ pub(crate) const ACP_INITIALIZE_TIMEOUT: std::time::Duration = std::time::Durati
 /// shared 15s budget even though the agent is healthy. Only warm uses this;
 /// interactive turns keep the responsive 15s budget.
 pub(crate) const ACP_NEW_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Loading can bootstrap an agent runtime and replay the entire transcript.
+/// Keep this separate from interactive RPCs and cancellable by the caller.
+pub(crate) const ACP_LOAD_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Shared by history browsing and continuing a session (cold or pooled).
+pub(crate) async fn timed_acp_load_session<T, E>(
+    agent_id: &str,
+    session_id: &str,
+    request: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, agent_client_protocol::Error>
+where
+    E: std::fmt::Display,
+{
+    // A dropped request future (e.g. the turn's cancellation select) must also
+    // leave a terminal log, rather than looking like a stuck load request.
+    struct LoadTimer<'a> {
+        agent_id: &'a str,
+        session_id: &'a str,
+        started: std::time::Instant,
+        outcome: &'static str,
+    }
+    impl Drop for LoadTimer<'_> {
+        fn drop(&mut self) {
+            log::info!(
+                "acp session/load agent={} session={} outcome={} elapsed_ms={}",
+                self.agent_id,
+                self.session_id,
+                self.outcome,
+                self.started.elapsed().as_millis(),
+            );
+        }
+    }
+    let mut timer = LoadTimer {
+        agent_id,
+        session_id,
+        started: std::time::Instant::now(),
+        outcome: "cancelled",
+    };
+    log::info!(
+        "acp session/load agent={agent_id} session={session_id} started budget_s={}",
+        ACP_LOAD_SESSION_TIMEOUT.as_secs(),
+    );
+    let result = timed_acp_request_with(ACP_LOAD_SESSION_TIMEOUT, "session/load", request).await;
+    timer.outcome = if result.is_ok() { "success" } else { "failed" };
+    if let Err(error) = &result {
+        log::warn!("acp session/load agent={agent_id} session={session_id}: {error}");
+    }
+    result
+}
 
 /// `session/new` variant of [`timed_acp_request`]; see [`ACP_NEW_SESSION_TIMEOUT`].
 pub(crate) async fn timed_acp_new_session<T, E>(
@@ -522,6 +629,49 @@ pub(crate) fn acp_err(msg: impl ToString) -> agent_client_protocol::Error {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn load_session_has_an_independent_budget() {
+        let slow_request = || async {
+            tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+            Ok::<_, &str>(())
+        };
+        let (load, ordinary) = tokio::join!(
+            timed_acp_load_session("pi", "test", slow_request()),
+            timed_acp_request("session/list", slow_request()),
+        );
+        assert!(load.is_ok());
+        assert!(ordinary.unwrap_err().to_string().contains("after 15s"));
+        let started = tokio::time::Instant::now();
+        let error =
+            timed_acp_load_session("pi", "test", std::future::pending::<Result<(), &str>>())
+                .await
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("session/load timed out after 60s"));
+        assert_eq!(started.elapsed(), ACP_LOAD_SESSION_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn load_session_remains_cancellable() {
+        let (tx, mut cancellation) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let cancel = async {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tx.send(true).unwrap();
+        };
+        let load = async {
+            tokio::select! {
+                result = timed_acp_load_session(
+                    "pi", "test", std::future::pending::<Result<(), &str>>(),
+                ) => panic!("load completed before cancellation: {result:?}"),
+                () = wait_for_cancellation(&mut cancellation) => {}
+            }
+        };
+        tokio::join!(load, cancel);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn initialize_has_an_independent_budget() {
@@ -636,6 +786,16 @@ mod cwd_shell_wrap_tests {
             // Windows resolution probes PATHEXT-style suffixes.
             #[cfg(windows)]
             std::fs::write(bin.join(format!("{name}.cmd")), "@echo off\r\n").unwrap();
+            #[cfg(windows)]
+            if *name == "claude" {
+                let cli = bin
+                    .join("node_modules")
+                    .join("@anthropic-ai")
+                    .join("claude-code")
+                    .join("cli.js");
+                std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+                std::fs::write(cli, "").unwrap();
+            }
         }
         let mut env = HashMap::new();
         env.insert(
@@ -673,7 +833,8 @@ mod cwd_shell_wrap_tests {
         let mut desc = descriptor(AgentTemplate::Custom);
         desc.command = "fake-agent".to_string();
         desc.args = vec!["--flag".to_string()];
-        let (launch_desc, command) = plan_local_launch_with(&desc, &mut env, fake_bundled_claude);
+        let (launch_desc, command) =
+            plan_local_launch_with(&desc, &mut env, fake_bundled_claude).unwrap();
         // Resolved PATH tier: args untouched, no entry injection. (Windows
         // resolution lands on the `.cmd` shim, so match by substring.)
         assert!(
@@ -694,7 +855,8 @@ mod cwd_shell_wrap_tests {
             desc.command, "claude",
             "adapter command must differ from host"
         );
-        let (launch_desc, command) = plan_local_launch_with(&desc, &mut env, fake_bundled_claude);
+        let (launch_desc, command) =
+            plan_local_launch_with(&desc, &mut env, fake_bundled_claude).unwrap();
         assert_eq!(command, PathBuf::from("/fake/node"));
         assert_eq!(
             launch_desc.args,
@@ -705,16 +867,23 @@ mod cwd_shell_wrap_tests {
             .expect("host env injected");
         assert!(injected.contains("claude"), "injected: {injected}");
 
-        // User-configured env wins: an explicit CLAUDE_CODE_EXECUTABLE survives.
-        let (_tmp2, mut env2) = fake_agent_bin(&["claude"]);
+        // An explicit, valid host overrides the PATH host.
+        let (tmp2, mut env2) = fake_agent_bin(&["claude"]);
+        let chosen = tmp2.path().join("chosen-cli.js");
+        std::fs::write(&chosen, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&chosen, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         env2.insert(
             "CLAUDE_CODE_EXECUTABLE".to_string(),
-            "/user/chosen/claude".to_string(),
+            chosen.display().to_string(),
         );
-        let (_, _) = plan_local_launch_with(&desc, &mut env2, fake_bundled_claude);
+        plan_local_launch_with(&desc, &mut env2, fake_bundled_claude).unwrap();
         assert_eq!(
-            env2.get("CLAUDE_CODE_EXECUTABLE").map(String::as_str),
-            Some("/user/chosen/claude")
+            env2.get("CLAUDE_CODE_EXECUTABLE"),
+            Some(&chosen.display().to_string())
         );
     }
 
@@ -725,7 +894,8 @@ mod cwd_shell_wrap_tests {
         let mut desc = descriptor(AgentTemplate::Custom);
         desc.command = "nowhere-agent".to_string();
         desc.args = vec!["--flag".to_string(), "value".to_string()];
-        let (launch_desc, command) = plan_local_launch_with(&desc, &mut env, fake_bundled_claude);
+        let (launch_desc, command) =
+            plan_local_launch_with(&desc, &mut env, fake_bundled_claude).unwrap();
         assert_eq!(command, PathBuf::from("/fake/node"));
         assert_eq!(
             launch_desc.args,
@@ -737,10 +907,30 @@ mod cwd_shell_wrap_tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn bundled_claude_rejects_invalid_override_but_path_adapter_keeps_priority() {
+        let (_tmp, mut env) = fake_agent_bin(&["claude"]);
+        let desc = descriptor(AgentTemplate::ClaudeAcp);
+        env.insert(
+            "CLAUDE_CODE_EXECUTABLE".to_string(),
+            "missing-claude.cmd".to_string(),
+        );
+        assert!(plan_local_launch_with(&desc, &mut env, fake_bundled_claude).is_err());
+        let (_tmp, mut env) = fake_agent_bin(&["claude-agent-acp"]);
+        env.insert(
+            "CLAUDE_CODE_EXECUTABLE".to_string(),
+            "missing-claude.cmd".to_string(),
+        );
+        let (_, command) = plan_local_launch_with(&desc, &mut env, fake_bundled_claude).unwrap();
+        assert!(command.to_string_lossy().contains("claude-agent-acp"));
+        assert_eq!(env["CLAUDE_CODE_EXECUTABLE"], "missing-claude.cmd");
+    }
+
     #[test]
     fn plan_local_launch_normalizes_bundled_windows_entry() {
         for template in [AgentTemplate::CodexAcp, AgentTemplate::ClaudeAcp] {
-            let (_tmp, mut env) = fake_agent_bin(&[]);
+            let (_tmp, mut env) = fake_agent_bin(&["claude", "codex"]);
             let mut desc = descriptor(template);
             desc.args = vec!["--flag".to_string(), "value with spaces".to_string()];
             let (launch_desc, command) = plan_local_launch_with(&desc, &mut env, |_, _| {
@@ -754,7 +944,8 @@ mod cwd_shell_wrap_tests {
                         node_major: Some(22),
                     },
                 ))
-            });
+            })
+            .unwrap();
             assert_eq!(command, PathBuf::from(r"C:\Program Files\nodejs\node.exe"));
             assert_eq!(
                 launch_desc.args,
@@ -773,7 +964,7 @@ mod cwd_shell_wrap_tests {
         let desc = descriptor(AgentTemplate::CodexAcp);
         let raw = desc.command.clone();
         let (launch_desc, command) =
-            plan_local_launch_with(&desc, &mut env, |_template_id, _child_env| None);
+            plan_local_launch_with(&desc, &mut env, |_template_id, _child_env| None).unwrap();
         assert_eq!(command, PathBuf::from(&raw));
         assert_eq!(launch_desc.args, desc.args);
         assert!(!env.contains_key("CODEX_PATH"));
@@ -920,7 +1111,7 @@ mod cwd_shell_wrap_tests {
         templates.push(AgentTemplate::Custom);
         for template in templates {
             let desc = descriptor(template);
-            // Probe has no cwd wrapper, including Pi/Custom. A native .exe
+            // Probe has no cwd wrapper, including Pi/Custom/Zcode. A native .exe
             // remains the SDK's direct child and can still be killed on timeout.
             let mut env = HashMap::new();
             let command = PathBuf::from(&desc.command);
@@ -930,11 +1121,37 @@ mod cwd_shell_wrap_tests {
             );
             assert!(env.is_empty());
 
-            if matches!(desc.template, AgentTemplate::Pi | AgentTemplate::Custom) {
-                let (program, _) =
+            if windows_process_cwd_template(&desc.template) {
+                let (program, args) =
                     windows_launch_command(&desc, command, &mut env, Some(Path::new(r"C:\Vault")));
                 assert_eq!(program, PathBuf::from("cmd"));
+                assert_eq!(
+                    args,
+                    vec![
+                        "/D".to_string(),
+                        "/C".to_string(),
+                        "cd /d %AGENTERO_AGENT_CWD% && %AGENTERO_AGENT_COMMAND%".to_string(),
+                    ]
+                );
                 assert!(env.contains_key("AGENTERO_AGENT_CWD"));
+                // Zcode's `server` subcommand must survive the wrap. Without it
+                // the adapter opens a TUI and never indexes `.agents/skills`.
+                if !desc.args.is_empty() {
+                    let suffix = format!(
+                        " {}",
+                        desc.args
+                            .iter()
+                            .map(|arg| windows_shell_quote(arg))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                    let command_env = env.get("AGENTERO_AGENT_COMMAND").unwrap();
+                    assert!(
+                        command_env.ends_with(&suffix),
+                        "{} command {command_env} missing {suffix}",
+                        desc.id
+                    );
+                }
                 continue;
             }
             // Native launchers also remain direct for UNC vaults; they must not
@@ -954,6 +1171,32 @@ mod cwd_shell_wrap_tests {
                 assert!(env.is_empty());
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn sdk_launch_accepts_windows_drive_env_and_batch_shims() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = dir.path().join("agent shim.cmd");
+        std::fs::write(
+            &batch,
+            "@echo off\r\nif not \"%~1\"==\"hello world\" exit /b 1\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+        let mut desc = descriptor(AgentTemplate::Opencode);
+        desc.command = windows_shell_path(&batch).display().to_string();
+        desc.args = vec!["hello world".into()];
+        // Windows exposes per-drive cwd entries through std::env::vars().
+        // Replaying one through windows-spawn rejected the name before launch.
+        desc.env.insert("=C:".into(), r"C:\".into());
+        let agent = to_acp_agent_local(&desc, None).unwrap();
+        let (_stdin, _stdout, _stderr, mut child) = agent.spawn_process().unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.status()).await;
+        if status.is_err() {
+            let _ = child.kill();
+            let _ = child.status().await;
+        }
+        assert!(status.unwrap().unwrap().success());
     }
 
     #[test]
@@ -1091,5 +1334,31 @@ mod cwd_shell_wrap_tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn build_child_env_drops_appimage_loader_overrides() {
+        let process_env = vec![
+            ("APPDIR".to_string(), "/tmp/.mount_Agentero".to_string()),
+            (
+                "LD_LIBRARY_PATH".to_string(),
+                "/tmp/.mount_Agentero/usr/lib".to_string(),
+            ),
+            (
+                "LD_PRELOAD".to_string(),
+                "/tmp/.mount_Agentero/lib.so".to_string(),
+            ),
+        ]
+        .into_iter();
+        let mut shell_env = HashMap::new();
+        shell_env.insert(
+            "LD_LIBRARY_PATH".to_string(),
+            "/tmp/.mount_Agentero/shell/lib".to_string(),
+        );
+
+        let env = build_child_env(process_env, Some(&shell_env), &HashMap::new());
+
+        assert!(!env.contains_key("LD_LIBRARY_PATH"));
+        assert!(!env.contains_key("LD_PRELOAD"));
     }
 }

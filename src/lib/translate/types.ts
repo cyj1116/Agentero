@@ -13,6 +13,7 @@ export type FreeTranslateProviderId =
 	| "google"
 	| "googleapi"
 	| "deeplx"
+	| "cnki"
 	| "huoshanweb"
 	| "tencenttransmart";
 
@@ -49,8 +50,21 @@ export type TranslateSettings = {
 	/**
 	 * Open a secondary window with the rendered full-document translation so the
 	 * original PDF stays on the left and the translation stays on the right.
+	 * @deprecated Use `displayMode` instead; kept for migration.
 	 */
 	dualPaneTranslate: boolean;
+	/**
+	 * How full-document translation is displayed.
+	 * - `overlay`: in-place translation layer over the source PDF.
+	 * - `dualPane`: side-by-side source + translation panes.
+	 */
+	displayMode: TranslationDisplayMode;
+	/**
+	 * Which source drives the left pane when `displayMode === "dualPane"`.
+	 * - `pdf`: the rendered PDF.
+	 * - `latex`: the arXiv LaTeX source.
+	 */
+	dualPaneSource: DualPaneSource;
 	/**
 	 * Agent seat for provider === "agent".
 	 * Empty = follow registry defaultId.
@@ -62,13 +76,43 @@ export type TranslateSettings = {
 	 */
 	modelId: string;
 	/**
-	 * Custom translate prompt replacing the built-in instructions for the
-	 * Agent and OpenAI-compatible providers (free MT and the built-in ignore
-	 * it). Empty = built-in. Supports {{targetLang}} / {{sourceLang}}; the
-	 * source text and [[n]] batch rules are always appended by the app.
-	 * Max 8000 chars.
+	 * Legacy single template. Kept so older settings.json still apply.
+	 * Empty when `customSystem` is set. A one-line colloquial value is an
+	 * extra preference; anything longer replaces the academic style block
+	 * only. Engine rules always stay. Max 8000 chars.
 	 */
 	customPrompt: string;
+	/**
+	 * Custom system style or preference. Wins over `customPrompt`.
+	 * Placeholders: targetLang, sourceLang, and text.
+	 */
+	customSystem: string;
+	/**
+	 * Custom user template. Used only when it contains the text placeholder;
+	 * otherwise the source is still quoted. Max 8000 chars.
+	 */
+	customUser: string;
+	/**
+	 * Persist extracted reflow character IR pages under the app cache directory
+	 * (default on). Off = extraction runs again on every open and nothing is
+	 * written; existing files stay until the cache is cleared.
+	 */
+	cacheReflowIr: boolean;
+	/**
+	 * Persist the finished translated PDF under the app cache directory
+	 * (default off: each final is ~25 MB).
+	 */
+	cacheReflowFinal: boolean;
+	/**
+	 * Translate a paper's full text in the background once it is imported and
+	 * its layout analysis succeeds (default off: it spends provider quota).
+	 */
+	autoTranslateImport: boolean;
+	/**
+	 * How many papers the import-triggered background translation runs at
+	 * once (1–5, default 1). Seeded into the JobCenter `layoutTranslate` cap.
+	 */
+	autoTranslateImportConcurrency: number;
 };
 
 export type TranslateProviderConfig = {
@@ -79,6 +123,8 @@ export type TranslateProviderConfig = {
 	region: string;
 	/** OpenAI-compatible model id. */
 	model: string;
+	/** JSON object replacing automatic request options; blank uses model defaults. */
+	extraRequestBody?: string;
 };
 
 export type TranslateServiceType = "sentence" | "word";
@@ -109,6 +155,10 @@ export type TranslateRunOptions = {
 	 * settings.translate.customPrompt (set by `runTranslate`).
 	 */
 	customPrompt?: string;
+	/** Wins over `customPrompt`. Defaults to settings.translate.customSystem. */
+	customSystem?: string;
+	/** Defaults to settings.translate.customUser. */
+	customUser?: string;
 	/**
 	 * Agent path: inject runner so lib/ does not depend on ACP wiring.
 	 * Streaming is the caller's concern; this returns the final string when used.
@@ -136,6 +186,7 @@ export const FREE_MT_PROVIDER_IDS: FreeTranslateProviderId[] = [
 	"tencenttransmart",
 	"huoshanweb",
 	"deeplx",
+	"cnki",
 	"googleapi",
 	"google",
 ];
@@ -175,3 +226,18 @@ export const COMMERCIAL_MT_DOCS_URLS: Record<
 		"https://console.cloud.google.com/apis/library/translate.googleapis.com",
 	openaiCompatible: "https://platform.openai.com/api-keys",
 };
+
+/** How full-document translation is rendered. */
+export type TranslationDisplayMode = "overlay" | "dualPane";
+
+/** Canonical display modes in UI order. */
+export const TRANSLATION_DISPLAY_MODES: TranslationDisplayMode[] = [
+	"overlay",
+	"dualPane",
+];
+
+/** Source pane type for dual-pane full-document translation. */
+export type DualPaneSource = "pdf" | "latex";
+
+/** Canonical dual-pane source values in UI order. */
+export const DUAL_PANE_SOURCES: DualPaneSource[] = ["pdf", "latex"];

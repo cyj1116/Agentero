@@ -2,6 +2,7 @@ use crate::features::agent::acp::ask_user::{
     cancelled_response, grok_response_from_answers, questions_to_dto, AskUserRequestEvent,
     GrokAskUserRequest,
 };
+use crate::features::agent::models::ElicitationFieldValue;
 use crate::features::agent::runtime::events::AgentEventEmitter;
 use crate::features::agent::runtime::gates::{
     AskUserAnswer, AskUserGate, ElicitationAnswer, ElicitationGate, PermissionGate,
@@ -9,8 +10,8 @@ use crate::features::agent::runtime::gates::{
 use agent_client_protocol::schema::v1::{
     CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction,
     ElicitationAction, ElicitationContentValue, ElicitationMode, ElicitationPropertySchema,
-    ElicitationScope, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome,
+    ElicitationScope, MultiSelectItems, PermissionOptionKind, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
 };
 use std::collections::{BTreeMap, HashSet};
 
@@ -36,6 +37,70 @@ pub(crate) fn permission_response(
     RequestPermissionResponse::new(outcome)
 }
 
+#[cfg(test)]
+mod elicitation_tests {
+    use super::*;
+    use crate::features::agent::models::ElicitationResponseRequest;
+    use serde_json::json;
+
+    #[test]
+    fn array_elicitation_preserves_options_and_multiple_wire_answers() {
+        let request: CreateElicitationRequest = serde_json::from_value(json!({
+            "sessionId": "session", "mode": "form", "message": "Choose features",
+            "requestedSchema": { "type": "object", "required": ["features"], "properties": {
+                "features": { "type": "array", "title": "Features", "items": {
+                    "type": "string", "enum": ["trace", "citations"]
+                }}
+            }}
+        }))
+        .unwrap();
+        let fields = elicitation_fields_from_request(&request);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].kind, "multiselect");
+        assert!(fields[0].required);
+        assert_eq!(
+            fields[0]
+                .options
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["trace", "citations"]
+        );
+
+        let answer: ElicitationResponseRequest = serde_json::from_value(json!({
+            "requestId": "request", "action": "accept", "content": {
+                "features": ["trace", "citations"], "comment": "both"
+            }
+        }))
+        .unwrap();
+        let response =
+            elicitation_response_from_answer(ElicitationAnswer::Accept(answer.content.unwrap()));
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["content"]["features"], json!(["trace", "citations"]));
+        assert_eq!(wire["content"]["comment"], "both");
+    }
+
+    #[test]
+    fn titled_array_options_keep_labels_and_descriptions() {
+        let request: CreateElicitationRequest = serde_json::from_value(json!({
+            "sessionId": "session", "mode": "form", "message": "Choose features",
+            "requestedSchema": { "type": "object", "properties": {
+                "features": { "type": "array", "items": { "anyOf": [
+                    { "const": "trace", "title": "Execution trace", "description": "Show commands" }
+                ]}}
+            }}
+        }))
+        .unwrap();
+        let fields = elicitation_fields_from_request(&request);
+        assert_eq!(fields[0].kind, "multiselect");
+        assert_eq!(fields[0].options[0].title, "Execution trace");
+        assert_eq!(
+            fields[0].options[0].description.as_deref(),
+            Some("Show commands")
+        );
+    }
+}
+
 /// How ACP permission requests are handled for a run.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PermissionPolicy {
@@ -57,6 +122,9 @@ pub(crate) struct PermissionRequestEvent {
     pub(crate) kind: Option<String>,
     pub(crate) paths: Vec<String>,
     pub(crate) options: Vec<PermissionOptionView>,
+    /// Remote host when this request came from a delegated run.
+    #[serde(default)]
+    pub(crate) host: Option<String>,
 }
 
 #[derive(specta::Type, Clone, serde::Serialize)]
@@ -85,7 +153,7 @@ pub(crate) struct ElicitationFieldView {
     pub(crate) title: String,
     pub(crate) description: Option<String>,
     pub(crate) required: bool,
-    /// select | text | boolean | number | other
+    /// select | multiselect | text | boolean | number | other
     pub(crate) kind: String,
     pub(crate) options: Vec<ElicitationOptionView>,
     /// Codex companion free-text for "Other" (same logical question).
@@ -260,14 +328,37 @@ pub(crate) fn elicitation_fields_from_request(
                     "number",
                     Vec::new(),
                 ),
-                ElicitationPropertySchema::Array(a) => ElicitationFieldView::plain(
-                    id,
-                    a.title.as_deref(),
-                    a.description.as_deref(),
-                    is_required,
-                    "text",
-                    Vec::new(),
-                ),
+                ElicitationPropertySchema::Array(a) => {
+                    let options = match &a.items {
+                        MultiSelectItems::String(items) => items
+                            .values
+                            .iter()
+                            .map(|value| ElicitationOptionView {
+                                value: value.clone(),
+                                title: value.clone(),
+                                description: None,
+                            })
+                            .collect(),
+                        MultiSelectItems::Titled(items) => items
+                            .options
+                            .iter()
+                            .map(|option| ElicitationOptionView {
+                                value: option.value.clone(),
+                                title: option.title.clone(),
+                                description: option.description.clone(),
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    ElicitationFieldView::plain(
+                        id,
+                        a.title.as_deref(),
+                        a.description.as_deref(),
+                        is_required,
+                        "multiselect",
+                        options,
+                    )
+                }
                 ElicitationPropertySchema::Other(_) | _ => {
                     ElicitationFieldView::plain(id, None, None, is_required, "other", Vec::new())
                 }
@@ -297,7 +388,19 @@ pub(crate) fn elicitation_response_from_answer(
         ElicitationAnswer::Accept(fields) => {
             let content: BTreeMap<String, ElicitationContentValue> = fields
                 .into_iter()
-                .map(|(k, v)| (k, ElicitationContentValue::String(v)))
+                .map(|(k, v)| {
+                    (
+                        k,
+                        match v {
+                            ElicitationFieldValue::String(value) => {
+                                ElicitationContentValue::String(value)
+                            }
+                            ElicitationFieldValue::StringArray(values) => {
+                                ElicitationContentValue::StringArray(values)
+                            }
+                        },
+                    )
+                })
                 .collect();
             CreateElicitationResponse::new(ElicitationAction::Accept(
                 ElicitationAcceptAction::new().content(content),
@@ -398,6 +501,8 @@ pub(crate) async fn await_user_permission(
     app: &AgentEventEmitter,
     gate: &PermissionGate,
     session_id: &str,
+    host: Option<&str>,
+    user_wait: Option<&crate::features::agent::session::DelegateUserWait>,
     request: &RequestPermissionRequest,
 ) -> RequestPermissionResponse {
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -433,6 +538,13 @@ pub(crate) async fn await_user_permission(
         .collect();
 
     let rx = gate.register(&request_id);
+    if let Some(wait) = user_wait {
+        if let Ok(mut id) = wait.request_id.lock() {
+            *id = Some(request_id.clone());
+        }
+        wait.waiting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     let _ = app.emit(
         "agent:permission-request",
         PermissionRequestEvent {
@@ -442,10 +554,20 @@ pub(crate) async fn await_user_permission(
             kind,
             paths,
             options,
+            host: host.map(str::to_string).filter(|host| !host.is_empty()),
         },
     );
 
     let answer = tokio::time::timeout(std::time::Duration::from_secs(300), rx).await;
+    if let Some(wait) = user_wait {
+        wait.waiting
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut id) = wait.request_id.lock() {
+            if id.as_deref() == Some(request_id.as_str()) {
+                *id = None;
+            }
+        }
+    }
     let outcome = match answer {
         Ok(Ok(Some(option_id))) => {
             RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id))

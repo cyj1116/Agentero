@@ -3,10 +3,11 @@ use crate::core::error::{map_err, ApiResult, AppError};
 use serde::{Deserialize, Serialize};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use tauri::State;
+use tauri::{Manager, State};
 
 use super::{
-    emit_job_changed, parse_lane, JobCenter, JobKind, JobLane, JobSnapshot, JobState, StartOutcome,
+    emit_job_changed, parse_lane, start_enqueued_job, JobCenter, JobKind, JobLane, JobSnapshot,
+    JobState, StartOutcome,
 };
 
 /// Validate the command's (vault, paper) pair or early-return the IPC error
@@ -31,6 +32,23 @@ pub struct JobEnqueueArgs {
     pub lane: Option<JobLane>,
     #[serde(default)]
     pub force: bool,
+}
+
+/// `layoutAnalyze` enqueue args. `auto_translate` marks import / download
+/// origins: when Settings → Translate → "Auto-translate after import" is on,
+/// the Host also queues the dependent `layoutTranslate` job. Opening a paper or
+/// re-parsing layout leaves it false.
+#[derive(Debug, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct JobLayoutAnalyzeEnqueueArgs {
+    pub vault_path: String,
+    pub path: String,
+    #[serde(default)]
+    pub lane: Option<JobLane>,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub auto_translate: bool,
 }
 
 #[derive(Debug, Deserialize, specta::Type)]
@@ -64,6 +82,12 @@ pub struct JobListArgs {
 
 #[derive(Debug, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
+pub struct JobReorderArgs {
+    pub job_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct JobReportArgs {
     pub job_id: String,
     #[serde(default)]
@@ -74,6 +98,9 @@ pub struct JobReportArgs {
     pub error: Option<String>,
     #[serde(default)]
     pub state: Option<JobState>,
+    #[serde(default)]
+    #[specta(type = Option<crate::core::json::Json>)]
+    pub params: Option<serde_json::Value>,
 }
 
 /// Announce an enqueued job (`job:changed`) and start it when its kind has a
@@ -255,7 +282,14 @@ pub async fn job_reconcile_paper(
     caps.invalidate(&vault, &path);
     let paper_caps = caps.caps_for(&vault, &path);
     let mut enqueued = Vec::new();
-    if paper_caps.needs_paper_md() {
+    if paper_caps.needs_paper_md()
+        || crate::features::paper::catalog::papers::get_by_path(&vault, &path)
+            .ok()
+            .flatten()
+            .is_some_and(|paper| {
+                agentero_core::features::paper::source::needs_preparation(&vault, &paper)
+            })
+    {
         enqueued.push(
             enqueue_backfill(&app, &center, parse_lane(None), |lane| {
                 center.enqueue_parse_body(&vault, &path, lane, false, None)
@@ -281,42 +315,69 @@ pub async fn job_reconcile_paper(
 
 #[derive(Debug, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
-pub struct JobReconcileVaultArgs {
+pub struct JobBackfillPreviewArgs {
     pub vault_path: String,
 }
 
-/// Vault-wide reconcile (§7.3 T2): backfill `ParseBody` for every catalog paper
-/// that has a PDF but no TeX and no `PAPER.md`. Jobs enqueue on the idle lane;
-/// the per-kind cap (ParseBody = 1) throttles execution. Returns the count.
+/// Preview vault-wide backfill and inline local catalog repairs. Never enqueues work.
 #[tauri::command]
 #[specta::specta]
-pub async fn job_reconcile_vault(
-    app: tauri::AppHandle,
-    center: State<'_, JobCenter>,
-    caps: State<'_, crate::features::paper::catalog::CapsCache>,
-    args: JobReconcileVaultArgs,
-) -> Result<ApiResult<u32>, String> {
+pub async fn job_backfill_preview(
+    args: JobBackfillPreviewArgs,
+) -> Result<ApiResult<agentero_core::features::paper::source::backfill::BackfillPreview>, String> {
     let vault = try_vault_ok!(&args.vault_path);
-    let caps_handle = (*caps).clone();
-    let scan_vault = vault.clone();
-    let needing = tauri::async_runtime::spawn_blocking(move || {
-        let Ok(papers) = crate::features::paper::catalog::papers::list_all(&scan_vault) else {
-            return Vec::new();
-        };
-        papers
-            .into_iter()
-            .map(|paper| paper.path)
-            .filter(|path| {
-                caps_handle.invalidate(&scan_vault, path);
-                caps_handle.caps_for(&scan_vault, path).needs_paper_md()
-            })
-            .collect::<Vec<_>>()
+    match tauri::async_runtime::spawn_blocking(move || {
+        agentero_core::features::paper::source::backfill::preview(&vault)
     })
     .await
-    .unwrap_or_default();
+    {
+        Ok(Ok(preview)) => Ok(ApiResult::ok(preview)),
+        Ok(Err(error)) => Ok(map_err(error)),
+        Err(error) => Err(error.to_string()),
+    }
+}
 
-    let mut enqueued = 0u32;
-    for path in needing {
+#[derive(Debug, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct JobBackfillEnqueueArgs {
+    pub vault_path: String,
+    pub paths: Vec<String>,
+}
+
+/// Enqueue only the explicitly confirmed paths, without rescanning the catalog.
+#[tauri::command]
+#[specta::specta]
+pub async fn job_backfill_enqueue(
+    app: tauri::AppHandle,
+    center: State<'_, JobCenter>,
+    args: JobBackfillEnqueueArgs,
+) -> Result<ApiResult<u32>, String> {
+    let vault = try_vault_ok!(&args.vault_path);
+    let mut paths = std::collections::BTreeSet::new();
+    // Validate the whole selection before starting any work.
+    for path in args.paths {
+        match super::validate_job_paper(&args.vault_path, &path) {
+            Ok((_, path)) => {
+                paths.insert(path);
+            }
+            Err(error) => return Ok(map_err(error)),
+        }
+    }
+    let mut enqueued = 0;
+    for path in paths {
+        if deferred_if_recognizing(
+            &center,
+            &vault,
+            &path,
+            JobKind::ParseBody,
+            JobLane::Idle,
+            false,
+        )
+        .await
+        .is_some()
+        {
+            continue;
+        }
         enqueue_backfill(&app, &center, JobLane::Idle, |lane| {
             center.enqueue_parse_body(&vault, &path, lane, false, None)
         })
@@ -354,6 +415,10 @@ pub async fn job_papers_needing_assets(
             .filter(|paper| {
                 let caps = caps_handle.caps_for(&scan_vault, &paper.path);
                 caps.needs_asset_download(paper.body_source.as_deref())
+                    || agentero_core::features::paper::source::needs_source(
+                        &scan_vault.join(&paper.path),
+                        agentero_core::features::paper::source::arxiv_request(paper).as_deref(),
+                    )
             })
             .map(|paper| paper.path)
             .collect::<Vec<_>>()
@@ -363,12 +428,86 @@ pub async fn job_papers_needing_assets(
     Ok(ApiResult::ok(needing))
 }
 
+/// Request a document translation through the same queue used by imports.
+#[tauri::command]
+#[specta::specta]
+pub async fn job_layout_translate_enqueue(
+    app: tauri::AppHandle,
+    center: State<'_, JobCenter>,
+    args: JobEnqueueArgs,
+) -> Result<ApiResult<JobSnapshot>, String> {
+    let (vault, path) = try_job_paper!(args);
+    let active = center
+        .list(Some(&vault), Some(&path))
+        .await
+        .into_iter()
+        .find(|job| {
+            job.kind == JobKind::LayoutTranslate
+                && matches!(job.state, JobState::Queued | JobState::Running)
+        });
+    let job = if let Some(job) = active {
+        job
+    } else if vault.join(&path).join("source/layout.json").is_file() {
+        center
+            .enqueue_core(
+                JobKind::LayoutTranslate,
+                vault,
+                path,
+                JobLane::Focus,
+                args.force,
+                None,
+                None,
+            )
+            .await
+    } else {
+        let layout = center
+            .enqueue_layout_analyze(vault.clone(), path.clone(), JobLane::Focus, false)
+            .await;
+        let translate = center
+            .enqueue_layout_translate_after(
+                vault,
+                path,
+                JobLane::Focus,
+                args.force,
+                super::JobId(layout.id.clone()),
+            )
+            .await;
+        emit_job_changed(&app, layout);
+        translate
+    };
+    for snapshot in center.focus_layout_translate(&job.id).await {
+        emit_job_changed(&app, snapshot);
+    }
+    center.drain_and_spawn(&app).await;
+    Ok(ApiResult::ok(center.snapshot(&job.id).await.unwrap_or(job)))
+}
+
+#[derive(Debug, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct JobLayoutTranslateClaimArgs {
+    pub job_id: String,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn job_layout_translate_claim(
+    window: tauri::WebviewWindow,
+    center: State<'_, JobCenter>,
+    args: JobLayoutTranslateClaimArgs,
+) -> Result<ApiResult<bool>, String> {
+    Ok(ApiResult::ok(
+        center
+            .claim_layout_translate(&args.job_id, window.label())
+            .await,
+    ))
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn job_layout_analyze_enqueue(
     app: tauri::AppHandle,
     center: State<'_, JobCenter>,
-    args: JobEnqueueArgs,
+    args: JobLayoutAnalyzeEnqueueArgs,
 ) -> Result<ApiResult<JobSnapshot>, String> {
     let (vault, path) = try_job_paper!(args);
     if let Some(snapshot) = deferred_if_recognizing(
@@ -383,13 +522,30 @@ pub async fn job_layout_analyze_enqueue(
     {
         return Ok(ApiResult::ok(snapshot));
     }
+    // Only import / download origins opt in; the setting is read here so the
+    // renderer never has to mirror it and a settings change needs no requeue.
+    let auto_translate = args.auto_translate
+        && app
+            .state::<crate::features::system::settings::AppSettingsStore>()
+            .auto_translate_import();
     center.refresh_layout_backend().await;
-    Ok(start_enqueued(
-        &app,
-        &center,
-        center.enqueue_layout_analyze(&vault, &path, parse_lane(args.lane), args.force),
-    )
-    .await)
+    let (layout, translate) = center
+        .enqueue_layout_analysis_with_translate(
+            &vault,
+            &path,
+            parse_lane(args.lane),
+            args.force,
+            auto_translate,
+        )
+        .await;
+    if let Some(translate) = translate {
+        // Queued behind the layout job; its own `job:changed` carries the row.
+        emit_job_changed(&app, translate.clone());
+        // Layout may have settled between the two enqueues (dedupe hit on a
+        // running job); the finish event would then never wake the dependent.
+        start_enqueued_job(&app, &center, &translate).await;
+    }
+    Ok(ApiResult::ok(start_or_hold(&app, &center, layout).await))
 }
 
 #[derive(Debug, Deserialize, specta::Type)]
@@ -404,6 +560,8 @@ pub struct JobLatexCompileEnqueueArgs {
     pub lane: Option<JobLane>,
     #[serde(default)]
     pub force: bool,
+    #[serde(default)]
+    pub build: Option<crate::features::compile::types::LatexBuildOptions>,
 }
 
 #[tauri::command]
@@ -429,7 +587,8 @@ pub async fn job_latex_compile_enqueue(
         ))));
     }
     let tex_path = tex_path.to_string_lossy().to_string();
-    let params = serde_json::json!({ "texPath": tex_path, "engine": args.engine });
+    let params =
+        serde_json::json!({ "texPath": tex_path, "engine": args.engine, "build": args.build });
     Ok(start_enqueued(
         &app,
         &center,
@@ -456,6 +615,22 @@ pub async fn job_download_assets_enqueue(
         &app,
         &center,
         center.enqueue_download_assets(&vault, &path, parse_lane(args.lane), args.force),
+    )
+    .await)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn job_jev_smart_highlights_enqueue(
+    app: tauri::AppHandle,
+    center: State<'_, JobCenter>,
+    args: JobEnqueueArgs,
+) -> Result<ApiResult<JobSnapshot>, String> {
+    let (vault, path) = try_job_paper!(args);
+    Ok(start_enqueued(
+        &app,
+        &center,
+        center.enqueue_jev_smart_highlights(&vault, &path, parse_lane(args.lane), args.force),
     )
     .await)
 }
@@ -707,6 +882,15 @@ pub async fn job_focus_paper(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn job_reorder(
+    center: State<'_, JobCenter>,
+    args: JobReorderArgs,
+) -> Result<ApiResult<bool>, String> {
+    Ok(ApiResult::ok(center.reorder_queued(&args.job_ids).await))
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn job_cancel(
     app: tauri::AppHandle,
     center: State<'_, JobCenter>,
@@ -731,6 +915,9 @@ pub async fn job_report(
     center: State<'_, JobCenter>,
     args: JobReportArgs,
 ) -> Result<ApiResult<JobSnapshot>, String> {
+    if let Some(params) = args.params {
+        center.merge_running_job_params(&args.job_id, params).await;
+    }
     match center
         .job_report(
             &args.job_id,
@@ -882,7 +1069,7 @@ async fn clear_parse_results_core(
         if !paper_dir.is_dir() {
             continue;
         }
-        affected_paths.push(paper.path);
+        affected_paths.push(paper.path.clone());
 
         if matches!(scope, ParseResultScope::Layout | ParseResultScope::All) {
             let source_dir = paper_dir.join("source");
@@ -897,6 +1084,9 @@ async fn clear_parse_results_core(
             && remove_file_best_effort(&paper_dir.join(PAPER_MD_FILE))?
         {
             files_removed += 1;
+        }
+        if matches!(scope, ParseResultScope::Paper | ParseResultScope::All) {
+            agentero_core::features::paper::source::reconcile_body(&vault, &paper.path)?;
         }
     }
 

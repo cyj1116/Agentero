@@ -2,6 +2,7 @@
 
 use super::schema::with_catalog;
 use crate::error::AppError;
+use crate::features::paper::identity::is_paper_marker_file;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -21,7 +22,8 @@ const PAPER_COLUMNS: &str = "\
     added_at, updated_at, \
     creators_json, date, isbn, issn, pmid, publication, volume, issue, pages, \
     publisher, place, series, language, zotero_item_type, meta_source, extra, \
-    is_read, zotero_item_id, zotero_last_synced";
+    is_read, zotero_item_id, zotero_last_synced, code_repo, openreview_url, \
+    custom_props_json";
 
 /// Prefix for Connector provenance tags (hidden from user-facing tag UI).
 pub const ZOTERO_INTERNAL_TAG_PREFIX: &str = "@zotero:";
@@ -297,6 +299,16 @@ pub struct PaperRecord {
     pub html_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
+    /// Code repository. Import fills this from the main PDF when it is empty
+    /// and the user has not edited it; Edit Metadata can set or clear it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_repo: Option<String>,
+    /// Manually maintained OpenReview link; never resolved from identifiers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openreview_url: Option<String>,
+    /// Custom property values: property_id -> option_id (select).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub custom_props: std::collections::HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -363,6 +375,9 @@ impl PaperRecord {
             pdf_url: None,
             html_url: None,
             source_url: None,
+            code_repo: None,
+            openreview_url: None,
+            custom_props: std::collections::HashMap::new(),
             body_source: None,
             body_quality: None,
             bibtex_key: None,
@@ -392,12 +407,32 @@ impl PaperRecord {
 /// Upsert paper row to catalog and project it into the paper's sidecar.
 pub fn upsert_paper(vault_root: &Path, record: &PaperRecord) -> Result<PaperRecord, AppError> {
     let persisted = with_catalog(vault_root, |conn| upsert_conn(conn, record))?;
-    super::sidecar::write_sidecar(vault_root, &persisted);
+    with_catalog(vault_root, |conn| {
+        super::sidecar::retry_pending(vault_root, conn, Some(&persisted.path));
+        Ok(())
+    })?;
     Ok(persisted)
+}
+
+/// Restore missing rows without overwriting a concurrent watcher/user update.
+pub fn insert_paper_if_missing(vault_root: &Path, record: &PaperRecord) -> Result<(), AppError> {
+    let path = crate::fs::normalize_rel_separators(&record.path);
+    with_catalog(vault_root, |conn| {
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        if get_conn(&tx, &path)?.is_none() {
+            upsert_conn(&tx, record)?;
+        }
+        tx.commit()?;
+        super::sidecar::retry_pending(vault_root, conn, Some(&path));
+        Ok(())
+    })
 }
 
 pub fn get_by_path(vault_root: &Path, path: &str) -> Result<Option<PaperRecord>, AppError> {
     let path = crate::fs::normalize_rel_separators(path);
+    // A same-vault directory link is another spelling of the canonical folder.
+    let path = crate::fs::linked_dir_vault_rel(vault_root, &path).unwrap_or(path);
     with_catalog(vault_root, |conn| get_conn(conn, &path))
 }
 
@@ -534,7 +569,92 @@ pub fn find_by_identifier(
 
 /// List all papers for library table (newest first).
 pub fn list_all(vault_root: &Path) -> Result<Vec<PaperRecord>, AppError> {
-    with_catalog(vault_root, list_all_conn)
+    with_catalog(vault_root, |conn| {
+        repair_legacy_local_ids(vault_root, conn)?;
+        list_all_conn(conn)
+    })
+}
+
+/// Allocate a local placeholder id across the whole vault, keeping its path.
+pub fn allocate_local_id(vault_root: &Path, base: &str, path: &str) -> Result<String, AppError> {
+    with_catalog(vault_root, |conn| local_id_conn(conn, base, path))
+}
+
+fn local_id_conn(conn: &Connection, base: &str, path: &str) -> Result<String, AppError> {
+    use sha2::{Digest, Sha256};
+    let taken = |id: &str| -> Result<bool, AppError> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM papers WHERE id = ?1 AND path != ?2)",
+            params![id, path],
+            |row| row.get(0),
+        )?)
+    };
+    if !taken(base)? {
+        return Ok(base.to_string());
+    }
+    let digest = hex::encode(Sha256::digest(path.as_bytes()));
+    let prefix = format!("{base}-{}", &digest[..12]);
+    let mut id = prefix.clone();
+    let mut suffix = 2;
+    while taken(&id)? {
+        id = format!("{prefix}-{suffix}");
+        suffix += 1;
+    }
+    Ok(id)
+}
+
+// Old ASCII-only slugs collapsed unrelated CJK folders to `paper` (#937).
+// Repair before id-based dedupe; project the correction through the existing
+// durable sidecar queue so rescan cannot resurrect the bad id. Paths and
+// resources stay in place. Canonical scholarly identifiers are left alone.
+fn repair_legacy_local_ids(vault_root: &Path, conn: &Connection) -> Result<Vec<String>, AppError> {
+    let paths = conn
+        .prepare("SELECT path FROM papers WHERE id = 'paper' AND type = 'pdf' ORDER BY path")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let mut changed = Vec::new();
+    for path in paths {
+        let Some(mut record) = get_conn(&tx, &path)? else {
+            continue;
+        };
+        if record.id != "paper" || !vault_root.join(&path).is_dir() {
+            continue;
+        }
+        // Reconcile newer external edits before projecting the repaired row.
+        if let Some(sidecar) = super::sidecar::read_sidecar(vault_root, &path) {
+            if crate::time::rfc3339_after(&sidecar.updated_at, &record.updated_at) {
+                record = sidecar;
+            }
+        }
+        if record.id != "paper" || record.doi.is_some() || record.arxiv_id.is_some() {
+            continue;
+        }
+        let name = path.rsplit('/').next().unwrap_or(&path);
+        let mut base = crate::features::paper::import::slug_from_stem(name);
+        if base == "paper" {
+            use sha2::{Digest, Sha256};
+            base = format!(
+                "paper-{}",
+                &hex::encode(Sha256::digest(path.as_bytes()))[..12]
+            );
+        }
+        record.id = local_id_conn(&tx, &base, &path)?;
+        let now = crate::time::now_rfc3339_millis();
+        if crate::time::rfc3339_after(&now, &record.updated_at) {
+            record.updated_at = now;
+        }
+        upsert_conn(&tx, &record)?;
+        changed.push(path);
+    }
+    tx.commit()?;
+    for path in &changed {
+        super::sidecar::retry_pending(vault_root, conn, Some(path));
+    }
+    Ok(changed)
 }
 
 /// Read all papers from an already-open Catalog connection.
@@ -677,7 +797,7 @@ pub fn find_duplicates_conn(
 /// This is a defensive view for the Library table: it hides duplicate catalog
 /// rows caused by old bugs or manual folder copies without deleting anything.
 pub fn list_all_unique_by_id(vault_root: &Path) -> Result<Vec<PaperRecord>, AppError> {
-    let rows = with_catalog(vault_root, list_all_conn)?;
+    let rows = list_all(vault_root)?;
     Ok(dedupe_records_by_id(vault_root, rows))
 }
 
@@ -693,11 +813,17 @@ fn dedupe_records_by_id(vault_root: &Path, rows: Vec<PaperRecord>) -> Vec<PaperR
             .or_insert_with(|| vault_root.join(path).is_dir())
     };
 
-    let mut best_by_id: HashMap<String, PaperRecord> = HashMap::new();
+    let mut best_by_id: HashMap<(String, Option<String>), PaperRecord> = HashMap::new();
     for row in rows {
         let existing_path_exists = path_exists(&row.path);
         best_by_id
-            .entry(row.id.clone())
+            // A filename-derived local id is not a scholarly identity. Never
+            // hide distinct local PDFs just because their names collide.
+            .entry((
+                row.id.clone(),
+                (row.paper_type == PaperKind::Pdf && row.doi.is_none() && row.arxiv_id.is_none())
+                    .then(|| row.path.clone()),
+            ))
             .and_modify(|best| {
                 let best_path_exists = path_exists(&best.path);
                 let replace = match (
@@ -843,6 +969,16 @@ pub fn repair_duplicates(vault_root: &Path) -> Result<DuplicateRepairResult, App
     })
 }
 
+/// A direct child file of `dir` is a paper marker (`NOTES.md` or `metadata.json`).
+fn dir_is_paper(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|ent| {
+        ent.path().is_file() && ent.file_name().to_str().is_some_and(is_paper_marker_file)
+    })
+}
+
 /// Rebuild catalog rows by scanning `papers/` on disk.
 /// Detects paper folders by NOTES.md / metadata.json presence. Idempotent —
 /// disk-only papers are re-added (sidecar metadata preferred over a minimal
@@ -854,10 +990,15 @@ pub fn rebuild_from_disk(vault_root: &Path) -> Result<usize, AppError> {
         return Ok(0);
     }
     with_catalog(vault_root, |conn| {
-        let mut count = 0usize;
+        let mut written = std::collections::HashSet::new();
         let mut stack = vec![papers_dir];
         while let Some(dir) = stack.pop() {
-            if dir.join("NOTES.md").is_file() || dir.join(super::sidecar::SIDECAR_FILE).is_file() {
+            // A directory link is an alias of a paper already stored at its
+            // target. Importing it would insert a second row for the same files.
+            if crate::fs::is_linked_dir(&dir) {
+                continue;
+            }
+            if dir_is_paper(&dir) {
                 // A paper folder is a leaf: reconcile and do not descend.
                 let rel = dir
                     .strip_prefix(vault_root)
@@ -882,8 +1023,8 @@ pub fn rebuild_from_disk(vault_root: &Path) -> Result<usize, AppError> {
                         (None, None) => Some(minimal_record_for(&dir, &rel_path)),
                     };
                     if let Some(record) = next {
-                        if upsert_conn(conn, &record).is_ok() {
-                            count += 1;
+                        if import_disk_row(conn, &record).is_ok() {
+                            written.insert(rel_path);
                         }
                     }
                 }
@@ -892,13 +1033,17 @@ pub fn rebuild_from_disk(vault_root: &Path) -> Result<usize, AppError> {
             if let Ok(read) = fs::read_dir(&dir) {
                 for ent in read.flatten() {
                     let p = ent.path();
+                    if crate::fs::is_linked_dir(&p) {
+                        continue;
+                    }
                     if p.is_dir() {
                         stack.push(p);
                     }
                 }
             }
         }
-        Ok(count)
+        written.extend(repair_legacy_local_ids(vault_root, conn)?);
+        Ok(written.len())
     })
 }
 
@@ -912,14 +1057,124 @@ pub fn ensure_row_for_path(
     rel_path: &str,
 ) -> Result<Option<PaperRecord>, AppError> {
     let rel_path = crate::fs::normalize_rel_separators(rel_path);
+    if let Some(canon) = crate::fs::linked_dir_vault_rel(vault_root, &rel_path) {
+        return ensure_row_for_path(vault_root, &canon);
+    }
+    if crate::fs::is_linked_dir(&vault_root.join(&rel_path)) {
+        return Ok(None);
+    }
     with_catalog(vault_root, |conn| {
         if let Some(row) = get_conn(conn, &rel_path)? {
+            // Same sidecar rule as `rebuild_from_disk`: a newer metadata.json
+            // (sync, or an external replace) updates this one row.
+            if let Some(sidecar) = super::sidecar::read_sidecar(vault_root, &rel_path) {
+                if crate::time::rfc3339_after(&sidecar.updated_at, &row.updated_at) {
+                    return import_disk_row(conn, &sidecar).map(Some);
+                }
+            }
             return Ok(Some(row));
         }
         let record = super::sidecar::read_sidecar(vault_root, &rel_path)
             .unwrap_or_else(|| minimal_record_for(&vault_root.join(&rel_path), &rel_path));
-        upsert_conn(conn, &record).map(Some)
+        import_disk_row(conn, &record).map(Some)
     })
+}
+
+/// How a batch of watcher paths was reconciled into the catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaperRowsTouch {
+    /// Each path mapped onto one paper folder. `count` is rows inserted.
+    /// An existing row is left in place unless its sidecar is newer.
+    Ensured { count: usize },
+    /// A path under `papers/` did not belong to a single paper folder, so
+    /// the whole library was rebuilt.
+    Rescanned { count: usize },
+}
+
+/// Ensure catalog rows for watcher paths under `papers/`.
+///
+/// Each file or paper folder is resolved to the nearest paper directory
+/// (`NOTES.md` / `metadata.json`) and passed to [`ensure_row_for_path`].
+/// A `papers/` root, an organization folder, or any other path that does not
+/// belong to one paper falls back to [`rebuild_from_disk`].
+pub fn ensure_rows_for_paths(
+    vault_root: &Path,
+    paths: &[String],
+) -> Result<PaperRowsTouch, AppError> {
+    let mut papers = std::collections::BTreeSet::new();
+    let mut unmapped = false;
+    for raw in paths {
+        match locate_paper_rel(vault_root, raw) {
+            PaperLocate::Paper(rel) => {
+                papers.insert(rel);
+            }
+            PaperLocate::Unmapped => unmapped = true,
+            PaperLocate::Ignore => {}
+        }
+    }
+    if unmapped {
+        let count = rebuild_from_disk(vault_root)?;
+        return Ok(PaperRowsTouch::Rescanned { count });
+    }
+    let mut count = 0usize;
+    for rel in papers {
+        let existing = get_by_path(vault_root, &rel)?.is_some();
+        if ensure_row_for_path(vault_root, &rel)?.is_some() && !existing {
+            count += 1;
+        }
+    }
+    Ok(PaperRowsTouch::Ensured { count })
+}
+
+enum PaperLocate {
+    Paper(String),
+    Unmapped,
+    Ignore,
+}
+
+fn locate_paper_rel(vault_root: &Path, raw: &str) -> PaperLocate {
+    let rel = vault_rel_for_catalog(vault_root, raw);
+    if rel.is_empty() || rel.split('/').any(|part| part == "..") {
+        return PaperLocate::Ignore;
+    }
+    if rel == "papers" {
+        return PaperLocate::Unmapped;
+    }
+    if !rel.starts_with("papers/") {
+        return PaperLocate::Ignore;
+    }
+    let absolute = vault_root.join(&rel);
+    let mut cursor = if absolute.is_file() {
+        absolute.parent().map(std::path::Path::to_path_buf)
+    } else {
+        Some(absolute)
+    };
+    let papers_root = vault_root.join("papers");
+    while let Some(dir) = cursor {
+        if dir == papers_root || !dir.starts_with(&papers_root) {
+            break;
+        }
+        if dir_is_paper(&dir) {
+            let Some(found) = dir
+                .strip_prefix(vault_root)
+                .ok()
+                .and_then(|path| path.to_str())
+                .map(crate::fs::normalize_rel_separators)
+            else {
+                return PaperLocate::Unmapped;
+            };
+            if found.is_empty() || found == "papers" {
+                return PaperLocate::Unmapped;
+            }
+            return PaperLocate::Paper(found);
+        }
+        cursor = dir.parent().map(std::path::Path::to_path_buf);
+    }
+    PaperLocate::Unmapped
+}
+
+fn vault_rel_for_catalog(vault_root: &Path, raw: &str) -> String {
+    crate::fs::vault_relative(vault_root, raw).unwrap_or_default()
 }
 
 /// Fallback record when a paper folder has no sidecar: folder name as id/title.
@@ -1034,6 +1289,24 @@ pub struct PaperMetaPatch {
     pub abstract_text: Option<String>,
     pub pdf_url: Option<String>,
     pub html_url: Option<String>,
+    pub code_repo: Option<String>,
+    pub openreview_url: Option<String>,
+}
+
+/// Whether Edit Metadata has written `code_repo` for this paper.
+/// A missing row is not manual. The column is not part of [`PaperRecord`].
+pub fn code_repo_is_manual(vault_root: &Path, path: &str) -> Result<bool, AppError> {
+    let path = crate::fs::normalize_rel_separators(path);
+    with_catalog(vault_root, |conn| {
+        let flagged: Option<i64> = conn
+            .query_row(
+                "SELECT code_repo_manual FROM papers WHERE path = ?1",
+                params![path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(flagged.unwrap_or(0) != 0)
+    })
 }
 
 /// Apply a manual metadata patch; returns the updated row.
@@ -1047,79 +1320,101 @@ pub fn update_meta(
 ) -> Result<PaperRecord, AppError> {
     let mut old_title = String::new();
     let mut title_changed = false;
-    let updated = mutate_paper(vault_root, path, |row| {
-        fn norm(value: &str) -> Option<String> {
-            let trimmed = value.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        }
-
-        if let Some(title) = patch.title.as_deref() {
-            let title = title.trim();
-            if title.is_empty() {
-                return Err(AppError::message("title cannot be empty"));
+    let updated = mutate_paper_inner(
+        vault_root,
+        path,
+        |row| {
+            fn norm(value: &str) -> Option<String> {
+                let trimmed = value.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
             }
-            old_title = row.title.clone();
-            title_changed = title != row.title;
-            row.title = title.to_string();
-        }
-        if let Some(authors) = &patch.authors {
-            row.authors = authors
-                .iter()
-                .map(|a| a.trim().to_string())
-                .filter(|a| !a.is_empty())
-                .collect();
-        }
-        if let Some(date) = patch.date.as_deref() {
-            match norm(date) {
-                None => {
-                    row.date = None;
-                    row.year = None;
+
+            if let Some(title) = patch.title.as_deref() {
+                let title = title.trim();
+                if title.is_empty() {
+                    return Err(AppError::message("title cannot be empty"));
                 }
-                Some(text) => {
-                    let parsed = parse_publication_date(&text).ok_or_else(|| {
+                old_title = row.title.clone();
+                title_changed = title != row.title;
+                row.title = title.to_string();
+            }
+            if let Some(authors) = &patch.authors {
+                row.authors = authors
+                    .iter()
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| !a.is_empty())
+                    .collect();
+            }
+            if let Some(date) = patch.date.as_deref() {
+                match norm(date) {
+                    None => {
+                        row.date = None;
+                        row.year = None;
+                    }
+                    Some(text) => {
+                        let parsed = parse_publication_date(&text).ok_or_else(|| {
                         AppError::message(
                             "date must be a year (YYYY), year-month (YYYY-MM) or full date (YYYY-MM-DD)",
                         )
                     })?;
-                    row.year = Some(parsed.year);
-                    row.date = Some(parsed.canonical());
+                        row.year = Some(parsed.year);
+                        row.date = Some(parsed.canonical());
+                    }
                 }
             }
-        }
-        if let Some(v) = patch.doi.as_deref() {
-            row.doi = norm(v);
-        }
-        if let Some(v) = patch.arxiv_id.as_deref() {
-            row.arxiv_id = norm(v);
-        }
-        if let Some(v) = patch.publication.as_deref() {
-            row.publication = norm(v);
-        }
-        if let Some(v) = patch.volume.as_deref() {
-            row.volume = norm(v);
-        }
-        if let Some(v) = patch.issue.as_deref() {
-            row.issue = norm(v);
-        }
-        if let Some(v) = patch.pages.as_deref() {
-            row.pages = norm(v);
-        }
-        if let Some(v) = patch.publisher.as_deref() {
-            row.publisher = norm(v);
-        }
-        if let Some(v) = patch.abstract_text.as_deref() {
-            row.abstract_text = norm(v);
-        }
-        if let Some(v) = patch.pdf_url.as_deref() {
-            row.pdf_url = norm(v);
-        }
-        if let Some(v) = patch.html_url.as_deref() {
-            row.html_url = norm(v);
-        }
+            if let Some(v) = patch.doi.as_deref() {
+                row.doi = norm(v);
+            }
+            if let Some(v) = patch.arxiv_id.as_deref() {
+                row.arxiv_id = norm(v);
+            }
+            if let Some(v) = patch.publication.as_deref() {
+                let next = norm(v);
+                // Metrics are derived from the venue name; a changed publication
+                // invalidates them immediately instead of leaving stale ranks.
+                if next != row.publication {
+                    row.tags.retain(|tag| {
+                        !tag.name
+                            .trim()
+                            .to_ascii_lowercase()
+                            .starts_with("#easyscholar:")
+                    });
+                }
+                row.publication = next;
+            }
+            if let Some(v) = patch.volume.as_deref() {
+                row.volume = norm(v);
+            }
+            if let Some(v) = patch.issue.as_deref() {
+                row.issue = norm(v);
+            }
+            if let Some(v) = patch.pages.as_deref() {
+                row.pages = norm(v);
+            }
+            if let Some(v) = patch.publisher.as_deref() {
+                row.publisher = norm(v);
+            }
+            if let Some(v) = patch.abstract_text.as_deref() {
+                row.abstract_text = norm(v);
+            }
+            if let Some(v) = patch.pdf_url.as_deref() {
+                row.pdf_url = norm(v);
+            }
+            if let Some(v) = patch.html_url.as_deref() {
+                row.html_url = norm(v);
+            }
+            if let Some(v) = patch.code_repo.as_deref() {
+                row.code_repo = norm(v);
+            }
+            if let Some(v) = patch.openreview_url.as_deref() {
+                row.openreview_url = norm(v);
+            }
 
-        row.meta_source = Some("manual".to_string());
-        Ok(())
-    })?;
+            row.meta_source = Some("manual".to_string());
+            Ok(())
+        },
+        patch.code_repo.is_some(),
+    )?;
     if title_changed {
         log::info!(
             target: "agentero::catalog",
@@ -1155,6 +1450,26 @@ pub fn set_tags(vault_root: &Path, path: &str, tags: &[PaperTag]) -> Result<Pape
     })
 }
 
+/// Replace user tags while preserving internal `@zotero:` / `@arxiv:` tags.
+/// This is the `paper tag set` / `paper_tag_set` semantics.
+pub fn set_user_tags(
+    vault_root: &Path,
+    path: &str,
+    tags: &[PaperTag],
+) -> Result<PaperRecord, AppError> {
+    mutate_paper(vault_root, path, |row| {
+        let mut next: Vec<PaperTag> = row
+            .tags
+            .iter()
+            .filter(|tag| is_internal_tag_name(&tag.name))
+            .cloned()
+            .collect();
+        next.extend(tags.iter().cloned());
+        row.tags = normalize_tags(&next);
+        Ok(())
+    })
+}
+
 /// Append tags to a paper (trim + case-insensitive dedupe). Returns the updated row.
 pub fn add_tags(vault_root: &Path, path: &str, tags: &[PaperTag]) -> Result<PaperRecord, AppError> {
     mutate_paper(vault_root, path, |row| {
@@ -1185,10 +1500,34 @@ pub fn remove_tags(
 /// Keep the read/patch/write under one SQLite write reservation, including
 /// writers in other processes (e.g. CLI alongside desktop). A deferred
 /// transaction would allow a stale read before acquiring the write lock.
+pub fn set_body_source(
+    vault_root: &Path,
+    path: &str,
+    body: Option<(&str, &str)>,
+) -> Result<PaperRecord, AppError> {
+    mutate_paper(vault_root, path, |row| {
+        row.body_source = body.map(|(source, _)| source.to_string());
+        row.body_quality = body.map(|(_, quality)| quality.to_string());
+        Ok(())
+    })
+}
+
 fn mutate_paper(
     vault_root: &Path,
     path: &str,
     patch: impl FnOnce(&mut PaperRecord) -> Result<(), AppError>,
+) -> Result<PaperRecord, AppError> {
+    mutate_paper_inner(vault_root, path, patch, false)
+}
+
+/// `mark_code_repo` records that Edit Metadata wrote `code_repo`, including a
+/// clear. The flag lives beside the row so a later PDF scan does not put the
+/// automatic value back. Upsert leaves the column alone.
+fn mutate_paper_inner(
+    vault_root: &Path,
+    path: &str,
+    patch: impl FnOnce(&mut PaperRecord) -> Result<(), AppError>,
+    mark_code_repo: bool,
 ) -> Result<PaperRecord, AppError> {
     let path = crate::fs::normalize_rel_separators(path);
     let persisted = with_catalog(vault_root, |conn| {
@@ -1198,14 +1537,23 @@ fn mutate_paper(
             get_conn(&tx, &path)?.ok_or_else(|| AppError::message("paper not found in catalog"))?;
         patch(&mut row)?;
         row.updated_at = crate::time::now_rfc3339_millis();
-        upsert_conn(&tx, &row)?;
+        upsert_conn_impl(&tx, &row, false)?;
+        if mark_code_repo {
+            tx.execute(
+                "UPDATE papers SET code_repo_manual = 1 WHERE path = ?1",
+                params![path],
+            )?;
+        }
         let persisted =
             get_conn(&tx, &path)?.ok_or_else(|| AppError::message("paper not found in catalog"))?;
         tx.commit()?;
         Ok(persisted)
     })?;
-    // Projection stays best-effort and outside the transaction, as for upsert.
-    super::sidecar::write_sidecar(vault_root, &persisted);
+    // The durable pending path survives a failed projection.
+    with_catalog(vault_root, |conn| {
+        super::sidecar::retry_pending(vault_root, conn, Some(&persisted.path));
+        Ok(())
+    })?;
     Ok(persisted)
 }
 
@@ -1242,6 +1590,16 @@ pub fn list_all_tags(vault_root: &Path) -> Result<Vec<TagCount>, AppError> {
         .into_values()
         .map(|(name, color, count)| TagCount { name, color, count })
         .collect())
+}
+
+/// Catalog-wide tag inventory, optionally hiding internal `@zotero:` /
+/// `@arxiv:` tags. Shared by CLI `paper tag list` and MCP `paper_tag_list`.
+pub fn list_tags(vault_root: &Path, include_internal: bool) -> Result<Vec<TagCount>, AppError> {
+    let mut tags = list_all_tags(vault_root)?;
+    if !include_internal {
+        tags.retain(|tag| !is_internal_tag_name(&tag.name));
+    }
+    Ok(tags)
 }
 
 /// True if the paper has every tag in `required` (exact match, case-insensitive).
@@ -1409,6 +1767,23 @@ pub fn list_page_counts(
     })
 }
 
+/// Cached page count for one paper path, if a probe ever recorded it.
+pub fn get_page_count(vault_root: &Path, path: &str) -> Result<Option<i64>, AppError> {
+    let path = crate::fs::normalize_rel_separators(path);
+    with_catalog(vault_root, |conn| {
+        let mut stmt = conn
+            .prepare("SELECT page_count FROM pdf_page_counts WHERE path = ?1")
+            .map_err(AppError::from)?;
+        let mut rows = stmt
+            .query_map(params![path], |row| row.get::<_, i64>(0))
+            .map_err(AppError::from)?;
+        match rows.next() {
+            Some(value) => Ok(Some(value.map_err(AppError::from)?)),
+            None => Ok(None),
+        }
+    })
+}
+
 /// Batch-upsert cached page counts. Deliberately does not touch `papers`
 /// (no `updated_at` bump) so caching never reorders the library.
 pub fn set_page_counts(vault_root: &Path, counts: &[(String, i64)]) -> Result<(), AppError> {
@@ -1433,9 +1808,30 @@ pub fn set_page_counts(vault_root: &Path, counts: &[(String, i64)]) -> Result<()
     })
 }
 
+// Reconciliation imports an existing disk representation; it must not generate
+// a new sidecar for NOTES-only papers or turn a sync download into a new upload.
+fn import_disk_row(conn: &Connection, record: &PaperRecord) -> Result<PaperRecord, AppError> {
+    let tx = conn.unchecked_transaction()?;
+    let persisted = upsert_conn(&tx, record)?;
+    tx.execute(
+        "DELETE FROM pending_sidecars WHERE path = ?1",
+        [&persisted.path],
+    )?;
+    tx.commit()?;
+    Ok(persisted)
+}
+
 /// Single funnel for catalog writes. `path` is normalized and required here:
 /// an empty one upserts a row whose sidecar would land on the vault root.
 fn upsert_conn(conn: &Connection, r: &PaperRecord) -> Result<PaperRecord, AppError> {
+    upsert_conn_impl(conn, r, true)
+}
+
+fn upsert_conn_impl(
+    conn: &Connection,
+    r: &PaperRecord,
+    inherit_custom_props_if_empty: bool,
+) -> Result<PaperRecord, AppError> {
     let mut r = r.clone();
     r.path = crate::fs::normalize_rel_separators(&r.path);
     if r.path.is_empty() {
@@ -1443,6 +1839,14 @@ fn upsert_conn(conn: &Connection, r: &PaperRecord) -> Result<PaperRecord, AppErr
             "paper record missing vault-relative path (id `{}`)",
             r.id
         )));
+    }
+    // Merge protection: preserve existing custom_props if new record has none.
+    if inherit_custom_props_if_empty && r.custom_props.is_empty() {
+        if let Ok(Some(existing)) = get_conn(conn, &r.path) {
+            if !existing.custom_props.is_empty() {
+                r.custom_props = existing.custom_props;
+            }
+        }
     }
     // Legacy sidecars may carry second-precision timestamps; normalize on the
     // write path so Secs/Millis never mix inside the string-ordered catalog.
@@ -1461,6 +1865,8 @@ fn upsert_conn(conn: &Connection, r: &PaperRecord) -> Result<PaperRecord, AppErr
         .map(serde_json::to_string)
         .transpose()
         .map_err(|e| AppError::message(e.to_string()))?;
+    let custom_props_json =
+        serde_json::to_string(&r.custom_props).map_err(|e| AppError::message(e.to_string()))?;
 
     conn.execute(
         &format!(
@@ -1472,7 +1878,7 @@ fn upsert_conn(conn: &Connection, r: &PaperRecord) -> Result<PaperRecord, AppErr
             ?20, ?21,
             ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
             ?31, ?32, ?33, ?34, ?35, ?36, ?37,
-            ?38, ?39, ?40
+            ?38, ?39, ?40, ?41, ?42, ?43
         )
         ON CONFLICT(path) DO UPDATE SET
             id = excluded.id,
@@ -1512,7 +1918,10 @@ fn upsert_conn(conn: &Connection, r: &PaperRecord) -> Result<PaperRecord, AppErr
             extra = excluded.extra,
             is_read = excluded.is_read,
             zotero_item_id = excluded.zotero_item_id,
-            zotero_last_synced = excluded.zotero_last_synced
+            zotero_last_synced = excluded.zotero_last_synced,
+            code_repo = excluded.code_repo,
+            openreview_url = excluded.openreview_url,
+            custom_props_json = excluded.custom_props_json
         "#,
         ),
         params![
@@ -1556,6 +1965,9 @@ fn upsert_conn(conn: &Connection, r: &PaperRecord) -> Result<PaperRecord, AppErr
             if r.is_read { 1i32 } else { 0i32 },
             r.zotero_item_id,
             r.zotero_last_synced,
+            r.code_repo,
+            r.openreview_url,
+            custom_props_json,
         ],
     )
     .map_err(AppError::from)?;
@@ -1569,6 +1981,13 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaperRecord> {
     let is_read_i: i32 = row.get(37)?;
     let zotero_item_id: Option<i64> = row.get(38)?;
     let zotero_last_synced: Option<String> = row.get(39)?;
+    let code_repo: Option<String> = row.get(40)?;
+    let openreview_url: Option<String> = row.get(41)?;
+    let custom_props_json: Option<String> = row.get(42)?;
+    let custom_props = custom_props_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
     Ok(PaperRecord {
         path: row.get(0)?,
         id: row.get(1)?,
@@ -1612,10 +2031,13 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaperRecord> {
         is_read: is_read_i != 0,
         zotero_item_id,
         zotero_last_synced,
+        code_repo,
+        openreview_url,
+        custom_props,
     })
 }
 
-fn get_conn(conn: &Connection, path: &str) -> Result<Option<PaperRecord>, AppError> {
+pub(crate) fn get_conn(conn: &Connection, path: &str) -> Result<Option<PaperRecord>, AppError> {
     let mut stmt = conn
         .prepare(&format!(
             r#"
@@ -1631,6 +2053,28 @@ fn get_conn(conn: &Connection, path: &str) -> Result<Option<PaperRecord>, AppErr
         .map_err(AppError::from)?;
 
     Ok(row)
+}
+
+pub fn mutate_paper_custom_props(
+    vault_root: &Path,
+    path: &str,
+    patch: impl FnOnce(&mut std::collections::HashMap<String, String>),
+) -> Result<PaperRecord, AppError> {
+    mutate_paper(vault_root, path, |row| {
+        patch(&mut row.custom_props);
+        Ok(())
+    })
+}
+
+pub fn direct_update_paper_custom_props(
+    vault_root: &Path,
+    path: &str,
+    props: &std::collections::HashMap<String, String>,
+) -> Result<PaperRecord, AppError> {
+    mutate_paper(vault_root, path, |row| {
+        row.custom_props = props.clone();
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1801,12 +2245,40 @@ mod tests {
     }
 
     #[test]
+    fn user_tag_replace_keeps_internal_tags_and_inventory_filters_them() {
+        let dir = env::temp_dir().join(format!("agentero-tag-replace-{}", uuid::Uuid::new_v4()));
+        let conn = ensure_catalog(&dir).unwrap();
+        insert(&conn, "papers/x");
+        drop(conn);
+        set_tags(
+            &dir,
+            "papers/x",
+            &[PaperTag::new("@zotero:ABCD"), PaperTag::new("old")],
+        )
+        .unwrap();
+
+        let row = set_user_tags(&dir, "papers/x", &[PaperTag::new("new")]).unwrap();
+        let names: Vec<_> = row.tags.iter().map(|tag| tag.name.as_str()).collect();
+        assert_eq!(names, vec!["@zotero:ABCD", "new"]);
+
+        let public = list_tags(&dir, false).unwrap();
+        assert_eq!(public.len(), 1);
+        assert_eq!(public[0].name, "new");
+        let all = list_tags(&dir, true).unwrap();
+        assert_eq!(all.len(), 2);
+
+        super::super::evict_catalog_conn(&dir);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn concurrent_paper_patches_preserve_fields_and_tag_sets() {
         use std::sync::{Arc, Barrier};
         let dir = env::temp_dir().join(format!(
             "agentero-patch-concurrent-{}",
             uuid::Uuid::new_v4()
         ));
+        fs::create_dir_all(dir.join("papers/x")).unwrap();
         let conn = ensure_catalog(&dir).unwrap();
         insert(&conn, "papers/x");
         drop(conn);
@@ -1854,6 +2326,11 @@ mod tests {
         assert!(row.is_read);
         assert_eq!(row.publication.as_deref(), Some("Journal 31"));
         assert_eq!(row.tags.len(), count);
+        assert_eq!(
+            serde_json::to_value(super::super::sidecar::read_sidecar(&dir, "papers/x").unwrap())
+                .unwrap(),
+            serde_json::to_value(&row).unwrap()
+        );
         for i in 0..count {
             assert!(row.tags.iter().any(|tag| tag.name == format!("add-{i}")));
         }
@@ -1891,6 +2368,8 @@ mod tests {
                 authors: Some(vec![" A ".into(), "".into(), "B".into()]),
                 date: Some("2024-06-12".into()),
                 publication: Some("NeurIPS".into()),
+                code_repo: Some("https://github.com/foo/bar".into()),
+                openreview_url: Some("  https://openreview.net/forum?id=paper  ".into()),
                 ..Default::default()
             },
         )
@@ -1902,6 +2381,21 @@ mod tests {
         assert_eq!(row.year, Some(2024));
         assert_eq!(row.publication.as_deref(), Some("NeurIPS"));
         assert_eq!(row.doi.as_deref(), Some("10.1/old")); // untouched
+        assert_eq!(row.code_repo.as_deref(), Some("https://github.com/foo/bar"));
+        assert_eq!(
+            get_by_path(&dir, "papers/x")
+                .unwrap()
+                .unwrap()
+                .openreview_url
+                .as_deref(),
+            Some("https://openreview.net/forum?id=paper")
+        );
+        assert_eq!(
+            super::super::sidecar::read_sidecar(&dir, "papers/x")
+                .unwrap()
+                .openreview_url,
+            row.openreview_url
+        );
         assert_eq!(row.meta_source.as_deref(), Some("manual"));
 
         // New title appended to aliases; old alias kept.
@@ -1921,6 +2415,10 @@ mod tests {
         .unwrap();
         assert_eq!(row.date.as_deref(), Some("2019-07"));
         assert_eq!(row.year, Some(2019));
+        assert_eq!(
+            row.openreview_url.as_deref(),
+            Some("https://openreview.net/forum?id=paper")
+        );
         let row = update_meta(
             &dir,
             "papers/x",
@@ -1939,6 +2437,8 @@ mod tests {
             &PaperMetaPatch {
                 doi: Some("  ".into()),
                 date: Some("".into()),
+                code_repo: Some("  ".into()),
+                openreview_url: Some("  ".into()),
                 ..Default::default()
             },
         )
@@ -1946,6 +2446,21 @@ mod tests {
         assert_eq!(row.doi, None);
         assert_eq!(row.date, None);
         assert_eq!(row.year, None);
+        assert_eq!(row.code_repo, None);
+        assert_eq!(row.openreview_url, None);
+        assert_eq!(
+            get_by_path(&dir, "papers/x")
+                .unwrap()
+                .unwrap()
+                .openreview_url,
+            None
+        );
+        assert_eq!(
+            super::super::sidecar::read_sidecar(&dir, "papers/x")
+                .unwrap()
+                .openreview_url,
+            None
+        );
 
         // Validation errors.
         assert!(update_meta(
@@ -2072,6 +2587,8 @@ mod tests {
             pdf_url: None,
             html_url: None,
             source_url: None,
+            code_repo: None,
+            openreview_url: None,
             body_source: None,
             body_quality: None,
             bibtex_key: None,
@@ -2084,6 +2601,7 @@ mod tests {
             is_read: false,
             zotero_item_id: None,
             zotero_last_synced: None,
+            custom_props: Default::default(),
             added_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -2128,6 +2646,8 @@ mod tests {
             pdf_url: None,
             html_url: None,
             source_url: None,
+            code_repo: None,
+            openreview_url: None,
             body_source: None,
             body_quality: None,
             bibtex_key: None,
@@ -2140,6 +2660,7 @@ mod tests {
             is_read: false,
             zotero_item_id: None,
             zotero_last_synced: None,
+            custom_props: Default::default(),
             added_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -2201,6 +2722,8 @@ mod tests {
             pdf_url: None,
             html_url: None,
             source_url: None,
+            code_repo: None,
+            openreview_url: None,
             body_source: None,
             body_quality: None,
             bibtex_key: None,
@@ -2213,6 +2736,7 @@ mod tests {
             is_read: false,
             zotero_item_id: None,
             zotero_last_synced: None,
+            custom_props: Default::default(),
             added_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -2238,6 +2762,97 @@ mod tests {
         assert_eq!(minimal.year, None);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_rows_for_paths_targets_one_paper_and_rescans_when_unmapped() {
+        let dir = env::temp_dir().join(format!("agentero-ensure-rows-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("papers/a")).unwrap();
+        fs::create_dir_all(dir.join("papers/b")).unwrap();
+        fs::write(dir.join("papers/a/NOTES.md"), "# a\n").unwrap();
+        fs::write(dir.join("papers/b/NOTES.md"), "# b\n").unwrap();
+        upsert_paper(
+            &dir,
+            &PaperRecord::local_pdf("a".into(), "Paper A".into()).at_path("papers/a"),
+        )
+        .unwrap();
+        upsert_paper(
+            &dir,
+            &PaperRecord::local_pdf("b".into(), "Paper B".into()).at_path("papers/b"),
+        )
+        .unwrap();
+        delete_under_path(&dir, "papers/b").unwrap();
+
+        let notes = dir.join("papers/b/NOTES.md");
+        let touched = ensure_rows_for_paths(&dir, &[notes.to_string_lossy().to_string()]).unwrap();
+        assert_eq!(touched, PaperRowsTouch::Ensured { count: 1 });
+        assert_eq!(
+            get_by_path(&dir, "papers/b").unwrap().unwrap().title,
+            "Paper B"
+        );
+        assert_eq!(
+            get_by_path(&dir, "papers/a").unwrap().unwrap().title,
+            "Paper A"
+        );
+
+        delete_under_path(&dir, "papers/a").unwrap();
+        delete_under_path(&dir, "papers/b").unwrap();
+        let org = dir.join("papers");
+        let rescanned = ensure_rows_for_paths(&dir, &[org.to_string_lossy().to_string()]).unwrap();
+        assert!(matches!(rescanned, PaperRowsTouch::Rescanned { count: 2 }));
+        assert!(get_by_path(&dir, "papers/a").unwrap().is_some());
+        assert!(get_by_path(&dir, "papers/b").unwrap().is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_row_for_path_refreshes_a_newer_sidecar() {
+        let dir = env::temp_dir().join(format!("agentero-ensure-sidecar-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("papers/x")).unwrap();
+        fs::write(dir.join("papers/x/NOTES.md"), "# notes\n").unwrap();
+        upsert_paper(
+            &dir,
+            &PaperRecord::local_pdf("x".into(), "Old".into()).at_path("papers/x"),
+        )
+        .unwrap();
+        let mut sidecar: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("papers/x/metadata.json")).unwrap())
+                .unwrap();
+        sidecar["title"] = serde_json::json!("New");
+        sidecar["updated_at"] = serde_json::json!("2099-01-01T00:00:00.000Z");
+        fs::write(
+            dir.join("papers/x/metadata.json"),
+            serde_json::to_vec_pretty(&sidecar).unwrap(),
+        )
+        .unwrap();
+
+        let row = ensure_row_for_path(&dir, "papers/x").unwrap().unwrap();
+        assert_eq!(row.title, "New");
+        assert_eq!(get_by_path(&dir, "papers/x").unwrap().unwrap().title, "New");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_rows_for_paths_follows_a_symlink_spelling() {
+        let base = env::temp_dir().join(format!("agentero-ensure-canon-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let real = base.join("real");
+        fs::create_dir_all(real.join("papers/a")).unwrap();
+        fs::write(real.join("papers/a/NOTES.md"), "# A\n").unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let notes = real.join("papers/a/NOTES.md");
+        let touched = ensure_rows_for_paths(&link, &[notes.to_string_lossy().to_string()]).unwrap();
+        assert_eq!(touched, PaperRowsTouch::Ensured { count: 1 });
+        assert!(get_by_path(&link, "papers/a").unwrap().is_some());
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -2376,6 +2991,128 @@ mod tests {
     }
 
     #[test]
+    fn chinese_legacy_ids_recover_without_losing_files_or_sidecar_metadata() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        let names = ["舞蹈概论", "舞蹈学中国学派的构成及其方向"];
+        for name in names {
+            let path = format!("papers/{name}");
+            let folder = root.join(&path);
+            fs::create_dir_all(folder.join("marks")).unwrap();
+            fs::write(folder.join("NOTES.md"), "中文阅读笔记").unwrap();
+            fs::write(folder.join("paper.pdf"), b"%PDF-1.4 original").unwrap();
+            fs::write(folder.join("marks/1.json"), b"{}").unwrap();
+            let mut record = PaperRecord::local_pdf("paper".into(), name.into()).at_path(&path);
+            record.tags = vec![PaperTag::new("舞蹈")];
+            record.is_read = true;
+            upsert_paper(root, &record).unwrap();
+            // Reproduce the pre-fix catalog AND sidecars, bypassing new writes.
+            with_catalog(root, |conn| {
+                conn.execute("UPDATE papers SET id = 'paper' WHERE path = ?1", [&path])?;
+                Ok(())
+            })
+            .unwrap();
+            fs::write(
+                folder.join("metadata.json"),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        }
+        // A newer externally edited sidecar must survive the repair, even
+        // when its timestamp is ahead of the local clock.
+        let newer_path = format!("papers/{}", names[1]);
+        let mut newer = super::super::sidecar::read_sidecar(root, &newer_path).unwrap();
+        newer.title = "外部更新的中文标题".into();
+        newer.updated_at = "2099-01-01T00:00:00.000Z".into();
+        fs::write(
+            root.join(&newer_path).join("metadata.json"),
+            serde_json::to_vec(&newer).unwrap(),
+        )
+        .unwrap();
+        let rows = list_all_unique_by_id(root).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].id, rows[1].id);
+        assert!(rows.iter().all(|row| row.id != "paper"));
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.path == newer_path)
+                .unwrap()
+                .title,
+            newer.title
+        );
+        for row in &rows {
+            let sidecar = super::super::sidecar::read_sidecar(root, &row.path).unwrap();
+            assert_eq!(sidecar.id, row.id);
+            assert_eq!(sidecar.tags, [PaperTag::new("舞蹈")]);
+            assert!(sidecar.is_read);
+            assert_eq!(
+                fs::read_to_string(root.join(&row.path).join("NOTES.md")).unwrap(),
+                "中文阅读笔记"
+            );
+            assert_eq!(
+                fs::read(root.join(&row.path).join("paper.pdf")).unwrap(),
+                b"%PDF-1.4 original"
+            );
+            assert!(root.join(&row.path).join("marks/1.json").is_file());
+        }
+        // Recovery remains stable across rescan, database loss and reopening.
+        assert_eq!(rebuild_from_disk(root).unwrap(), 0);
+        with_catalog(root, |conn| {
+            conn.execute("DELETE FROM papers", [])?;
+            Ok(())
+        })
+        .unwrap();
+        // Old backups may still carry `paper` in both sidecars. Count each
+        // recovered paper once even when import and id repair both write it.
+        for row in &rows {
+            let mut sidecar = super::super::sidecar::read_sidecar(root, &row.path).unwrap();
+            sidecar.id = "paper".into();
+            fs::write(
+                root.join(&row.path).join("metadata.json"),
+                serde_json::to_vec(&sidecar).unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(rebuild_from_disk(root).unwrap(), 2);
+        super::super::evict_catalog_conn(root);
+        let restored = list_all_unique_by_id(root).unwrap();
+        for row in rows {
+            assert_eq!(
+                restored.iter().find(|r| r.path == row.path).unwrap().id,
+                row.id
+            );
+        }
+    }
+
+    #[test]
+    fn local_pdf_name_collisions_are_distinct_but_canonical_duplicates_stay_deduped() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        let a =
+            PaperRecord::local_pdf("中文论文".into(), "甲".into()).at_path("papers/甲/中文论文");
+        let a = upsert_paper(root, &a).unwrap();
+        let id = allocate_local_id(root, "中文论文", "papers/乙/中文论文").unwrap();
+        let b = PaperRecord::local_pdf(id, "乙".into()).at_path("papers/乙/中文论文");
+        let b = upsert_paper(root, &b).unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!(upsert_paper(root, &b).unwrap().id, b.id);
+        // Defensive list behavior also protects legacy non-`paper` collisions.
+        let mut legacy_b = b.clone();
+        legacy_b.id = a.id.clone();
+        assert_eq!(
+            dedupe_records_by_id(root, vec![a.clone(), legacy_b.clone()]).len(),
+            2
+        );
+        let mut canonical_a = a;
+        canonical_a.doi = Some("10.1234/example".into());
+        legacy_b.doi = canonical_a.doi.clone();
+        assert_eq!(
+            dedupe_records_by_id(root, vec![canonical_a, legacy_b]).len(),
+            1
+        );
+    }
+
+    #[test]
     fn list_all_unique_by_id_prefers_existing_path_then_newest() {
         let dir = env::temp_dir().join(format!("agentero-dup-view-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -2480,14 +3217,18 @@ mod tests {
             fresh.as_secs_f64() / cached.as_secs_f64().max(f64::EPSILON)
         );
         assert!(opens <= 1, "expected at most 1 physical open, got {opens}");
-        assert!(
-            cached < fresh,
-            "cached connection ({cached:?}) should beat per-call opens ({fresh:?})"
-        );
+        // Timing comparison intentionally not asserted: on loaded CI runners
+        // the cached loop can lose to per-call opens (OS page cache, WAL
+        // state), flipping this test without any regression — the physical
+        // open count above is the deterministic guard. Durations stay in the
+        // eprintln for manual inspection.
 
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Unix can unlink an open SQLite file; Windows returns os error 32, so the
+    /// stale-handle recovery this exercises cannot be set up there.
+    #[cfg(unix)]
     #[test]
     fn with_catalog_recovers_after_db_deleted_externally() {
         let dir = env::temp_dir().join(format!("agentero-conn-stale-{}", std::process::id()));

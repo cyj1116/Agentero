@@ -5,6 +5,13 @@
 //! zip and read `*content_list.json` (0–1000 normalized boxes) plus the
 //! intermediate result — `*middle.json` in older zips, `layout.json` in
 //! cloud v4 — for per-page sizes.
+//!
+//! The `selfHosted` option switches to a self-hosted deployment instead: its
+//! dialect is negotiated from the capabilities in `/v1/health` (see
+//! [`MineruDialect`]), and the same zip is read back — 4.0 and 4.1 zips both
+//! carry `middle_json.json` (`docvortex.middle`, 0–1 normalized boxes), 3.x
+//! zips the cloud-shaped `*content_list.json` + `*middle.json` pair. Only the
+//! transport differs between 4.0 and 4.1, not the artifact.
 
 use crate::core::error::AppError;
 use crate::core::http;
@@ -17,12 +24,13 @@ use crate::features::paper::analyze::layout::hosted::{
 };
 use crate::features::paper::import::CANCELLED_MESSAGE;
 use async_trait::async_trait;
-use base64::Engine;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::Read;
 use std::time::{Duration, Instant};
+
+mod extract;
 
 const MINERU_BASE_URL: &str = "https://mineru.net";
 const MINERU_POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -32,8 +40,10 @@ const MINERU_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// MinerU's own default and covers Chinese (Simplified / Traditional) plus
 /// English, which fits mixed-language papers.
 const MINERU_DEFAULT_LANGUAGE: &str = "ch";
-/// Per-request payload cap for the whole-PDF upload (base64 chars).
-const MAX_PDF_BASE64_CHARS: usize = 96 * 1024 * 1024;
+/// Stable code for a server without `/v1/uploads`. The caller uses it to tell
+/// a mis-guessed dialect apart from a genuine server error, so a relay that
+/// strips `features` can still fall forward to the 4.1 transport.
+const ERR_MINERU_UPLOADS_MISSING: &str = "mineru.uploads_missing";
 /// Untrusted result zip: cap the download and each decompressed JSON entry
 /// to prevent zip-bomb OOM (same rationale as the sync gunzip caps).
 const MAX_RESULT_ZIP_BYTES: usize = 256 * 1024 * 1024;
@@ -81,45 +91,187 @@ impl HostedLayoutAnalyzer for MineruEngine {
     }
 }
 
+/// Self-hosted deployments run on a LAN, where plain http is the norm; the
+/// official cloud default is https either way.
 fn ensure_base_url_scheme(base: &str) -> Result<(), AppError> {
-    if base.starts_with("https://") {
+    if base.starts_with("https://") || base.starts_with("http://") {
         return Ok(());
     }
-    if let Some(rest) = base.strip_prefix("http://") {
-        let authority = rest.split('/').next().unwrap_or("");
-        let host = match authority.strip_prefix('[') {
-            Some(v6) => v6.split(']').next().unwrap_or(""),
-            None => authority.split(':').next().unwrap_or(""),
-        };
-        if matches!(host, "localhost" | "127.0.0.1" | "::1") {
-            return Ok(());
-        }
-    }
     Err(AppError::message(
-        "MinerU baseUrl must use https (plain http is allowed for loopback only)",
+        "MinerU baseUrl must start with http:// or https://",
     ))
 }
 
+/// Attach the API token only when one was configured: a self-hosted server may
+/// run anonymously, and a cross-origin upload URL must never see the token.
+fn authed(request: reqwest::RequestBuilder, auth: &str) -> reqwest::RequestBuilder {
+    if auth.is_empty() {
+        request
+    } else {
+        request.header("Authorization", auth)
+    }
+}
+
+/// Resolve `(base_url, authorization header)`. The official cloud always needs
+/// a token; a self-hosted endpoint may leave it empty.
 fn resolve_target(credentials: &HostedProviderCredentials) -> Result<(String, String), AppError> {
-    let api_key = credentials
+    let configured_base = credentials
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let base = match configured_base {
+        Some(base) => {
+            ensure_base_url_scheme(base)?;
+            base.trim_end_matches('/').to_string()
+        }
+        None => MINERU_BASE_URL.to_string(),
+    };
+    let auth = match credentials
         .api_key
         .as_deref()
         .map(str::trim)
         .filter(|k| !k.is_empty())
-        .ok_or_else(|| {
-            AppError::message("MinerU layout service requires apiKey (Settings → Layout)")
-        })?
-        .to_string();
-    let base = credentials
-        .base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(MINERU_BASE_URL)
-        .trim_end_matches('/')
-        .to_string();
-    ensure_base_url_scheme(&base)?;
-    Ok((base, format!("Bearer {api_key}")))
+    {
+        Some(api_key) => format!("Bearer {api_key}"),
+        // The official cloud (and its relays) always authenticates; a
+        // self-hosted server may run anonymously.
+        None if !credentials.self_hosted => {
+            return Err(AppError::message(
+                "MinerU official cloud API requires apiKey (Settings → Layout)",
+            ))
+        }
+        None => String::new(),
+    };
+    Ok((base, auth))
+}
+
+/// Wire dialect of a self-hosted MinerU server. 4.0 replaced the 3.x
+/// `/file_parse` + `/tasks` routes with an upload → parse-job → artifact flow;
+/// 4.1 then folded that upload and the submit into a single `POST /v1/tasks`
+/// and hands back a per-file `result_url` instead of a `zip` file id.
+///
+/// Adding the next generation (4.2 / 5.x) is a three-step change, all of it
+/// local to this file:
+///   1. add a variant here and name the endpoints it replaces;
+///   2. extend [`dialect_from_health`] with a capability probe for the new
+///      shape — read `features`, never compare `version`, because relays and
+///      mirrors rewrite or drop it;
+///   3. add a `run_*_extract()` arm in `run_mineru_extract_unshared()` and
+///      reuse `authed` / `json_body` / `resolve_upload_url` / `read_capped_zip`.
+///
+/// Keep the `None` fallback (inferred → oldest still-supported dialect) so an
+/// unknown server degrades to today's behaviour instead of hard-failing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MineruDialect {
+    /// 4.0.x: `POST /v1/uploads` → `PUT` → `/complete` → `/v1/parse/jobs`.
+    V1,
+    /// 4.1.x: `POST /v1/tasks` (input + output formats in one request), then
+    /// `PUT files[].upload.url` → poll `/v1/tasks/{id}` → `files[].result_url`.
+    V1Tasks,
+    /// 3.x: multipart `/tasks` + `/tasks/{id}/result`.
+    Legacy,
+}
+
+/// Health-probe outcome: the negotiated dialect, the server version (logging
+/// only), and whether the dialect was *inferred* because the server did not
+/// advertise any capability. Only an inferred dialect may fall forward to
+/// another transport when the picked endpoints turn out to be missing.
+#[derive(Debug, Clone)]
+struct DetectedDialect {
+    dialect: MineruDialect,
+    version: String,
+    inferred: bool,
+}
+
+/// Capability-based dialect detection: 4.1 swapped `output_formats` for
+/// `task_output_formats` when it moved the upload and the submit into
+/// `POST /v1/tasks`. A build that advertises both is a newer one that still
+/// tolerates the old shape, so the newer key wins.
+fn dialect_from_health(body: &Value) -> Option<MineruDialect> {
+    let features = body.get("features")?;
+    if features.get("task_output_formats").is_some() {
+        Some(MineruDialect::V1Tasks)
+    } else if features.get("output_formats").is_some() {
+        Some(MineruDialect::V1)
+    } else {
+        None
+    }
+}
+
+/// Read and parse a JSON response; when the body is not JSON, report the HTTP
+/// status together with a body snippet instead of a bare parse error.
+async fn json_body(response: reqwest::Response, what: &str) -> Result<Value, AppError> {
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| AppError::message(format!("MinerU {what} read failed: {e}")))?;
+    serde_json::from_str(&text).map_err(|_| {
+        let snippet = http::http_err_snippet(&text);
+        AppError::message(format!("MinerU {what} failed (HTTP {status}): {snippet}"))
+    })
+}
+
+/// Negotiate the self-hosted dialect from the health endpoint and return it
+/// with the server version (`GET /v1/health` on 4.0+, `GET /health` on 3.x).
+///
+/// The 4.x endpoint answers for both 4.0 and 4.1, so the version string alone
+/// cannot pick a transport: the capability list decides. When a server omits
+/// `features` entirely the dialect is *inferred* as 4.0 — that keeps every
+/// deployment that works today working — and the caller may still fall
+/// forward if `/v1/uploads` turns out to be missing.
+async fn detect_self_hosted(
+    client: &reqwest::Client,
+    base: &str,
+    auth: &str,
+) -> Result<DetectedDialect, AppError> {
+    if let Ok(response) = authed(client.get(format!("{base}/v1/health")), auth)
+        .send()
+        .await
+    {
+        if response.status().is_success() {
+            let body = response.json::<Value>().await.ok();
+            let version = body
+                .as_ref()
+                .and_then(|value| value.get("version"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let advertised = body.as_ref().and_then(dialect_from_health);
+            return Ok(DetectedDialect {
+                dialect: advertised.unwrap_or(MineruDialect::V1),
+                inferred: advertised.is_none(),
+                version,
+            });
+        }
+    }
+    if let Ok(response) = authed(client.get(format!("{base}/health")), auth)
+        .send()
+        .await
+    {
+        if response.status().is_success() {
+            let version = response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            return Ok(DetectedDialect {
+                dialect: MineruDialect::Legacy,
+                inferred: false,
+                version,
+            });
+        }
+    }
+    Err(AppError::message(format!(
+        "MinerU self-hosted server {base} answered neither /v1/health (4.x) nor /health (3.x)"
+    )))
 }
 
 /// MinerU top-level `code` may be a number (`0`, `-500`, `-10002`) or a
@@ -147,19 +299,42 @@ fn is_token_error_code(code: &str) -> bool {
     matches!(code, "A0202" | "A0211")
 }
 
-fn mineru_api_error(context: &str, body: &Value) -> AppError {
-    let code = mineru_code(body);
-    let msg = mineru_msg(body);
-    if is_token_error_code(&code) {
-        AppError::message(format!(
-            "MinerU {context} failed: invalid API token ({code})"
-        ))
-    } else {
-        AppError::message(format!("MinerU {context} failed ({code}): {msg}"))
-    }
+/// MinerU cloud replies always carry a business code (`code`, or `msgCode` on
+/// newer versions); a 404 page, an HTML error or a proxy body does not.
+fn is_mineru_reply(body: &Value) -> bool {
+    body.get("code").is_some() || body.get("msgCode").is_some()
 }
 
-/// Poll-state classification for `extract_result[].state`.
+/// Error for a failed cloud call. A body without a business code is reported
+/// with its HTTP status plus the self-hosted hint — that combination is what a
+/// self-hosted address (or a wrong path) looks like when the `selfHosted`
+/// switch is off.
+fn mineru_api_error(context: &str, body: &Value, status: StatusCode) -> AppError {
+    let code = mineru_code(body);
+    if is_token_error_code(&code) {
+        return AppError::message(format!(
+            "MinerU {context} failed: invalid API token ({code})"
+        ));
+    }
+    if !code.is_empty() {
+        return AppError::message(format!(
+            "MinerU {context} failed ({code}): {}",
+            mineru_msg(body)
+        ));
+    }
+    if status == StatusCode::UNAUTHORIZED {
+        return AppError::message(format!(
+            "MinerU {context} failed: invalid API token (HTTP 401)"
+        ));
+    }
+    AppError::message(format!(
+        "MinerU {context} failed (HTTP {status}). This endpoint did not answer as the official \
+         cloud API — a self-hosted server needs \"Self-hosted API\" enabled in Settings → Layout"
+    ))
+}
+
+/// Poll-state classification for `extract_result[].state` (cloud v4) and
+/// `status` (3.x).
 #[derive(Debug, PartialEq, Eq)]
 enum ExtractState {
     Done,
@@ -169,7 +344,8 @@ enum ExtractState {
 
 fn classify_extract_state(state: &str) -> ExtractState {
     match state.trim().to_ascii_lowercase().as_str() {
-        "done" => ExtractState::Done,
+        // The cloud reports `done`; 3.x reports `completed`.
+        "done" | "completed" => ExtractState::Done,
         "failed" => ExtractState::Failed,
         _ => ExtractState::InProgress,
     }
@@ -196,10 +372,29 @@ fn map_mineru_label(item_type: &str, text_level: Option<i64>) -> String {
         "list" => "text".to_string(),
         "header" | "page_header" => "header".to_string(),
         "footer" | "page_footer" => "footer".to_string(),
+        // 4.0 labels the running page number; PP-DocLayoutV3 calls it `number`.
+        "page_number" => "number".to_string(),
         "footnote" | "page_footnote" => "footnote".to_string(),
         "ref_text" | "reference" => "reference".to_string(),
+        "image_caption" | "table_caption" => "figure_title".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Content List captions are arrays; text and intermediate spans are strings.
+fn mineru_text(value: Option<&Value>) -> Option<String> {
+    let text = match value? {
+        Value::String(text) => text.trim().to_string(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    (!text.is_empty()).then_some(text)
 }
 
 /// `middle.json` → per-page sizes from `pdf_info[].page_size` (`[w, h]`).
@@ -278,9 +473,74 @@ fn build_pages(
                 nums[2] / 1000.0 * w,
                 nums[3] / 1000.0 * h,
             ],
+            text: mineru_text(item.get("text")).or_else(|| mineru_text(item.get("content"))),
+            caption: mineru_text(item.get("image_caption"))
+                .or_else(|| mineru_text(item.get("table_caption"))),
         });
     }
     Ok(pages)
+}
+
+/// Only intermediate caption blocks have independent geometry. Their bboxes
+/// already use page points, unlike the normalized Content List bboxes.
+fn append_middle_captions(pages: &mut [LayoutRemotePageResult], middle: &Value) {
+    let Some(source_pages) = middle.get("pdf_info").and_then(Value::as_array) else {
+        return;
+    };
+    for (page, source) in pages.iter_mut().zip(source_pages) {
+        // para_blocks contains the final reading order; preproc_blocks repeats
+        // those blocks in many results and is only a fallback for older output.
+        let blocks = source
+            .get("para_blocks")
+            .and_then(Value::as_array)
+            .filter(|blocks| !blocks.is_empty())
+            .or_else(|| source.get("preproc_blocks").and_then(Value::as_array));
+        let Some(blocks) = blocks else { continue };
+        let mut pending: Vec<&Value> = blocks.iter().rev().collect();
+        while let Some(block) = pending.pop() {
+            if let Some(children) = block.get("blocks").and_then(Value::as_array) {
+                pending.extend(children.iter().rev());
+            }
+            if !matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("image_caption" | "table_caption")
+            ) {
+                continue;
+            }
+            let Some(bbox) = block.get("bbox").and_then(Value::as_array) else {
+                continue;
+            };
+            let nums: Vec<f64> = bbox.iter().filter_map(Value::as_f64).collect();
+            if bbox.len() != 4 || nums.len() != 4 || nums[2] <= nums[0] || nums[3] <= nums[1] {
+                continue;
+            }
+            let text = mineru_text(block.get("text")).or_else(|| {
+                let lines = block.get("lines")?.as_array()?;
+                let text = lines
+                    .iter()
+                    .filter_map(|line| line.get("spans")?.as_array())
+                    .map(|spans| {
+                        spans
+                            .iter()
+                            .filter_map(|span| span.get("content")?.as_str())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let text = text.trim();
+                (!text.is_empty()).then(|| text.to_string())
+            });
+            let Some(text) = text else { continue };
+            page.boxes.push(LayoutRemoteBox {
+                cls_id: -1,
+                label: "figure_title".to_string(),
+                score: 1.0,
+                coordinate: [nums[0], nums[1], nums[2], nums[3]],
+                text: Some(text),
+                caption: None,
+            });
+        }
+    }
 }
 
 /// Find a zip entry by candidate names — an exact entry name match wins
@@ -300,7 +560,10 @@ pub(crate) fn read_zip_entry_by_candidates(
             let entry = archive
                 .by_index(i)
                 .map_err(|e| AppError::message(format!("MinerU result zip entry failed: {e}")))?;
-            if entry.name() == *candidate {
+            let name = entry.name().map_err(|e| {
+                AppError::message(format!("MinerU result zip entry name failed: {e}"))
+            })?;
+            if name == *candidate {
                 index = Some(i);
                 break;
             }
@@ -310,7 +573,10 @@ pub(crate) fn read_zip_entry_by_candidates(
                 let entry = archive.by_index(i).map_err(|e| {
                     AppError::message(format!("MinerU result zip entry failed: {e}"))
                 })?;
-                if entry.name().ends_with(candidate) {
+                let name = entry.name().map_err(|e| {
+                    AppError::message(format!("MinerU result zip entry name failed: {e}"))
+                })?;
+                if name.ends_with(candidate) {
                     index = Some(i);
                     break;
                 }
@@ -322,7 +588,12 @@ pub(crate) fn read_zip_entry_by_candidates(
     }
     let index = index.ok_or_else(|| {
         let names: Vec<String> = (0..archive.len())
-            .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_string()))
+            .filter_map(|i| {
+                archive
+                    .by_index(i)
+                    .ok()
+                    .and_then(|e| e.name().ok().map(|name| name.into_owned()))
+            })
             .collect();
         AppError::message(format!(
             "MinerU result zip missing {:?} entry (entries: {})",
@@ -380,11 +651,13 @@ fn safe_mineru_image_path(name: &str) -> Result<Option<String>, AppError> {
     Ok(Some(format!("images/{}", image_parts.join("/"))))
 }
 
-/// Extract `full.md` and the `images/` files it references by relative path.
+/// Extract the Markdown and the `images/` files it references by relative path.
 /// The caller writes them beside `PAPER.md`, preserving MinerU's portable
 /// Markdown instead of rewriting the links to application-specific URLs.
+/// Entry names differ per protocol: `full.md` (cloud v4), `markdown.md`
+/// (self-hosted 4.0) and `<stem>.md` (3.x).
 pub(crate) fn read_mineru_markdown_bundle(bytes: &[u8]) -> Result<MineruMarkdownBundle, AppError> {
-    let markdown = read_zip_entry_by_candidates(bytes, &["full.md"])?;
+    let markdown = read_zip_entry_by_candidates(bytes, &["full.md", "markdown.md", ".md"])?;
     let cursor = std::io::Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| AppError::message(format!("MinerU result zip open failed: {e}")))?;
@@ -399,7 +672,10 @@ pub(crate) fn read_mineru_markdown_bundle(bytes: &[u8]) -> Result<MineruMarkdown
         if entry.is_dir() {
             continue;
         }
-        let Some(relative_path) = safe_mineru_image_path(entry.name())? else {
+        let name = entry
+            .name()
+            .map_err(|e| AppError::message(format!("MinerU result zip entry name failed: {e}")))?;
+        let Some(relative_path) = safe_mineru_image_path(name.as_ref())? else {
             continue;
         };
         if !paths.insert(relative_path.clone()) {
@@ -441,7 +717,167 @@ pub(crate) fn read_mineru_markdown_bundle(bytes: &[u8]) -> Result<MineruMarkdown
 /// zips, `layout.json` in cloud v4 (same `pdf_info[].page_size` schema).
 const MIDDLE_CANDIDATES: &[&str] = &["middle.json", "layout.json"];
 
+/// MinerU 4.0 result protocol (`docvortex.middle`): `pages[].blocks[]` are
+/// page-relative (0–1) boxes and per-page sizes live in
+/// `extensions.docvortex_layout.pages[]`. Caption sub-blocks keep their own
+/// geometry, so they become independent `figure_title` boxes.
+fn parse_docvortex_pages(middle: &Value) -> Result<Vec<LayoutRemotePageResult>, AppError> {
+    let sizes: Vec<(f64, f64)> = middle
+        .get("extensions")
+        .and_then(|extensions| extensions.get("docvortex_layout"))
+        .and_then(|layout| layout.get("pages"))
+        .and_then(Value::as_array)
+        .map(|pages| {
+            pages
+                .iter()
+                .map(|page| {
+                    (
+                        page.get("width_pt").and_then(Value::as_f64).unwrap_or(0.0),
+                        page.get("height_pt").and_then(Value::as_f64).unwrap_or(0.0),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if sizes.is_empty() {
+        return Err(AppError::message(
+            "MinerU result parse failed: docvortex layout has no page sizes",
+        ));
+    }
+    let mut pages: Vec<LayoutRemotePageResult> = sizes
+        .iter()
+        .map(|&(w, h)| LayoutRemotePageResult {
+            boxes: Vec::new(),
+            width_px: (w > 0.0).then(|| w.round() as u32),
+            height_px: (h > 0.0).then(|| h.round() as u32),
+        })
+        .collect();
+    let Some(source_pages) = middle.get("pages").and_then(Value::as_array) else {
+        return Ok(pages);
+    };
+    for source in source_pages {
+        let Some(page_idx) = source.get("page_idx").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(page) = pages.get_mut(page_idx as usize) else {
+            continue;
+        };
+        let (w, h) = sizes[page_idx as usize];
+        let Some(blocks) = source.get("blocks").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in blocks {
+            let Some(item_type) = block.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            let item_type = item_type.trim();
+            if item_type.is_empty() {
+                continue;
+            }
+            let Some(coordinate) = docvortex_box(block.get("bbox"), w, h) else {
+                continue;
+            };
+            let text_level = block.get("level").and_then(Value::as_i64);
+            page.boxes.push(LayoutRemoteBox {
+                cls_id: -1,
+                label: map_mineru_label(item_type, text_level),
+                // The protocol carries no confidence; 1.0 passes the frontend
+                // min-score gate without distorting relative ordering.
+                score: 1.0,
+                coordinate,
+                text: docvortex_text(block.get("content")),
+                caption: None,
+            });
+            let Some(content) = block.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for sub in content {
+                let Some(sub_type) = sub.get("type").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !matches!(
+                    sub_type.trim(),
+                    "image_caption" | "table_caption" | "chart_caption"
+                ) {
+                    continue;
+                }
+                let Some(caption_coordinate) = docvortex_box(sub.get("bbox"), w, h) else {
+                    continue;
+                };
+                let Some(caption) = docvortex_text(sub.get("content")) else {
+                    continue;
+                };
+                page.boxes.push(LayoutRemoteBox {
+                    cls_id: -1,
+                    label: "figure_title".to_string(),
+                    score: 1.0,
+                    coordinate: caption_coordinate,
+                    text: Some(caption),
+                    caption: None,
+                });
+            }
+        }
+    }
+    Ok(pages)
+}
+
+/// Page-relative (0–1) box → rendered-page pixels. Empty boxes are dropped.
+fn docvortex_box(bbox: Option<&Value>, width: f64, height: f64) -> Option<[f64; 4]> {
+    let bbox = bbox?.as_array()?;
+    let nums: Vec<f64> = bbox.iter().filter_map(Value::as_f64).collect();
+    if nums.len() != 4 {
+        return None;
+    }
+    let coordinate = [
+        nums[0] * width,
+        nums[1] * height,
+        nums[2] * width,
+        nums[3] * height,
+    ];
+    (coordinate[2] > coordinate[0] && coordinate[3] > coordinate[1]).then_some(coordinate)
+}
+
+/// Concatenate the text spans of a docvortex `content` array (spans nest).
+fn docvortex_text(value: Option<&Value>) -> Option<String> {
+    fn collect(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(text) => {
+                let text = text.trim();
+                if !text.is_empty() {
+                    out.push(text.to_string());
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
+            Value::Object(map) => {
+                if let Some(content) = map.get("content") {
+                    collect(content, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut parts = Vec::new();
+    collect(value?, &mut parts);
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
 fn parse_result_zip(bytes: &[u8]) -> Result<LayoutRemoteAnalyzePdfResult, AppError> {
+    // Self-hosted 4.0 zips carry the shared docvortex document instead of the
+    // cloud content-list + middle-json pair (which 3.x still produces).
+    if let Ok(middle_text) = read_zip_entry_by_candidates(bytes, &["middle_json.json"]) {
+        let middle: Value = serde_json::from_str(&middle_text).map_err(|e| {
+            AppError::message(format!("MinerU result parse failed: middle_json: {e}"))
+        })?;
+        let pages = parse_docvortex_pages(&middle)?;
+        let rendered_pages = pages
+            .iter()
+            .map(|page| (page.width_px.unwrap_or(0), page.height_px.unwrap_or(0)))
+            .collect();
+        return Ok(LayoutRemoteAnalyzePdfResult {
+            pages,
+            rendered_pages,
+        });
+    }
     let content_list_text = read_zip_entry_by_candidates(bytes, &["content_list.json"])?;
     let middle_text = read_zip_entry_by_candidates(bytes, MIDDLE_CANDIDATES)?;
     let content_list: Value = serde_json::from_str(&content_list_text)
@@ -449,7 +885,8 @@ fn parse_result_zip(bytes: &[u8]) -> Result<LayoutRemoteAnalyzePdfResult, AppErr
     let middle: Value = serde_json::from_str(&middle_text)
         .map_err(|e| AppError::message(format!("MinerU result parse failed: middle: {e}")))?;
     let page_sizes = parse_middle_page_sizes(&middle)?;
-    let pages = build_pages(&content_list, &page_sizes)?;
+    let mut pages = build_pages(&content_list, &page_sizes)?;
+    append_middle_captions(&mut pages, &middle);
     let rendered_pages = page_sizes
         .iter()
         .map(|&(w, h)| (w.round() as u32, h.round() as u32))
@@ -497,7 +934,7 @@ async fn request_upload_url(
         ))
     })?;
     if mineru_code(&value) != "0" {
-        return Err(mineru_api_error("batch submit", &value));
+        return Err(mineru_api_error("batch submit", &value, status));
     }
     let data = value.get("data").cloned().unwrap_or_default();
     let batch_id = data
@@ -521,27 +958,13 @@ async fn analyze_pdf(ctx: LayoutAnalyzeContext) -> Result<LayoutRemoteAnalyzePdf
         credentials,
         args,
     } = ctx;
-    if args.pdf_base64.trim().is_empty() {
-        return Err(AppError::message("layout_remote: PDF is empty"));
-    }
-    if args.pdf_base64.len() > MAX_PDF_BASE64_CHARS {
-        return Err(AppError::message("layout_remote: PDF too large"));
-    }
-    let pdf_bytes = base64::engine::general_purpose::STANDARD
-        .decode(args.pdf_base64.trim())
-        .map_err(|e| AppError::message(format!("layout_remote: invalid PDF base64: {e}")))?;
+    let (pdf_bytes, file_name) =
+        super::prepare_pdf_upload(&args.pdf_base64, args.file_name.as_deref())?;
 
     let request_id = args.request_id.clone();
     let emit_progress = move |phase: &str, extracted: Option<u64>, total: Option<u64>| {
         emit_cloud_progress(&app, phase, extracted, total, request_id.clone());
     };
-    let file_name = args
-        .file_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("paper.pdf")
-        .to_string();
 
     let zip_bytes =
         run_mineru_extract(&credentials, pdf_bytes, &file_name, &emit_progress, &|| {
@@ -560,10 +983,25 @@ async fn analyze_pdf(ctx: LayoutAnalyzeContext) -> Result<LayoutRemoteAnalyzePdf
     Ok(result)
 }
 
-/// Whole-document MinerU extract: presigned upload → poll → download the
-/// result zip. Shared by the layout analyze path and the PAPER.md body-parse
-/// engine (which reads `full.md` from the same zip).
+/// Whole-document MinerU extract returning the result zip. Shared by the
+/// layout analyze path and the PAPER.md body-parse engine, both of which read
+/// their own entries out of that zip. Identical concurrent requests share one
+/// extraction; completed ZIPs are not retained in a cache.
+///
+/// `selfHosted` chooses between the cloud batch flow (including custom relays)
+/// and a self-hosted deployment, whose dialect is detected from `/v1/health`
+/// (4.0+) or `/health` (3.x).
 pub(crate) async fn run_mineru_extract(
+    credentials: &HostedProviderCredentials,
+    pdf_bytes: Vec<u8>,
+    file_name: &str,
+    progress: super::ProgressFn<'_>,
+    cancel: super::CancelFn<'_>,
+) -> Result<std::sync::Arc<Vec<u8>>, AppError> {
+    extract::run(credentials, pdf_bytes, file_name, progress, cancel).await
+}
+
+async fn run_mineru_extract_unshared(
     credentials: &HostedProviderCredentials,
     pdf_bytes: Vec<u8>,
     file_name: &str,
@@ -572,7 +1010,126 @@ pub(crate) async fn run_mineru_extract(
 ) -> Result<Vec<u8>, AppError> {
     let (base, auth) = resolve_target(credentials)?;
     let client = http::client(MINERU_REQUEST_TIMEOUT)?;
+    // The `selfHosted` switch decides the protocol, not the host — that is what
+    // keeps a relay (or the default mineru.net) on the cloud batch API.
+    if !credentials.self_hosted {
+        return run_cloud_extract(
+            &client,
+            &base,
+            &auth,
+            pdf_bytes,
+            file_name,
+            credentials,
+            progress,
+            cancel,
+        )
+        .await;
+    }
+    let DetectedDialect {
+        dialect,
+        version,
+        inferred,
+    } = detect_self_hosted(&client, &base, &auth).await?;
+    log::info!(
+        target: "agentero::layout::hosted",
+        "mineru self-hosted: {dialect:?} version={version} inferred={inferred}"
+    );
+    // Dispatch by negotiated capability, not by base URL or version string: a
+    // self-hosted "server" is often a relay, and a relay's `version` is not
+    // trustworthy enough to pick a wire protocol from.
+    match dialect {
+        // An inferred 4.0 dialect may still be a 4.1 relay that stripped
+        // `features`. Keep the bytes so the upload 404 can be retried once on
+        // the task transport instead of failing the whole parse.
+        MineruDialect::V1 if inferred => {
+            let retry_bytes = pdf_bytes.clone();
+            match run_v1_extract(
+                &client,
+                &base,
+                &auth,
+                pdf_bytes,
+                file_name,
+                credentials,
+                progress,
+                cancel,
+            )
+            .await
+            {
+                Err(err) if err.code() == ERR_MINERU_UPLOADS_MISSING => {
+                    log::warn!(
+                        target: "agentero::layout::hosted",
+                        "mineru self-hosted: /v1/uploads missing on an inferred 4.0 dialect, retrying as 4.1"
+                    );
+                    run_task_extract(
+                        &client,
+                        &base,
+                        &auth,
+                        retry_bytes,
+                        file_name,
+                        credentials,
+                        progress,
+                        cancel,
+                    )
+                    .await
+                }
+                other => other,
+            }
+        }
+        MineruDialect::V1 => {
+            run_v1_extract(
+                &client,
+                &base,
+                &auth,
+                pdf_bytes,
+                file_name,
+                credentials,
+                progress,
+                cancel,
+            )
+            .await
+        }
+        MineruDialect::V1Tasks => {
+            run_task_extract(
+                &client,
+                &base,
+                &auth,
+                pdf_bytes,
+                file_name,
+                credentials,
+                progress,
+                cancel,
+            )
+            .await
+        }
+        MineruDialect::Legacy => {
+            run_legacy_extract(
+                &client,
+                &base,
+                &auth,
+                pdf_bytes,
+                file_name,
+                credentials,
+                progress,
+                cancel,
+            )
+            .await
+        }
+    }
+}
 
+/// Cloud batch flow: request the presigned upload URL, PUT the bytes, poll the
+/// batch id, then download the result zip.
+#[allow(clippy::too_many_arguments)]
+async fn run_cloud_extract(
+    client: &reqwest::Client,
+    base: &str,
+    auth: &str,
+    pdf_bytes: Vec<u8>,
+    file_name: &str,
+    credentials: &HostedProviderCredentials,
+    progress: super::ProgressFn<'_>,
+    cancel: super::CancelFn<'_>,
+) -> Result<Vec<u8>, AppError> {
     // 1) Request the presigned upload URL, then PUT the raw PDF bytes
     //    (no Content-Type — the presigned signature does not cover one).
     progress("uploading", None, None);
@@ -582,15 +1139,8 @@ pub(crate) async fn run_mineru_extract(
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .unwrap_or(MINERU_DEFAULT_LANGUAGE);
-    let (batch_id, upload_url) = request_upload_url(
-        &client,
-        &base,
-        &auth,
-        file_name,
-        language,
-        credentials.is_ocr,
-    )
-    .await?;
+    let (batch_id, upload_url) =
+        request_upload_url(client, base, auth, file_name, language, credentials.is_ocr).await?;
     let upload = client
         .put(&upload_url)
         .body(pdf_bytes)
@@ -617,7 +1167,7 @@ pub(crate) async fn run_mineru_extract(
         tokio::time::sleep(MINERU_POLL_INTERVAL).await;
         let poll = client
             .get(&poll_url)
-            .header("Authorization", &auth)
+            .header("Authorization", auth)
             .send()
             .await
             .map_err(|e| AppError::message(format!("MinerU task poll failed: {e}")))?;
@@ -633,7 +1183,7 @@ pub(crate) async fn run_mineru_extract(
             ))
         })?;
         if mineru_code(&poll_value) != "0" {
-            return Err(mineru_api_error("task poll", &poll_value));
+            return Err(mineru_api_error("task poll", &poll_value, poll_status));
         }
         let result = poll_value
             .get("data")
@@ -693,9 +1243,14 @@ pub(crate) async fn run_mineru_extract(
             "MinerU result download failed (HTTP {zip_status})"
         )));
     }
+    read_capped_zip(zip_response).await
+}
+
+/// Stream an untrusted result zip into memory, capped so a remote zip bomb
+/// cannot exhaust the Host.
+async fn read_capped_zip(mut response: reqwest::Response) -> Result<Vec<u8>, AppError> {
     let mut zip_bytes: Vec<u8> = Vec::new();
-    let mut zip_response = zip_response;
-    while let Some(chunk) = zip_response
+    while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|e| AppError::message(format!("MinerU result read failed: {e}")))?
@@ -708,11 +1263,534 @@ pub(crate) async fn run_mineru_extract(
     Ok(zip_bytes)
 }
 
-/// Probe outcome for the settings connectivity check.
-/// A non-auth business response (currently `-10002 file list is empty`)
-/// proves the token was authenticated; token error codes or HTTP 401 do not.
+/// Trimmed non-empty value; used for the optional request parameters.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// V1 job states: `completed` and `partial` are successful terminal states,
+/// `failed` and `canceled` are failures, everything else is still running.
+fn classify_v1_status(status: &str) -> ExtractState {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "completed" | "partial" => ExtractState::Done,
+        "failed" | "canceled" => ExtractState::Failed,
+        _ => ExtractState::InProgress,
+    }
+}
+
+/// `file.id` of a V1 upload response.
+fn v1_upload_file_id(upload: &Value) -> Result<String, AppError> {
+    upload
+        .get("file")
+        .and_then(|file| file.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| AppError::message("Unexpected MinerU response: missing upload file id"))
+}
+
+/// Per-file error text of a V1 job (falls back to the job status).
+fn v1_failure(job: &Value, status: &str) -> String {
+    job.get("files")
+        .and_then(Value::as_array)
+        .and_then(|files| files.iter().find_map(|file| file.get("error")))
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or(status)
+        .to_string()
+}
+
+/// `file_id` of the `zip` artifact of a finished V1 job.
+fn v1_zip_file_id(job: &Value) -> Result<String, AppError> {
+    job.get("files")
+        .and_then(Value::as_array)
+        .and_then(|files| {
+            files
+                .iter()
+                .find(|file| file.get("status").and_then(Value::as_str) == Some("completed"))
+                .or_else(|| files.first())
+        })
+        .and_then(|file| file.get("output_files"))
+        .and_then(|outputs| outputs.get("zip"))
+        .and_then(|zip| zip.get("file_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            AppError::message(format!(
+                "MinerU task done without a zip artifact: {}",
+                v1_failure(job, "completed")
+            ))
+        })
+}
+
+/// Resolve the service-provided upload URL (self-hosted servers return a
+/// same-origin path) against the API base.
+fn resolve_upload_url(base: &str, target: &str) -> Result<String, AppError> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return Ok(target.to_string());
+    }
+    if !target.starts_with('/') {
+        return Err(AppError::message(format!(
+            "MinerU upload URL is neither absolute nor rooted: {target}"
+        )));
+    }
+    Ok(format!("{base}{target}"))
+}
+
+/// Scheme + host + effective port comparison, used to decide whether the API
+/// token may travel to the upload URL the service handed back.
+fn same_origin(base: &str, target: &str) -> bool {
+    let origin = |value: &str| {
+        reqwest::Url::parse(value).ok().map(|url| {
+            (
+                url.scheme().to_string(),
+                url.host_str().unwrap_or_default().to_string(),
+                url.port_or_known_default(),
+            )
+        })
+    };
+    matches!((origin(base), origin(target)), (Some(a), Some(b)) if a == b)
+}
+
+/// Self-hosted 4.0 flow: create upload → PUT bytes → complete → submit parse
+/// job → poll → download the `zip` artifact.
+#[allow(clippy::too_many_arguments)]
+async fn run_v1_extract(
+    client: &reqwest::Client,
+    base: &str,
+    auth: &str,
+    pdf_bytes: Vec<u8>,
+    file_name: &str,
+    credentials: &HostedProviderCredentials,
+    progress: super::ProgressFn<'_>,
+    cancel: super::CancelFn<'_>,
+) -> Result<Vec<u8>, AppError> {
+    progress("uploading", None, None);
+    let create = authed(client.post(format!("{base}/v1/uploads")), auth)
+        .json(&json!({
+            "filename": file_name,
+            "bytes": pdf_bytes.len(),
+            "mime_type": "application/pdf",
+            "purpose": "parse",
+        }))
+        .send()
+        .await
+        .map_err(|e| AppError::message(format!("MinerU upload request failed: {e}")))?;
+    // 4.1 removed `/v1/uploads`; a 404 here means the dialect guess was wrong
+    // (or the server is a version this build does not know). Report it as a
+    // domain error so the caller can retry on the task transport, and so the
+    // user sees the real cause instead of a downstream timeout.
+    if create.status() == StatusCode::NOT_FOUND {
+        return Err(AppError::domain(
+            ERR_MINERU_UPLOADS_MISSING,
+            "MinerU self-hosted server has no /v1/uploads endpoint \
+             (expected 4.0; 4.1 moved to /v1/tasks)",
+        ));
+    }
+    let upload = json_body(create, "upload request").await?;
+    let upload_id = upload
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::message("Unexpected MinerU response: missing upload id"))?
+        .to_string();
+
+    let file_id = if upload.get("status").and_then(Value::as_str) == Some("completed") {
+        // The server already holds these bytes; the PUT is skipped.
+        v1_upload_file_id(&upload)?
+    } else {
+        let target = upload
+            .get("upload_url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::message("Unexpected MinerU response: missing upload_url"))?;
+        let url = resolve_upload_url(base, target)?;
+        let mut request = client.request(reqwest::Method::PUT, &url).body(pdf_bytes);
+        if let Some(headers) = upload.get("upload_headers").and_then(Value::as_object) {
+            for (name, value) in headers {
+                if let Some(value) = value.as_str() {
+                    request = request.header(name, value);
+                }
+            }
+        }
+        // A same-origin upload needs the API token; a presigned cross-origin
+        // URL must never receive it.
+        if same_origin(base, &url) {
+            request = authed(request, auth);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| AppError::message(format!("MinerU upload failed: {e}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AppError::message(format!(
+                "MinerU upload failed (HTTP {status})"
+            )));
+        }
+        let complete = authed(
+            client.post(format!("{base}/v1/uploads/{upload_id}/complete")),
+            auth,
+        )
+        .json(&json!({}))
+        .send()
+        .await
+        .map_err(|e| AppError::message(format!("MinerU upload complete failed: {e}")))?;
+        let completed = json_body(complete, "upload complete").await?;
+        v1_upload_file_id(&completed)?
+    };
+
+    let job = json!({
+        "files": [{ "source": { "type": "file_id", "file_id": file_id } }],
+        // `ocr` treats every page as an image; `auto` prefers the text layer
+        // and still OCRs scanned pages.
+        "ocr_mode": if credentials.is_ocr { "ocr" } else { "auto" },
+        // One zip keeps the artifact handling identical to the cloud path and
+        // is the only output that also carries the `images/` assets.
+        "output_formats": ["zip"],
+    });
+    let submit = authed(client.post(format!("{base}/v1/parse/jobs")), auth)
+        .json(&job)
+        .send()
+        .await
+        .map_err(|e| AppError::message(format!("MinerU job submit failed: {e}")))?;
+    let submitted = json_body(submit, "job submit").await?;
+    let job_id = submitted
+        .get("job_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::message("Unexpected MinerU response: missing job_id"))?;
+
+    // Poll until a terminal state (deadline guards a stuck task).
+    let poll_url = format!("{base}/v1/parse/jobs/{job_id}");
+    let started = Instant::now();
+    let artifact_url = loop {
+        if cancel() {
+            return Err(AppError::message(CANCELLED_MESSAGE));
+        }
+        if started.elapsed() > MINERU_JOB_DEADLINE {
+            return Err(AppError::message("MinerU task timed out"));
+        }
+        tokio::time::sleep(MINERU_POLL_INTERVAL).await;
+        let poll = authed(client.get(&poll_url), auth)
+            .send()
+            .await
+            .map_err(|e| AppError::message(format!("MinerU task poll failed: {e}")))?;
+        let poll = json_body(poll, "task poll").await?;
+        let status = poll.get("status").and_then(Value::as_str).unwrap_or("");
+        let job_progress = poll.get("progress");
+        let completed = job_progress
+            .and_then(|p| p.get("completed"))
+            .and_then(Value::as_u64);
+        let total = job_progress
+            .and_then(|p| p.get("total"))
+            .and_then(Value::as_u64);
+        match classify_v1_status(status) {
+            ExtractState::Done => {
+                let file_id = v1_zip_file_id(&poll)?;
+                progress("done", completed, total);
+                break format!("{base}/v1/files/{file_id}/content");
+            }
+            ExtractState::Failed => {
+                return Err(AppError::message(format!(
+                    "MinerU task {status}: {}",
+                    v1_failure(&poll, status)
+                )))
+            }
+            ExtractState::InProgress => progress(status, completed, total),
+        }
+    };
+
+    progress("downloading", None, None);
+    let response = authed(client.get(&artifact_url), auth)
+        .send()
+        .await
+        .map_err(|e| AppError::message(format!("MinerU result download failed: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AppError::message(format!(
+            "MinerU result download failed (HTTP {status})"
+        )));
+    }
+    read_capped_zip(response).await
+}
+
+/// `result_url` of the finished file of a 4.1 task (first completed file).
+fn v1_task_result_url(task: &Value) -> Result<String, AppError> {
+    task.get("files")
+        .and_then(Value::as_array)
+        .and_then(|files| {
+            files
+                .iter()
+                .find(|file| file.get("status").and_then(Value::as_str) == Some("completed"))
+                .or_else(|| files.first())
+        })
+        .and_then(|file| file.get("result_url"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            AppError::message(format!(
+                "MinerU task done without a result file: {}",
+                v1_failure(task, "completed")
+            ))
+        })
+}
+
+/// Self-hosted 4.1 flow: one `POST /v1/tasks` declares the input and the
+/// output formats, the service answers with a presigned upload link, and the
+/// finished document is a per-file `result_url` instead of a `zip` file id.
+///
+/// The artifact itself is unchanged: `default` still returns the zip holding
+/// `markdown.md`, `middle_json.json` and `images/`, so
+/// [`parse_result_zip`] reads 4.1 output through the same docvortex path.
+#[allow(clippy::too_many_arguments)]
+async fn run_task_extract(
+    client: &reqwest::Client,
+    base: &str,
+    auth: &str,
+    pdf_bytes: Vec<u8>,
+    file_name: &str,
+    credentials: &HostedProviderCredentials,
+    progress: super::ProgressFn<'_>,
+    cancel: super::CancelFn<'_>,
+) -> Result<Vec<u8>, AppError> {
+    progress("uploading", None, None);
+    let create = authed(client.post(format!("{base}/v1/tasks")), auth)
+        .json(&json!({
+            "files": [{ "file_name": file_name, "bytes": pdf_bytes.len() }],
+            // 4.1 rejects the 4.0 `zip` token; `default` is the one that
+            // returns Markdown + `middle_json.json` + `images/` as a zip.
+            "output_formats": ["default"],
+            // `ocr` treats every page as an image; `auto` prefers the text
+            // layer and still OCRs scanned pages.
+            "ocr_mode": if credentials.is_ocr { "ocr" } else { "auto" },
+        }))
+        .send()
+        .await
+        .map_err(|e| AppError::message(format!("MinerU task create failed: {e}")))?;
+    // Report the real cause: a 401 used to fall through to the JSON reader and
+    // surface as "missing task_id", which points nowhere.
+    let status = create.status();
+    if status == StatusCode::UNAUTHORIZED {
+        return Err(AppError::message(
+            "MinerU task create failed: invalid API token (HTTP 401)",
+        ));
+    }
+    if !status.is_success() {
+        let text = create.text().await.unwrap_or_default();
+        let snippet = http::http_err_snippet(&text);
+        return Err(AppError::message(format!(
+            "MinerU task create failed (HTTP {status}): {snippet}"
+        )));
+    }
+    let created = json_body(create, "task create").await?;
+    let task_id = created
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::message("Unexpected MinerU response: missing task_id"))?
+        .to_string();
+
+    let upload = created
+        .get("files")
+        .and_then(Value::as_array)
+        .and_then(|files| files.first())
+        .and_then(|file| file.get("upload"))
+        .ok_or_else(|| AppError::message("Unexpected MinerU response: missing upload link"))?;
+    let target = upload
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::message("Unexpected MinerU response: missing upload_url"))?;
+    let url = resolve_upload_url(base, target)?;
+    let mut request = client.request(reqwest::Method::PUT, &url).body(pdf_bytes);
+    if let Some(headers) = upload.get("headers").and_then(Value::as_object) {
+        for (name, value) in headers {
+            if let Some(value) = value.as_str() {
+                request = request.header(name, value);
+            }
+        }
+    }
+    // Same rule as the 4.0 path: the token only travels to our own origin.
+    if same_origin(base, &url) {
+        request = authed(request, auth);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| AppError::message(format!("MinerU upload failed: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AppError::message(format!(
+            "MinerU upload failed (HTTP {status})"
+        )));
+    }
+
+    let poll_url = format!("{base}/v1/tasks/{task_id}");
+    let started = Instant::now();
+    let artifact_url = loop {
+        if cancel() {
+            return Err(AppError::message(CANCELLED_MESSAGE));
+        }
+        if started.elapsed() > MINERU_JOB_DEADLINE {
+            return Err(AppError::message("MinerU task timed out"));
+        }
+        tokio::time::sleep(MINERU_POLL_INTERVAL).await;
+        let poll = authed(client.get(&poll_url), auth)
+            .send()
+            .await
+            .map_err(|e| AppError::message(format!("MinerU task poll failed: {e}")))?;
+        let poll = json_body(poll, "task poll").await?;
+        let status = poll.get("status").and_then(Value::as_str).unwrap_or("");
+        let job_progress = poll.get("progress");
+        let completed = job_progress
+            .and_then(|p| p.get("completed"))
+            .and_then(Value::as_u64);
+        let total = job_progress
+            .and_then(|p| p.get("total"))
+            .and_then(Value::as_u64);
+        match classify_v1_status(status) {
+            ExtractState::Done => {
+                let target = v1_task_result_url(&poll)?;
+                progress("done", completed, total);
+                break target;
+            }
+            ExtractState::Failed => {
+                return Err(AppError::message(format!(
+                    "MinerU task {status}: {}",
+                    v1_failure(&poll, status)
+                )))
+            }
+            ExtractState::InProgress => progress(status, completed, total),
+        }
+    };
+
+    progress("downloading", None, None);
+    let url = resolve_upload_url(base, &artifact_url)?;
+    let mut request = client.get(&url);
+    if same_origin(base, &url) {
+        request = authed(request, auth);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| AppError::message(format!("MinerU result download failed: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AppError::message(format!(
+            "MinerU result download failed (HTTP {status})"
+        )));
+    }
+    read_capped_zip(response).await
+}
+
+/// 3.x `/tasks` form fields; 4.0 removed every one of them.
+fn legacy_form_fields(credentials: &HostedProviderCredentials) -> Vec<(&'static str, String)> {
+    let language = non_empty(credentials.language.as_deref()).unwrap_or(MINERU_DEFAULT_LANGUAGE);
+    vec![
+        ("lang_list", language.to_string()),
+        (
+            "parse_method",
+            if credentials.is_ocr { "ocr" } else { "auto" }.to_string(),
+        ),
+        ("formula_enable", "true".to_string()),
+        ("table_enable", "true".to_string()),
+        ("return_md", "true".to_string()),
+        ("return_middle_json", "true".to_string()),
+        ("return_content_list", "true".to_string()),
+        // Zip, so the layout and body paths read the same artifact.
+        ("response_format_zip", "true".to_string()),
+    ]
+}
+
+/// Self-hosted 3.x flow: `POST /tasks` → poll `GET /tasks/{id}` → download the
+/// zip from `GET /tasks/{id}/result`.
+#[allow(clippy::too_many_arguments)]
+async fn run_legacy_extract(
+    client: &reqwest::Client,
+    base: &str,
+    auth: &str,
+    pdf_bytes: Vec<u8>,
+    file_name: &str,
+    credentials: &HostedProviderCredentials,
+    progress: super::ProgressFn<'_>,
+    cancel: super::CancelFn<'_>,
+) -> Result<Vec<u8>, AppError> {
+    progress("uploading", None, None);
+    let mut form = reqwest::multipart::Form::new().part(
+        "files",
+        reqwest::multipart::Part::bytes(pdf_bytes)
+            .file_name(file_name.to_string())
+            .mime_str("application/pdf")
+            .map_err(|e| AppError::message(format!("MinerU upload form failed: {e}")))?,
+    );
+    for (field, value) in legacy_form_fields(credentials) {
+        form = form.text(field, value);
+    }
+    let submit = authed(client.post(format!("{base}/tasks")), auth)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| AppError::message(format!("MinerU task submit failed: {e}")))?;
+    let submitted = json_body(submit, "task submit").await?;
+    let task_id = submitted
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::message("Unexpected MinerU response: missing task_id"))?
+        .to_string();
+
+    let poll_url = format!("{base}/tasks/{task_id}");
+    let started = Instant::now();
+    loop {
+        if cancel() {
+            return Err(AppError::message(CANCELLED_MESSAGE));
+        }
+        if started.elapsed() > MINERU_JOB_DEADLINE {
+            return Err(AppError::message("MinerU task timed out"));
+        }
+        tokio::time::sleep(MINERU_POLL_INTERVAL).await;
+        let poll = authed(client.get(&poll_url), auth)
+            .send()
+            .await
+            .map_err(|e| AppError::message(format!("MinerU task poll failed: {e}")))?;
+        let poll = json_body(poll, "task poll").await?;
+        let status = poll.get("status").and_then(Value::as_str).unwrap_or("");
+        match classify_extract_state(status) {
+            ExtractState::Done => {
+                progress("done", None, None);
+                break;
+            }
+            ExtractState::Failed => {
+                let message = poll
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.trim().is_empty())
+                    .unwrap_or("unknown error");
+                return Err(AppError::message(format!("MinerU task failed: {message}")));
+            }
+            // 3.x states: `pending` / `processing`.
+            ExtractState::InProgress => progress(status, None, None),
+        }
+    }
+
+    progress("downloading", None, None);
+    let response = authed(client.get(format!("{poll_url}/result")), auth)
+        .send()
+        .await
+        .map_err(|e| AppError::message(format!("MinerU result download failed: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AppError::message(format!(
+            "MinerU result download failed (HTTP {status})"
+        )));
+    }
+    read_capped_zip(response).await
+}
+
+/// Probe outcome for the settings connectivity check. A non-auth business
+/// response (currently `-10002 file list is empty`) proves the endpoint is the
+/// cloud API and the token was accepted; token error codes and HTTP 401 do not,
+/// and neither does a body without a business code — otherwise a self-hosted
+/// address (404) would probe green while every real request failed.
 fn probe_token_valid(body: &Value, status: StatusCode) -> bool {
-    !is_token_error_code(&mineru_code(body)) && status != StatusCode::UNAUTHORIZED
+    is_mineru_reply(body)
+        && !is_token_error_code(&mineru_code(body))
+        && status != StatusCode::UNAUTHORIZED
 }
 
 /// Connectivity probe: send a minimal (invalid-params) batch request; a
@@ -725,6 +1803,9 @@ async fn probe(
 ) -> Result<LayoutRemoteProbeResult, AppError> {
     let (base, auth) = resolve_target(credentials)?;
     let client = http::client(Duration::from_secs(30))?;
+    if credentials.self_hosted {
+        return probe_self_hosted(&client, &base, &auth).await;
+    }
     let response = client
         .post(format!("{base}/api/v4/file-urls/batch"))
         .header("Authorization", &auth)
@@ -749,11 +1830,43 @@ async fn probe(
             .to_string();
         Ok(LayoutRemoteProbeResult { job_id })
     } else {
-        let code = mineru_code(&value);
-        Err(AppError::message(format!(
-            "MinerU probe failed: invalid API token ({code})"
-        )))
+        Err(mineru_api_error("probe", &value, status))
     }
+}
+
+/// Self-hosted probe: the health endpoint identifies the dialect and version
+/// (both are anonymous), and on 4.0 the job listing additionally proves the
+/// token is accepted. 4.1 dropped that listing, so its health answer is the
+/// whole probe.
+async fn probe_self_hosted(
+    client: &reqwest::Client,
+    base: &str,
+    auth: &str,
+) -> Result<LayoutRemoteProbeResult, AppError> {
+    let detected = detect_self_hosted(client, base, auth).await?;
+    if detected.dialect == MineruDialect::V1 {
+        let response = authed(client.get(format!("{base}/v1/parse/jobs")), auth)
+            .query(&[("limit", "1")])
+            .send()
+            .await
+            .map_err(|e| AppError::message(format!("MinerU probe failed: {e}")))?;
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(AppError::message(
+                "MinerU probe failed: invalid API token (HTTP 401)",
+            ));
+        }
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            let snippet = http::http_err_snippet(&text);
+            return Err(AppError::message(format!(
+                "MinerU probe failed (HTTP {status}): {snippet}"
+            )));
+        }
+    }
+    Ok(LayoutRemoteProbeResult {
+        job_id: format!("mineru {}", detected.version),
+    })
 }
 
 #[cfg(test)]
@@ -777,6 +1890,73 @@ mod tests {
         assert_eq!(map_mineru_label("header", None), "header");
         assert_eq!(map_mineru_label("footer", None), "footer");
         assert_eq!(map_mineru_label("discarded", None), "discarded");
+    }
+
+    #[test]
+    fn preserves_content_text_and_captions_without_inventing_title_boxes() {
+        let content = json!([
+            {"type":"text", "page_idx":0, "bbox":[10,20,500,50], "text":"Fig. 1 | Overview."},
+            {"type":"image", "page_idx":0, "bbox":[10,100,500,500], "image_caption":["Fig. 1 | Overview.", "Panel details."]},
+            {"type":"table", "page_idx":0, "bbox":[500,100,900,500], "table_caption":["Table 1. Results."]},
+            {"type":"chart", "page_idx":0, "bbox":[10,600,500,900], "image_caption":[], "content":"Chart text"}
+        ]);
+        let pages = build_pages(&content, &[(600.0, 800.0)]).unwrap();
+        let boxes = serde_json::to_value(&pages[0].boxes).unwrap();
+        assert_eq!(boxes[0]["text"], "Fig. 1 | Overview.");
+        assert_eq!(boxes[1]["caption"], "Fig. 1 | Overview.\nPanel details.");
+        assert_eq!(boxes[2]["caption"], "Table 1. Results.");
+        assert_eq!(boxes[3]["text"], "Chart text");
+        assert_eq!(boxes[3].get("caption"), Some(&Value::Null));
+        assert_eq!(boxes[1].get("text"), Some(&Value::Null));
+        assert_eq!(pages[0].boxes.len(), 4);
+        assert!(pages[0].boxes.iter().all(|b| b.label != "figure_title"));
+    }
+
+    fn result_zip_fixture(content: &Value, middle: &Value) -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            for (name, value) in [("content_list.json", content), ("layout.json", middle)] {
+                writer
+                    .start_file(name, SimpleFileOptions::default())
+                    .unwrap();
+                writer
+                    .write_all(&serde_json::to_vec(value).unwrap())
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn extracts_nested_caption_geometry_in_page_points() {
+        let caption = json!({"type":"image_caption", "bbox":[60,410,540,450], "lines":[
+            {"spans":[{"content":"Fig. 2 | "},{"content":"Overview."}]},
+            {"spans":[{"content":"Panel details."}]}
+        ]});
+        let middle = json!({"pdf_info":[
+            {"page_idx":0,"page_size":[600,800],"para_blocks":[]},
+            {"page_idx":1,"page_size":[600,800],"para_blocks":[
+                {"type":"image", "bbox":[50,50,550,450], "blocks":[
+                    {"type":"image_body","bbox":[50,50,550,400]}, caption.clone(),
+                    {"type":"image_caption","lines":[{"spans":[{"content":"No box"}]}]},
+                    {"type":"image_caption","bbox":[90,80,20,10],"text":"Invalid box"}
+                ]},
+                {"type":"table", "blocks":[{"type":"table_caption","bbox":[60,500,540,530],"text":"Table 1. Results."}]}
+            ],"preproc_blocks":[caption]}
+        ]});
+        let result = parse_result_zip(&result_zip_fixture(&json!([]), &middle)).unwrap();
+        assert!(result.pages[0].boxes.is_empty());
+        let boxes = &result.pages[1].boxes;
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(boxes[0].label, "figure_title");
+        assert_eq!(boxes[0].coordinate, [60.0, 410.0, 540.0, 450.0]);
+        let wire = serde_json::to_value(boxes).unwrap();
+        assert_eq!(wire[0]["text"], "Fig. 2 | Overview.\nPanel details.");
+        assert_eq!(wire[1]["text"], "Table 1. Results.");
     }
 
     #[test]
@@ -819,31 +1999,30 @@ mod tests {
         assert!((pages[1].boxes[0].coordinate[3] - 396.0).abs() < 1e-9);
     }
 
+    /// The Markdown entry differs per protocol — `full.md` (cloud v4),
+    /// `markdown.md` (self-hosted 4.0) and `<stem>.md` (3.x) — while the
+    /// `images/` assets resolve relatively to `PAPER.md` in all three.
     #[test]
     fn reads_markdown_bundle_with_figure_assets() {
-        use std::io::Write;
-        use zip::write::SimpleFileOptions;
-
-        let mut cursor = std::io::Cursor::new(Vec::new());
-        {
-            let mut writer = zip::ZipWriter::new(&mut cursor);
-            let opts = SimpleFileOptions::default();
-            writer.start_file("task/full.md", opts).unwrap();
-            writer
-                .write_all(b"# Paper\n\n![](images/figure-1.jpg)\n")
-                .unwrap();
-            writer.start_file("task/images/figure-1.jpg", opts).unwrap();
-            writer.write_all(b"jpeg-bytes").unwrap();
-            writer.start_file("task/model.json", opts).unwrap();
-            writer.write_all(b"{}").unwrap();
-            writer.finish().unwrap();
+        for (entry, image_entry) in [
+            ("task/full.md", "task/images/figure-1.jpg"),
+            ("markdown.md", "images/figure-1.jpg"),
+            ("paper.pdf.md", "images/figure-1.jpg"),
+        ] {
+            let bytes = zip_fixture(&[
+                (entry, b"# Paper\n\n![](images/figure-1.jpg)\n"),
+                (image_entry, b"jpeg-bytes"),
+                ("model.json", b"{}"),
+            ]);
+            let bundle = read_mineru_markdown_bundle(&bytes).unwrap();
+            assert!(bundle.markdown.contains("images/figure-1.jpg"), "{entry}");
+            assert_eq!(bundle.assets.len(), 1, "{entry}");
+            assert_eq!(
+                bundle.assets[0].relative_path, "images/figure-1.jpg",
+                "{entry}"
+            );
+            assert_eq!(bundle.assets[0].bytes, b"jpeg-bytes", "{entry}");
         }
-
-        let bundle = read_mineru_markdown_bundle(cursor.get_ref()).unwrap();
-        assert!(bundle.markdown.contains("images/figure-1.jpg"));
-        assert_eq!(bundle.assets.len(), 1);
-        assert_eq!(bundle.assets[0].relative_path, "images/figure-1.jpg");
-        assert_eq!(bundle.assets[0].bytes, b"jpeg-bytes");
     }
 
     #[test]
@@ -948,10 +2127,181 @@ mod tests {
     #[test]
     fn classifies_extract_states() {
         assert_eq!(classify_extract_state("done"), ExtractState::Done);
+        // 3.x reports `completed` where the cloud reports `done`.
+        assert_eq!(classify_extract_state("completed"), ExtractState::Done);
         assert_eq!(classify_extract_state("failed"), ExtractState::Failed);
         for s in ["waiting-file", "pending", "running", "converting", ""] {
             assert_eq!(classify_extract_state(s), ExtractState::InProgress);
         }
+    }
+
+    #[test]
+    fn classifies_v1_job_statuses() {
+        for status in ["completed", "partial"] {
+            assert_eq!(classify_v1_status(status), ExtractState::Done);
+        }
+        for status in ["failed", "canceled"] {
+            assert_eq!(classify_v1_status(status), ExtractState::Failed);
+        }
+        for status in ["queued", "running", ""] {
+            assert_eq!(classify_v1_status(status), ExtractState::InProgress);
+        }
+    }
+
+    #[test]
+    fn cloud_requires_a_token_but_a_self_hosted_server_does_not() {
+        assert!(resolve_target(&HostedProviderCredentials::default()).is_err());
+        // A relay keeps the cloud protocol and its own host, but still needs a
+        // token.
+        assert!(resolve_target(&HostedProviderCredentials {
+            base_url: Some("https://relay.example.com".to_string()),
+            ..Default::default()
+        })
+        .is_err());
+        let relay = resolve_target(&HostedProviderCredentials {
+            base_url: Some("https://relay.example.com/".to_string()),
+            api_key: Some("sk-relay".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(relay.0, "https://relay.example.com");
+        assert_eq!(relay.1, "Bearer sk-relay");
+        // Self-hosted: no token required, host kept as the API base.
+        let (base, auth) = resolve_target(&HostedProviderCredentials {
+            base_url: Some("http://mineru.lan:8000/".to_string()),
+            self_hosted: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(base, "http://mineru.lan:8000");
+        assert!(auth.is_empty());
+        let (_, auth) = resolve_target(&HostedProviderCredentials {
+            base_url: Some("https://mineru.lan:8443".to_string()),
+            api_key: Some("sk-local".to_string()),
+            self_hosted: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(auth, "Bearer sk-local");
+        assert!(resolve_target(&HostedProviderCredentials {
+            base_url: Some("ftp://mineru.lan".to_string()),
+            self_hosted: true,
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn resolves_upload_urls_and_compares_origins() {
+        assert_eq!(
+            resolve_upload_url("http://host:8000", "/v1/uploads/u1/content").unwrap(),
+            "http://host:8000/v1/uploads/u1/content"
+        );
+        assert_eq!(
+            resolve_upload_url("http://host:8000", "https://bucket.example/x").unwrap(),
+            "https://bucket.example/x"
+        );
+        assert!(resolve_upload_url("http://host:8000", "v1/uploads/u1").is_err());
+        assert!(same_origin(
+            "http://host:8000",
+            "http://host:8000/v1/uploads/u1/content"
+        ));
+        // A different port is a different origin: the token must not travel.
+        assert!(!same_origin(
+            "http://host:8000",
+            "http://host:9000/v1/uploads/u1/content"
+        ));
+        assert!(!same_origin("http://host:8000", "https://host:8000/x"));
+    }
+
+    #[test]
+    fn builds_legacy_form_fields() {
+        let map: std::collections::HashMap<&str, String> =
+            legacy_form_fields(&HostedProviderCredentials::default())
+                .into_iter()
+                .collect();
+        assert_eq!(map.get("lang_list").map(String::as_str), Some("ch"));
+        assert_eq!(map.get("parse_method").map(String::as_str), Some("auto"));
+        assert_eq!(
+            map.get("response_format_zip").map(String::as_str),
+            Some("true")
+        );
+        // 4.0 removed `backend` / `server_url`, so they are never sent.
+        assert!(!map.contains_key("backend"));
+        assert!(!map.contains_key("server_url"));
+
+        let map: std::collections::HashMap<&str, String> =
+            legacy_form_fields(&HostedProviderCredentials {
+                language: Some("en".to_string()),
+                is_ocr: true,
+                ..Default::default()
+            })
+            .into_iter()
+            .collect();
+        assert_eq!(map.get("lang_list").map(String::as_str), Some("en"));
+        assert_eq!(map.get("parse_method").map(String::as_str), Some("ocr"));
+    }
+
+    /// Build a zip from `(entry name, bytes)` pairs.
+    fn zip_fixture(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            for (name, bytes) in entries {
+                writer
+                    .start_file(*name, SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    /// Self-hosted 4.0 zips carry `middle_json.json` (docvortex) with page
+    /// sizes in `extensions.docvortex_layout` and 0–1 page-relative boxes.
+    #[test]
+    fn builds_pages_from_docvortex_middle_json() {
+        let middle = json!({
+            "schema": "docvortex.middle",
+            "schema_version": "2.0",
+            "extensions": { "docvortex_layout": { "version": 1, "pages": [
+                { "page_idx": 0, "width_pt": 600.0, "height_pt": 800.0 },
+                { "page_idx": 1, "width_pt": 600.0, "height_pt": 800.0 }
+            ]}},
+            "pages": [
+                { "page_idx": 0, "blocks": [
+                    { "type": "doc_title", "index": 0, "bbox": [0.1, 0.05, 0.9, 0.1],
+                      "content": [{ "type": "text", "content": "Paper title" }]},
+                    { "type": "image", "index": 1, "bbox": [0.1, 0.2, 0.5, 0.5], "content": [
+                        { "type": "image_body", "index": 0, "bbox": [0.1, 0.2, 0.5, 0.5], "content": "" },
+                        { "type": "image_caption", "index": 1, "bbox": [0.12, 0.51, 0.48, 0.53],
+                          "content": [{ "type": "text", "content": "Figure 1: caption." }]}
+                    ]}
+                ]},
+                { "page_idx": 1, "blocks": [
+                    { "type": "page_number", "index": 0, "bbox": [0.45, 0.95, 0.55, 0.97],
+                      "content": [{ "type": "text", "content": "2" }]}
+                ]}
+            ]
+        });
+        let text = serde_json::to_string(&middle).unwrap();
+        let bytes = zip_fixture(&[("middle_json.json", text.as_bytes())]);
+        let result = parse_result_zip(&bytes).unwrap();
+        assert_eq!(result.rendered_pages, vec![(600, 800), (600, 800)]);
+        let boxes = &result.pages[0].boxes;
+        assert_eq!(boxes.len(), 3);
+        assert_eq!(boxes[0].label, "doc_title");
+        assert_eq!(boxes[0].coordinate, [60.0, 40.0, 540.0, 80.0]);
+        assert_eq!(boxes[0].text.as_deref(), Some("Paper title"));
+        assert_eq!(boxes[1].label, "image");
+        // The caption sub-block keeps its own geometry.
+        assert_eq!(boxes[2].label, "figure_title");
+        assert_eq!(boxes[2].coordinate, [72.0, 408.0, 288.0, 424.0]);
+        assert_eq!(boxes[2].text.as_deref(), Some("Figure 1: caption."));
+        assert_eq!(result.pages[1].boxes[0].label, "number");
     }
 
     #[test]
@@ -977,5 +2327,74 @@ mod tests {
         assert!(!probe_token_valid(&msg_code, unauthorized));
         let bare_401: Value = serde_json::from_str(r#"{"success":false}"#).unwrap();
         assert!(!probe_token_valid(&bare_401, unauthorized));
+        // A self-hosted address with the switch off: FastAPI's 404 body has no
+        // business code, so it must never probe green.
+        let not_found: Value = serde_json::from_str(r#"{"detail":"Not Found"}"#).unwrap();
+        assert!(!probe_token_valid(&not_found, StatusCode::NOT_FOUND));
+        assert!(mineru_api_error("probe", &not_found, StatusCode::NOT_FOUND)
+            .to_string()
+            .contains("Self-hosted API"));
+    }
+
+    /// 4.0 and 4.1 both answer `/v1/health`; only the capability list tells
+    /// them apart. Bodies below are real responses.
+    #[test]
+    fn detects_dialect_from_health_capabilities() {
+        let v40: Value = serde_json::from_str(
+            r#"{"status":"ok","version":"4.0.12","features":{"webhook":false,
+                "output_formats":["markdown","middle_json","structured_content","zip"],
+                "sources":["file_id","url","inline"]}}"#,
+        )
+        .unwrap();
+        let v41: Value = serde_json::from_str(
+            r#"{"status":"ok","version":"4.1.7","features":{"webhook":false,
+                "task_output_formats":["default","docx","html","latex"],
+                "sources":["upload","url"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(dialect_from_health(&v40), Some(MineruDialect::V1));
+        assert_eq!(dialect_from_health(&v41), Some(MineruDialect::V1Tasks));
+
+        // A build that advertises both shapes is newer: the task API wins.
+        let both: Value = serde_json::from_str(
+            r#"{"features":{"output_formats":["zip"],"task_output_formats":["default"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(dialect_from_health(&both), Some(MineruDialect::V1Tasks));
+
+        // No capability list (older builds, relays that strip it): the caller
+        // infers 4.0 and may fall forward on a missing upload endpoint.
+        let bare: Value = serde_json::from_str(r#"{"status":"ok","version":"4.0.0"}"#).unwrap();
+        assert_eq!(dialect_from_health(&bare), None);
+    }
+
+    /// 4.1 keeps the 4.0 artifact contract (`middle_json.json` with docvortex
+    /// page sizes), so the existing reader must keep working on it.
+    #[test]
+    fn parses_self_hosted_41_result_zip() {
+        let middle = json!({
+            "schema": "docvortex.middle",
+            "extensions": { "docvortex_layout": { "version": 1, "pages": [
+                { "page_idx": 0, "width_pt": 595.28, "height_pt": 841.89 }
+            ]}},
+            "pages": [
+                { "page_idx": 0, "blocks": [
+                    { "type": "image", "index": 0, "bbox": [0.1, 0.2, 0.5, 0.6], "content": [] },
+                    { "type": "text", "index": 1, "bbox": [0.1, 0.7, 0.9, 0.75], "level": null,
+                      "content": [{ "type": "text", "content": "Body text" }] }
+                ]}
+            ]
+        });
+        let body = middle.to_string();
+        let zip = zip_fixture(&[("middle_json.json", body.as_bytes())]);
+        let result = parse_result_zip(&zip).expect("4.1 middle_json reads through the 4.0 path");
+        assert_eq!(result.pages.len(), 1);
+        let labels: Vec<&str> = result.pages[0]
+            .boxes
+            .iter()
+            .map(|b| b.label.as_str())
+            .collect();
+        assert!(labels.contains(&"image"), "labels: {labels:?}");
+        assert!(labels.contains(&"text"), "labels: {labels:?}");
     }
 }

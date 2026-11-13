@@ -44,7 +44,7 @@ fn parse_body_runner(
         let result = crate::features::paper::import::pdf_parse::parse_paper_body(
             crate::features::paper::import::pdf_parse::PaperParseBodyArgs {
                 vault_path: vault.to_string_lossy().to_string(),
-                path,
+                path: path.clone(),
                 force,
                 task_id: Some(task_id),
             },
@@ -56,7 +56,15 @@ fn parse_body_runner(
         match result {
             Ok(parsed) => match parsed.error {
                 Some(message) => RunOutcome::Failed(Some(message)),
-                None => RunOutcome::Succeeded,
+                None => {
+                    // Source preparation can add .bbl/.bib after an older refs pass.
+                    crate::features::paper::analyze::refs::spawn_parse_after_import(
+                        Some(&app),
+                        &vault,
+                        &path,
+                    );
+                    RunOutcome::Succeeded
+                }
             },
             Err(e) => RunOutcome::Failed(Some(e.to_string())),
         }
@@ -98,12 +106,27 @@ fn download_assets_runner(
         cache.invalidate(&vault, &path);
 
         match result {
-            Ok(_) => {
+            Ok(downloaded) => {
+                // Commit/download no longer spawns through HostHooks. Enqueue
+                // the returned plan (ParseBody when the asset flags ask for it,
+                // plus ParseRefs) with the same jobs as before.
+                crate::features::host_hooks::enqueue_preparation_plan(
+                    &app,
+                    &vault,
+                    &downloaded.preparation,
+                );
+                // arXiv e-print template → `#submitted:` catalog tag. Best-effort:
+                // never fail the download.
+                if let Err(e) = crate::features::paper::venue::sync_venue_tag(&vault, &path) {
+                    log::warn!(target: "agentero::import",
+                        "venue tag refresh failed for {path}: {e}");
+                }
                 // Follow-ups only when a local PDF actually exists. TeX-only
                 // downloads (or a failed PDF attempt) must not enqueue layout /
                 // ParseBody — those jobs fail with "No local PDF".
+                // ParseBody from the plan is already queued; don't enqueue it twice.
                 let caps = cache.caps_for(&vault, &path);
-                if caps.needs_paper_md() {
+                if caps.needs_paper_md() && !downloaded.preparation.has_parse_body() {
                     let snap = center
                         .enqueue_parse_body(&vault, &path, JobLane::Normal, false, None)
                         .await;
@@ -113,17 +136,9 @@ fn download_assets_runner(
                     }
                 }
                 if caps.has_pdf() {
-                    let backend = app
-                        .state::<crate::features::system::settings::AppSettingsStore>()
-                        .layout_backend();
-                    center.apply_layout_backend(&backend).await;
-                    let lsnap = center
-                        .enqueue_layout_analyze(&vault, &path, JobLane::Normal, false)
-                        .await;
-                    emit_job_changed(&app, lsnap.clone());
-                    if let StartOutcome::Started(started) = center.try_start(&lsnap.id).await {
-                        center.spawn_runner(&app, started);
-                    }
+                    // Shared import entry: layout plus the optional dependent
+                    // background translation (settings gate inside).
+                    crate::features::jobs::spawn_layout_after_import(Some(&app), &vault, &path);
                 }
                 RunOutcome::Succeeded
             }
@@ -164,21 +179,8 @@ fn recognize_metadata_runner(
             return RunOutcome::Succeeded; // nothing to recognize without a PDF
         }
 
-        let translator_base = app
-            .state::<crate::features::system::settings::AppSettingsStore>()
-            .get()
-            .ok()
-            .map(|r| {
-                r.settings
-                    .translator_base_url
-                    .trim()
-                    .trim_end_matches('/')
-                    .to_string()
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                crate::features::paper::import::DEFAULT_TRANSLATOR_BASE_URL.to_string()
-            });
+        let translator_base =
+            crate::features::paper::import::DEFAULT_TRANSLATOR_BASE_URL.to_string();
 
         let probe =
             crate::features::paper::import::recognize::pdf_recognize::recognize_and_resolve(
@@ -198,9 +200,11 @@ fn recognize_metadata_runner(
         }
 
         let host_app = crate::features::host_hooks::wrap(&app);
+        let event_vault = std::path::PathBuf::from(&snapshot.vault_id);
         let outcome = crate::features::paper::import::recognize::apply::apply_probe_result(
             Some(&host_app),
             &vault,
+            &event_vault,
             Some(&cache),
             index,
             &path,
@@ -236,6 +240,9 @@ fn recognize_metadata_runner(
         };
         cache.invalidate(&vault, &path);
         cache.invalidate(&vault, &final_path);
+        // A recognized PDF just gained an arXiv id (and maybe a venue): let the
+        // catalog fill follow-ups run against the final path.
+        crate::features::paper::discovery::pwc::spawn_enrich(&vault, &final_path);
 
         // Soft warning for the frontend: arXiv id found, Atom lookup hit 429,
         // recognizer had no title — keep filename placeholder; Toast via
@@ -260,7 +267,14 @@ fn recognize_metadata_runner(
         }
 
         let final_caps = cache.caps_for(&vault, &final_path);
-        if final_caps.needs_paper_md() {
+        if final_caps.needs_paper_md()
+            || crate::features::paper::catalog::papers::get_by_path(&vault, &final_path)
+                .ok()
+                .flatten()
+                .is_some_and(|paper| {
+                    agentero_core::features::paper::source::needs_preparation(&vault, &paper)
+                })
+        {
             let snap = center
                 .enqueue_parse_body(&vault, &final_path, JobLane::Normal, false, None)
                 .await;
@@ -275,17 +289,7 @@ fn recognize_metadata_runner(
             &final_path,
         );
         if final_caps.has_pdf() {
-            let backend = app
-                .state::<crate::features::system::settings::AppSettingsStore>()
-                .layout_backend();
-            center.apply_layout_backend(&backend).await;
-            let lsnap = center
-                .enqueue_layout_analyze(&vault, &final_path, JobLane::Normal, false)
-                .await;
-            emit_job_changed(&app, lsnap.clone());
-            if let StartOutcome::Started(started) = center.try_start(&lsnap.id).await {
-                center.spawn_runner(&app, started);
-            }
+            crate::features::jobs::spawn_layout_after_import(Some(&app), &vault, &final_path);
         }
 
         match outcome {

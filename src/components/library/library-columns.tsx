@@ -9,6 +9,7 @@ import { LibraryPaperTag } from "@/components/library/library-paper-tag";
 import {
 	addedDate,
 	authorsCopyText,
+	type BuiltinLibraryColumnKey,
 	type CellCtx,
 	type ColumnDef,
 	identifierValue,
@@ -17,17 +18,22 @@ import {
 	type SortKey,
 } from "@/components/library/library-row-utils";
 import { ReadingTitleHeat } from "@/components/library/reading-heatmap";
-import { MathText } from "@/components/ui/math-text";
+import { PaperTitle } from "@/components/paper/paper-title";
 import {
 	Tooltip,
 	TooltipContent,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/core/utils";
-import { formatAuthorsShort, publicationDateText } from "@/lib/paper";
+import {
+	formatAuthorsShort,
+	type PaperLibraryRow,
+	publicationDateText,
+} from "@/lib/paper";
+import { type VenueStatus, venueInfo } from "@/lib/paper/venue-info";
 
 const COPY_CELL_BASE =
-	"cursor-pointer select-text rounded-sm hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
+	"cursor-pointer select-text rounded-sm hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
 
 /** Double-click-to-copy cell control shared by library columns. */
 function CopyCellButton({
@@ -45,12 +51,10 @@ function CopyCellButton({
 }) {
 	const label = ctx.t(labelKey);
 	const copyHint = ctx.t("papersLibrary.copyHint", { label });
-	const canCopy = Boolean(copyText?.trim());
 	return (
 		<button
 			type="button"
 			className={cn(COPY_CELL_BASE, className)}
-			title={canCopy ? copyHint : undefined}
 			aria-label={copyHint}
 			onDoubleClick={() => ctx.onCellCopy(copyText, label)}
 		>
@@ -100,6 +104,75 @@ function SortIcon({ active, dir }: { active: boolean; dir: SortDir }) {
 	);
 }
 
+const VENUE_STATUS_LABEL: Record<VenueStatus, string> = {
+	published: "papersLibrary.venueStatus.published",
+	submitted: "papersLibrary.venueStatus.submitted",
+	preprint: "papersLibrary.venueStatus.preprint",
+	none: "papersLibrary.colPublication",
+};
+
+const VENUE_STATUS_CLASS: Record<VenueStatus, string> = {
+	published: "bg-muted text-foreground",
+	submitted: "bg-muted/70 text-muted-foreground",
+	preprint: "bg-muted/40 text-muted-foreground",
+	none: "bg-muted/40 text-muted-foreground",
+};
+
+/** One cell for publication / submission / preprint + EasyScholar metrics. */
+function VenueCell({ paper, ctx }: { paper: PaperLibraryRow; ctx: CellCtx }) {
+	const info = venueInfo(paper);
+	if (info.status === "none" || !info.name) {
+		return (
+			<td className="min-w-0 max-w-0 overflow-hidden px-3 py-2.5 text-muted-foreground text-xs">
+				—
+			</td>
+		);
+	}
+	const metrics = info.metrics.join(" · ");
+	return (
+		<td className="min-w-0 max-w-0 overflow-hidden px-3 py-2.5">
+			<CopyCellButton
+				copyText={info.name}
+				labelKey="papersLibrary.colPublication"
+				ctx={ctx}
+				className="block w-full text-left"
+			>
+				<span className="flex min-w-0 flex-col gap-0.5">
+					<span className="flex min-w-0 items-center gap-1.5">
+						<span
+							className={cn(
+								"shrink-0 rounded px-1 py-0.5 text-[10px] leading-none",
+								VENUE_STATUS_CLASS[info.status],
+							)}
+						>
+							{ctx.t(VENUE_STATUS_LABEL[info.status])}
+						</span>
+						<span
+							className="truncate text-foreground text-xs"
+							title={info.fullName ?? undefined}
+						>
+							{info.name}
+						</span>
+					</span>
+					{metrics ? (
+						<span
+							className="truncate text-[10px] text-muted-foreground/80"
+							title={metrics}
+						>
+							{metrics}
+						</span>
+					) : null}
+					{info.inferred ? (
+						<span className="text-[10px] text-muted-foreground/70">
+							{ctx.t("papersLibrary.venueStatus.inferred")}
+						</span>
+					) : null}
+				</span>
+			</CopyCellButton>
+		</td>
+	);
+}
+
 /** Column layout + cell renderers (data-driven; no switch in the component). */
 export const COLUMN_META = {
 	title: {
@@ -116,7 +189,7 @@ export const COLUMN_META = {
 				>
 					<ReadingTitleHeat heatmap={ctx.heat} className="line-clamp-1">
 						<span className="flex min-w-0 items-center gap-1">
-							<MathText text={p.title} className="block min-w-0 truncate" />
+							<PaperTitle text={p.title} className="block min-w-0 truncate" />
 							{isMissingLocalPdf(p) ? (
 								<Tooltip>
 									<TooltipTrigger asChild>
@@ -197,13 +270,7 @@ export const COLUMN_META = {
 		labelKey: "papersLibrary.colPublication",
 		widthWeight: 14,
 		headerClassName: "min-w-[120px]",
-		render: (p) => (
-			<td className="min-w-0 max-w-0 overflow-hidden px-3 py-2.5 text-muted-foreground text-xs">
-				<span className="line-clamp-1" title={p.publication ?? undefined}>
-					{p.publication || "—"}
-				</span>
-			</td>
-		),
+		render: (p, ctx) => <VenueCell paper={p} ctx={ctx} />,
 	},
 	tags: {
 		labelKey: "papersLibrary.colTags",
@@ -257,6 +324,62 @@ export const COLUMN_META = {
 			);
 		},
 	},
-} as const satisfies Record<SortKey, ColumnDef>;
+} as const satisfies Record<BuiltinLibraryColumnKey, ColumnDef>;
 
 export { SortIcon };
+
+import { SelectCell } from "@/components/library/select-cell";
+import { TextCell } from "@/components/library/text-cell";
+import {
+	customPropertiesStore,
+	propertyType,
+} from "@/lib/paper/custom-properties-store";
+
+export function getColumnMeta(key: SortKey): ColumnDef {
+	if (Object.hasOwn(COLUMN_META, key)) {
+		return COLUMN_META[key as BuiltinLibraryColumnKey];
+	}
+	if (key.startsWith("prop:")) {
+		const propId = key.slice(5);
+		const prop = customPropertiesStore
+			.getState()
+			.properties.find((p) => p.id === propId);
+		return {
+			labelKey: prop?.name ?? propId,
+			widthWeight: 14,
+			headerClassName: "min-w-[120px]",
+			render: (p) => {
+				if (!prop) {
+					return (
+						<td className="px-3 py-2.5 text-muted-foreground text-xs">—</td>
+					);
+				}
+				return (
+					<td className="min-w-0 max-w-0 overflow-hidden px-3 py-2.5">
+						{propertyType(prop) === "text" ? (
+							<TextCell
+								paperPath={p.path ?? ""}
+								property={prop}
+								value={p.custom_props?.[prop.id]}
+							/>
+						) : (
+							<SelectCell
+								paperPath={p.path ?? ""}
+								property={prop}
+								selectedOptionId={p.custom_props?.[prop.id]}
+							/>
+						)}
+					</td>
+				);
+			},
+		};
+	}
+	return {
+		labelKey: key,
+		widthWeight: 10,
+		headerClassName: "min-w-[100px]",
+		render: () => (
+			<td className="px-3 py-2.5 text-xs text-muted-foreground">—</td>
+		),
+	};
+}

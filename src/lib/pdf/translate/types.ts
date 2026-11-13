@@ -24,10 +24,14 @@ export type PdfTranslateRecord = {
 	/** 1-based page number */
 	page: number;
 	rects: PdfTranslateRect[];
+	/** All selected pages for a cross-page translation; page/rects anchor the card. */
+	selectionPages?: { page: number; rects: PdfTranslateRect[] }[];
 	/** Source text that was translated */
 	quote?: string;
 	/** Translation body (persisted so the card can be reopened) */
 	result?: string;
+	/** Whether a page gutter marker keeps this result reachable after hiding. */
+	pinned: boolean;
 	/** Last error message if the run failed */
 	error?: string;
 };

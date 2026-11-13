@@ -8,8 +8,13 @@
 //! 3. **Bare directory argv** — OS shell integrations (Finder Quick Action,
 //!    Explorer context menu) pass the folder path directly
 //!
+//! The same request-file / `agentero://ui` deep-link plumbing also carries
+//! generic workspace **UI actions** (`open-paper` / `open-path` / `open-window`
+//! / `close-path`) as [`UiRequestPayload`] — the CLI-side of Herdr-like window
+//! management.
+//!
 //! The desktop Host (`agentero_lib::features::open_request`) adds the Tauri
-//! side: fs-scope extension, pending-path caching, event emit, and window
+//! side: fs-scope extension, pending-request caching, event emit, and window
 //! focus on top of these pure parsing/validation/request-file helpers.
 
 use crate::error::AppError;
@@ -21,9 +26,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
 pub const EVENT_VAULT_OPEN_REQUEST: &str = "vault:open-request";
+/// Generic workspace UI action request (open paper / path / window, close path).
+pub const EVENT_UI_REQUEST: &str = "ui:request";
+
+pub const UI_ACTION_OPEN_PAPER: &str = "open-paper";
+pub const UI_ACTION_OPEN_PATH: &str = "open-path";
+pub const UI_ACTION_OPEN_WINDOW: &str = "open-window";
+pub const UI_ACTION_CLOSE_PATH: &str = "close-path";
+pub const UI_ACTION_SPLIT: &str = "split";
+
+/// Dockview split directions accepted by [`UI_ACTION_SPLIT`].
+pub const SPLIT_DIRECTIONS: &[&str] = &["left", "right", "above", "below", "within"];
 
 /// Written by headless CLI; consumed by the running desktop Host.
 const CLI_OPEN_REQUEST_FILE: &str = "cli-open-request.json";
+/// CLI UI-action request file (`agentero paper open` / `agentero ui …`).
+const CLI_UI_REQUEST_FILE: &str = "cli-ui-request.json";
 /// Ignore stale requests older than this (seconds).
 const CLI_OPEN_REQUEST_MAX_AGE_SECS: u64 = 120;
 
@@ -57,6 +75,276 @@ impl PendingVaultOpen {
 #[serde(rename_all = "camelCase")]
 pub struct VaultOpenPayload {
     pub path: String,
+}
+
+/// Last validated UI request waiting for the frontend to consume.
+#[derive(Default)]
+pub struct PendingUiRequest {
+    pending: Mutex<Option<UiRequestPayload>>,
+}
+
+impl PendingUiRequest {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, payload: UiRequestPayload) {
+        if let Ok(mut guard) = self.pending.lock() {
+            *guard = Some(payload);
+        }
+    }
+
+    pub fn take(&self) -> Option<UiRequestPayload> {
+        self.pending.lock().ok().and_then(|mut g| g.take())
+    }
+}
+
+/// One workspace UI action for the desktop App, dispatched by `action`.
+///
+/// `vault_path` is the absolute Vault root and `path` is the Vault-relative
+/// target (paper folder, note, file). `window` selects a native child window.
+/// Together these address a Dockview panel or window without the Host needing
+/// to know the frontend's tab registry.
+#[derive(specta::Type, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiRequestPayload {
+    /// `open-paper` | `open-path` | `open-window` | `close-path` | `split`.
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    /// `split` direction (`left` | `right` | `above` | `below` | `within`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// `split` reference panel (Vault-relative path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+}
+
+impl UiRequestPayload {
+    pub fn open_paper(vault_path: String, path: String) -> Self {
+        Self::with_path(UI_ACTION_OPEN_PAPER, vault_path, path)
+    }
+
+    pub fn open_path(vault_path: String, path: String) -> Self {
+        Self::with_path(UI_ACTION_OPEN_PATH, vault_path, path)
+    }
+
+    pub fn close_path(vault_path: String, path: String) -> Self {
+        Self::with_path(UI_ACTION_CLOSE_PATH, vault_path, path)
+    }
+
+    pub fn open_window(window: String, section: Option<String>) -> Self {
+        Self {
+            action: UI_ACTION_OPEN_WINDOW.into(),
+            vault_path: None,
+            path: None,
+            window: Some(window),
+            section,
+            direction: None,
+            reference: None,
+        }
+    }
+
+    pub fn split(
+        vault_path: String,
+        path: Option<String>,
+        reference: Option<String>,
+        direction: Option<String>,
+    ) -> Self {
+        Self {
+            action: UI_ACTION_SPLIT.into(),
+            vault_path: Some(vault_path),
+            path,
+            window: None,
+            section: None,
+            direction,
+            reference,
+        }
+    }
+
+    fn with_path(action: &str, vault_path: String, path: String) -> Self {
+        Self {
+            action: action.into(),
+            vault_path: Some(vault_path),
+            path: Some(path),
+            window: None,
+            section: None,
+            direction: None,
+            reference: None,
+        }
+    }
+}
+
+/// Validate + canonicalize a UI request (absolute Vault dir, Vault-relative path).
+pub fn validate_ui_request(mut req: UiRequestPayload) -> Result<UiRequestPayload, AppError> {
+    match req.action.as_str() {
+        UI_ACTION_OPEN_PAPER | UI_ACTION_OPEN_PATH | UI_ACTION_CLOSE_PATH => {
+            let vault = req
+                .vault_path
+                .take()
+                .ok_or_else(|| AppError::message("vault path is required"))?;
+            let canonical = validate_open_dir(Path::new(&vault))?;
+            let path = normalize_vault_rel(req.path.as_deref().unwrap_or(""))?;
+            req.vault_path = Some(canonical.to_string_lossy().into_owned());
+            req.path = Some(path);
+            Ok(req)
+        }
+        UI_ACTION_OPEN_WINDOW => {
+            let window = req
+                .window
+                .take()
+                .map(|w| w.trim().to_string())
+                .filter(|w| !w.is_empty())
+                .ok_or_else(|| AppError::message("window is required"))?;
+            req.window = Some(window);
+            req.section = req
+                .section
+                .take()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            Ok(req)
+        }
+        UI_ACTION_SPLIT => {
+            let vault = req
+                .vault_path
+                .take()
+                .ok_or_else(|| AppError::message("vault path is required"))?;
+            let canonical = validate_open_dir(Path::new(&vault))?;
+            req.vault_path = Some(canonical.to_string_lossy().into_owned());
+            req.path = normalize_opt_rel(req.path.take())?;
+            req.reference = normalize_opt_rel(req.reference.take())?;
+            req.direction = Some(match req.direction.take() {
+                Some(d) => {
+                    let d = d.trim().to_ascii_lowercase();
+                    // Accept Herdr-style `up`/`down` as aliases for dockview's
+                    // `above`/`below`, then keep only canonical values.
+                    let canonical = match d.as_str() {
+                        "up" => "above",
+                        "down" => "below",
+                        other => other,
+                    };
+                    if !SPLIT_DIRECTIONS.contains(&canonical) {
+                        return Err(AppError::message(format!(
+                            "unsupported split direction: {d} (expected {})",
+                            SPLIT_DIRECTIONS.join(", ")
+                        )));
+                    }
+                    canonical.to_string()
+                }
+                None => "right".to_string(),
+            });
+            Ok(req)
+        }
+        other => Err(AppError::message(format!("unsupported ui action: {other}"))),
+    }
+}
+
+/// Normalize an optional Vault-relative path (`None` when absent/blank).
+fn normalize_opt_rel(value: Option<String>) -> Result<Option<String>, AppError> {
+    match value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        Some(v) => Ok(Some(normalize_vault_rel(&v)?)),
+        None => Ok(None),
+    }
+}
+
+/// Build the `agentero://ui?action=…` deep link for a UI request.
+pub fn ui_deep_link_url(req: &UiRequestPayload) -> String {
+    let mut url = Url::parse("agentero://ui").expect("static ui url");
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("action", &req.action);
+        if let Some(v) = req.vault_path.as_deref() {
+            q.append_pair("vault", v);
+        }
+        if let Some(v) = req.path.as_deref() {
+            q.append_pair("path", v);
+        }
+        if let Some(v) = req.window.as_deref() {
+            q.append_pair("window", v);
+        }
+        if let Some(v) = req.section.as_deref() {
+            q.append_pair("section", v);
+        }
+        if let Some(v) = req.direction.as_deref() {
+            q.append_pair("direction", v);
+        }
+        if let Some(v) = req.reference.as_deref() {
+            q.append_pair("reference", v);
+        }
+    }
+    url.to_string()
+}
+
+/// Parse `agentero://ui?action=…` into a validated [`UiRequestPayload`].
+pub fn parse_ui_url(raw: &str) -> Result<UiRequestPayload, AppError> {
+    let url = Url::parse(raw).map_err(|e| AppError::message(format!("invalid ui URL: {e}")))?;
+    if url.scheme() != "agentero" {
+        return Err(AppError::message(format!(
+            "unsupported URL scheme: {}",
+            url.scheme()
+        )));
+    }
+    let host = url.host_str().unwrap_or("");
+    let path_seg = url.path().trim_matches('/');
+    if !(host.eq_ignore_ascii_case("ui") || path_seg.eq_ignore_ascii_case("ui")) {
+        return Err(AppError::message(format!(
+            "unsupported agentero URL action: {}",
+            if host.is_empty() { path_seg } else { host }
+        )));
+    }
+    let param = |key: &str| {
+        url.query_pairs()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.into_owned())
+            .filter(|s| !s.trim().is_empty())
+    };
+    let action = param("action").ok_or_else(|| AppError::message("ui URL missing action query"))?;
+    // Structural parse only; `handle_ui_request` validates (and surfaces errors).
+    Ok(UiRequestPayload {
+        action,
+        vault_path: param("vault"),
+        path: param("path"),
+        window: param("window"),
+        section: param("section"),
+        direction: param("direction"),
+        reference: param("reference"),
+    })
+}
+
+/// Normalize a Vault-relative path, rejecting absolute paths and any `..`
+/// escape. Returns `/`-separated segments joined without a leading slash.
+pub fn normalize_vault_rel(rel: &str) -> Result<String, AppError> {
+    let raw = rel.trim().replace('\\', "/");
+    if raw.trim_matches('/').is_empty() {
+        return Err(AppError::message("vault-relative path is required"));
+    }
+    if Path::new(&raw).is_absolute() {
+        return Err(AppError::message(format!(
+            "path must be vault-relative: {rel}"
+        )));
+    }
+    let trimmed = raw.trim_matches('/');
+    let mut parts = Vec::new();
+    for seg in trimmed.split('/') {
+        match seg {
+            "" | "." => continue,
+            ".." => return Err(AppError::message("path must not escape the vault")),
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        return Err(AppError::message("vault-relative path is required"));
+    }
+    Ok(parts.join("/"))
 }
 
 /// Parse `agentero://open?path=` (or `agentero:open?path=` variants).
@@ -175,7 +463,7 @@ pub fn write_cli_open_request(absolute_path: &Path) -> Result<PathBuf, AppError>
     };
     let json = serde_json::to_string_pretty(&body)
         .map_err(|e| AppError::message(format!("serialize open request: {e}")))?;
-    // Atomic write: temp then rename (with the Windows replace fallback).
+    // Atomic replacement through the shared sibling-temp helper.
     crate::fs::atomic_write(&file, json.as_bytes())?;
     Ok(file)
 }
@@ -204,6 +492,89 @@ pub fn take_cli_open_request_file() -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+// --- CLI ↔ Host request file: UI actions -----------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliUiRequestFile {
+    action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vault_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    section: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    direction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reference: Option<String>,
+    /// Unix epoch seconds when the CLI wrote the request.
+    ts: u64,
+}
+
+/// Absolute path of the CLI UI-action request file.
+pub fn cli_ui_request_path() -> PathBuf {
+    agentero_config_dir().join(CLI_UI_REQUEST_FILE)
+}
+
+/// CLI (and tests): ask any running desktop Host to run a workspace UI action.
+pub fn write_cli_ui_request(req: &UiRequestPayload) -> Result<PathBuf, AppError> {
+    let validated = validate_ui_request(req.clone())?;
+    let dir = agentero_config_dir();
+    std::fs::create_dir_all(&dir)?;
+    let file = cli_ui_request_path();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let body = CliUiRequestFile {
+        action: validated.action,
+        vault_path: validated.vault_path,
+        path: validated.path,
+        window: validated.window,
+        section: validated.section,
+        direction: validated.direction,
+        reference: validated.reference,
+        ts,
+    };
+    let json = serde_json::to_string_pretty(&body)
+        .map_err(|e| AppError::message(format!("serialize ui request: {e}")))?;
+    crate::fs::atomic_write(&file, json.as_bytes())?;
+    Ok(file)
+}
+
+/// Read + delete a fresh CLI UI action request, if any.
+pub fn take_cli_ui_request_file() -> Option<UiRequestPayload> {
+    let file = cli_ui_request_path();
+    let raw = std::fs::read_to_string(&file).ok()?;
+    let _ = std::fs::remove_file(&file);
+    let req: CliUiRequestFile = serde_json::from_str(&raw).ok()?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(req.ts) > CLI_OPEN_REQUEST_MAX_AGE_SECS {
+        log::info!(
+            target: "agentero::op",
+            "ignore stale cli ui request age_s={}",
+            now.saturating_sub(req.ts)
+        );
+        return None;
+    }
+    validate_ui_request(UiRequestPayload {
+        action: req.action,
+        vault_path: req.vault_path,
+        path: req.path,
+        window: req.window,
+        section: req.section,
+        direction: req.direction,
+        reference: req.reference,
+    })
+    .ok()
 }
 
 #[cfg(test)]
@@ -239,6 +610,125 @@ mod tests {
     #[test]
     fn rejects_other_scheme() {
         assert!(parse_open_url("https://example.com/open?path=/tmp").is_err());
+    }
+
+    #[test]
+    fn ui_deep_link_roundtrips_open_paper() {
+        let dir = test_dir("ui-paper");
+        let req = UiRequestPayload::open_paper(
+            dir.to_string_lossy().into_owned(),
+            "papers/demo".to_string(),
+        );
+        let validated = validate_ui_request(req).unwrap();
+        let url = ui_deep_link_url(&validated);
+        assert!(url.starts_with("agentero://ui?action=open-paper"));
+        assert_eq!(parse_ui_url(&url).unwrap(), validated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ui_deep_link_roundtrips_open_window() {
+        let req = UiRequestPayload::open_window("agent".to_string(), Some("translate".into()));
+        let validated = validate_ui_request(req).unwrap();
+        let url = ui_deep_link_url(&validated);
+        let parsed = parse_ui_url(&url).unwrap();
+        assert_eq!(parsed, validated);
+        assert_eq!(parsed.window.as_deref(), Some("agent"));
+        assert_eq!(parsed.section.as_deref(), Some("translate"));
+    }
+
+    #[test]
+    fn ui_deep_link_roundtrips_split() {
+        let dir = test_dir("ui-split");
+        let req = UiRequestPayload::split(
+            dir.to_string_lossy().into_owned(),
+            Some("papers/demo".into()),
+            Some("papers/other".into()),
+            Some("down".into()),
+        );
+        let validated = validate_ui_request(req).unwrap();
+        let url = ui_deep_link_url(&validated);
+        let parsed = parse_ui_url(&url).unwrap();
+        assert_eq!(parsed.action, UI_ACTION_SPLIT);
+        assert_eq!(parsed.direction.as_deref(), Some("below"));
+        assert_eq!(parsed.path.as_deref(), Some("papers/demo"));
+        assert_eq!(parsed.reference.as_deref(), Some("papers/other"));
+        assert_eq!(
+            validate_ui_request(parse_ui_url(&url).unwrap()).unwrap(),
+            validated
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ui_split_defaults_direction_right_and_rejects_bad() {
+        let dir = test_dir("ui-split-dir");
+        let validated = validate_ui_request(UiRequestPayload::split(
+            dir.to_string_lossy().into_owned(),
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(validated.direction.as_deref(), Some("right"));
+        assert!(validated.path.is_none());
+
+        let bad = UiRequestPayload::split(
+            dir.to_string_lossy().into_owned(),
+            Some("papers/demo".into()),
+            None,
+            Some("sideways".into()),
+        );
+        assert!(validate_ui_request(bad).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ui_url_requires_action() {
+        assert!(parse_ui_url("agentero://ui?vault=/tmp/vault&path=papers/demo").is_err());
+    }
+
+    #[test]
+    fn ui_url_rejects_other_action() {
+        assert!(parse_ui_url("agentero://open?path=%2Ftmp%2Fvault").is_err());
+    }
+
+    #[test]
+    fn ui_open_path_requires_existing_absolute_vault() {
+        assert!(validate_ui_request(UiRequestPayload::open_path(
+            "relative".into(),
+            "notes/a.md".into()
+        ))
+        .is_err());
+        assert!(validate_ui_request(UiRequestPayload::open_path(
+            "/no/such/agentero/vault".into(),
+            "notes/a.md".into()
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn normalize_vault_rel_rejects_escape_and_absolute() {
+        assert!(normalize_vault_rel("../etc").is_err());
+        assert!(normalize_vault_rel("papers/../../etc").is_err());
+        // `/abs/paper` is not absolute on Windows, so it would be accepted as
+        // `abs/paper`. Reject a path that is absolute on this platform.
+        let absolute = if cfg!(windows) {
+            r"C:\abs\paper"
+        } else {
+            "/abs/paper"
+        };
+        assert!(normalize_vault_rel(absolute).is_err());
+        assert!(normalize_vault_rel("   ").is_err());
+    }
+
+    #[test]
+    fn normalize_vault_rel_collapses_separators() {
+        assert_eq!(
+            normalize_vault_rel("papers\\\\demo\\").unwrap(),
+            "papers/demo"
+        );
+        assert_eq!(normalize_vault_rel("./papers/demo").unwrap(), "papers/demo");
     }
 
     #[test]

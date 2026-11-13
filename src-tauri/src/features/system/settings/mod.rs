@@ -13,28 +13,26 @@
 use crate::core::error::AppError;
 use crate::core::paths::{self, settings_path};
 use crate::features::system::builtin;
+use agentero_core::decision::{SystemOneCredentials, DEFAULT_SYSTEM_ONE_MODEL};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-pub const DEFAULT_TRANSLATOR_BASE_URL: &str = "https://translation-server.agentero.app";
 pub const DEFAULT_NETWORK_PROXY_URL: &str = "http://127.0.0.1:7890";
-/// Built-in URL-prefix GitHub mirrors. The user picks from this list instead of
-/// typing a custom URL. All entries must support `{base}/{canonical_github_url}`.
-pub const GITHUB_MIRROR_PRESETS: &[&str] = &[
-    "https://gh.llkk.cc",
-    "https://mirror.ghproxy.com",
-    "https://ghproxy.net",
-    "https://github.moeyy.xyz",
-];
+/// Default System One endpoint (TypeSafe jEV). Clef/OpenAI presets override it.
+pub const DEFAULT_DECISION_BASE_URL: &str = "https://api.typesafe.ai/v1/systemone";
 /// Default Zotero Connector port (must match the official extension default).
 /// Owned here because the persisted `connectorPort` default must exist at
 /// deserialize time; `features::connector` re-exports it.
 pub const DEFAULT_CONNECTOR_PORT: u16 = 23119;
 /// Default loopback port for the optional MCP HTTP server.
-pub const DEFAULT_MCP_PORT: u16 = 8765;
+pub use agentero_mcp::DEFAULT_MCP_PORT;
+
+/// Upper bound for `auto_translate_import_concurrency` (the settings UI offers
+/// 1–5; larger values would hammer translation providers and disk).
+pub const MAX_AUTO_TRANSLATE_IMPORT_CONCURRENCY: u32 = 5;
 
 /// Built-in provider id, re-exported so the Host never re-types the literal.
 pub use agentero_core::features::translate::BUILTIN_PROVIDER_ID;
@@ -72,21 +70,32 @@ pub fn mask_translate_api_key(key: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
-    #[serde(default = "default_translator_base_url")]
-    pub translator_base_url: String,
+    /// Null disables a command; absent ids use their default shortcut.
+    #[serde(default)]
+    pub shortcut_overrides: HashMap<String, Option<ShortcutBinding>>,
     /// EasyScholar key for journal ranking and impact-factor lookups.
     #[serde(default)]
     pub easy_scholar_key: String,
+    /// 知乎开放平台 Access Secret（内置「知乎」Agent 的直答 / 检索凭证）。
+    #[serde(default)]
+    pub zhihu_access_secret: String,
     #[serde(default)]
     pub network_proxy_enabled: bool,
     #[serde(default = "default_network_proxy_url")]
     pub network_proxy_url: String,
-    /// URL-prefix GitHub mirror for Skill import fallback when GitHub is unreachable.
+    /// EZProxy/WebVPN prefix for paywalled PDF fallback, e.g.
+    /// `https://webvpn.example.edu/login?url=`. Empty disables the layer.
     #[serde(default)]
-    pub github_mirror_enabled: bool,
-    /// e.g. `https://gh.llkk.cc` — requests become `{base}/https://codeload.github.com/...`.
+    pub institution_proxy_prefix: String,
+    /// Session cookie sent along with institution proxy requests (pasted from
+    /// the browser). Empty = no cookie.
     #[serde(default)]
-    pub github_mirror_base_url: String,
+    pub institution_proxy_cookie: String,
+    /// Gateway flavour: `auto` (fingerprint the prefix), `ezproxy` (query
+    /// passthrough), `wengine` (path-rewriting WebVPN, e.g. ZJU) or
+    /// `subdomain` (Astraeus-style host mapping). Empty/unknown means `auto`.
+    #[serde(default)]
+    pub institution_proxy_type: String,
     #[serde(default = "default_paper_tree_label_mode")]
     pub paper_tree_label_mode: String,
     #[serde(default = "default_paper_tree_sort_mode")]
@@ -110,6 +119,29 @@ pub struct AppSettings {
     pub replace_current_tab_on_open_paper: bool,
     #[serde(default = "default_auto_update_internal_links")]
     pub auto_update_internal_links: String,
+    /// Preferred terminal for "Open in Terminal". Empty = system default.
+    /// Unknown or uninstalled ids fall back at launch time.
+    #[serde(default)]
+    pub terminal_app: String,
+    /// PDF navigation: `vertical` | `horizontal` | `paginated`.
+    #[serde(default = "default_pdf_scroll_strategy")]
+    pub pdf_scroll_strategy: String,
+    /// Enable single-key Vim navigation on PDF reading surfaces.
+    #[serde(default = "default_true")]
+    pub pdf_vim_keys: bool,
+    /// Master switch for Vim-style single-key navigation (PDF + list surfaces).
+    /// Off keeps plain typing and arrow keys only.
+    #[serde(default = "default_true")]
+    pub vim_mode: bool,
+    /// Enable the ephemeral F-key global element hint overlay.
+    #[serde(default = "default_true")]
+    pub hint_mode_enabled: bool,
+    /// Subtle in-app sound cues (agent attention / turn done / failure).
+    #[serde(default = "default_true")]
+    pub sound_enabled: bool,
+    /// PDF page layout: `none` (single page) | `odd` | `even` (two-page spread).
+    #[serde(default = "default_pdf_spread_mode")]
+    pub pdf_spread_mode: String,
     #[serde(default = "default_library_columns")]
     pub library_columns: Vec<LibraryColumnPref>,
     #[serde(default)]
@@ -121,6 +153,10 @@ pub struct AppSettings {
     pub mcp_enabled: bool,
     #[serde(default = "default_mcp_port")]
     pub mcp_port: u16,
+    /// Opt-in: expose paper full text (`paper_text_get`) through the MCP
+    /// server. Default off — external clients only see metadata and NOTES.
+    #[serde(default)]
+    pub mcp_expose_paper_text: bool,
     /// OpenAI Secure MCP Tunnel id (`tunnel_` + 32 hex) for the built-in
     /// `tunnel-client` supervisor. Empty = never configured.
     #[serde(default)]
@@ -158,6 +194,12 @@ pub struct AppSettings {
     pub ui_scale: f64,
     #[serde(default = "default_true")]
     pub show_editor_toolbar: bool,
+    /// Body size of wikilink embeds, px before UI scale. Range 12–20, default 13.
+    #[serde(default = "default_wiki_embed_font_size")]
+    pub wiki_embed_font_size: u32,
+    /// Markdown column max width in CSS px. 0 = full pane. Presets only.
+    #[serde(default = "default_markdown_max_width")]
+    pub markdown_max_width: u32,
     #[serde(default = "default_permission_mode")]
     pub agent_permission_mode: String,
     #[serde(default)]
@@ -168,15 +210,20 @@ pub struct AppSettings {
     pub agent_personal_prompt: String,
     #[serde(default)]
     pub pdf_ask: PdfAskSettings,
+    /// Background paper-reader (精读) Agent seat. Empty = follow the default
+    /// agent and its last picked model.
+    #[serde(default)]
+    pub paper_reader: PaperReaderSettings,
+    /// Decision-layer provider (System One: jEV / Cloudflare Clef / compatible).
+    /// The legacy `jev` key is still read for backward compatibility.
+    #[serde(default, alias = "jev")]
+    pub decision: DecisionSettings,
     #[serde(default)]
     pub embedding: EmbeddingSettings,
     #[serde(default)]
     pub translate: TranslateSettings,
     #[serde(default)]
     pub layout: LayoutSettings,
-    /// Prefill Markdown export dialog watermark checkbox (default off).
-    #[serde(default)]
-    pub export_watermark_enabled: bool,
     /// PostHog product analytics opt-out (applies from the next launch).
     #[serde(default = "default_true")]
     pub telemetry_enabled: bool,
@@ -192,6 +239,24 @@ pub struct AppSettings {
     /// Post-vault feature tour completed or skipped. Default false → auto-start once.
     #[serde(default)]
     pub feature_tour_done: bool,
+    /// Config reminders the user dismissed with "don't remind me again"
+    /// (`layout-local-model` | `network-proxy`). Unknown ids are dropped on save.
+    #[serde(default)]
+    pub dismissed_reminders: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortcutBinding {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctrl: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shift: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, specta::Type)]
@@ -201,6 +266,55 @@ pub struct PdfAskSettings {
     pub agent_id: String,
     #[serde(default)]
     pub model_id: String,
+}
+
+/// Agent seat for the background paper-reader workflow.
+///
+/// Empty fields follow the default agent and the model last picked for it;
+/// pinning them keeps the workflow off the agent CLI's own default model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperReaderSettings {
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub model_id: String,
+}
+
+/// Decision-layer provider settings.
+///
+/// Callers speak the System One contract (`state + questions -> answers`),
+/// implemented by TypeSafe jEV, Cloudflare Clef, and compatible endpoints.
+/// The OpenAI Decisions preset (`provider = "openai"`) uses the same settings
+/// fields; the transport adapts request/response shapes to `/v1/decisions`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionSettings {
+    /// `jev` | `clef` | `openai` | `custom` (empty = `jev`).
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub base_url: String,
+    /// Model id injected into every request (e.g. `jev-latest`, `clef`).
+    #[serde(default)]
+    pub model: String,
+    /// Whether the experimental smart-highlight toolbar action is enabled.
+    #[serde(default)]
+    pub smart_highlight: bool,
+}
+
+impl Default for DecisionSettings {
+    fn default() -> Self {
+        Self {
+            provider: default_decision_provider(),
+            api_key: String::new(),
+            base_url: default_decision_base_url(),
+            model: default_decision_model(),
+            smart_highlight: false,
+        }
+    }
 }
 
 /// Embedding endpoint: the built-in provider, or a custom OpenAI-compatible
@@ -242,17 +356,44 @@ pub struct TranslateSettings {
     pub provider_configs: HashMap<String, TranslateProviderConfig>,
     #[serde(default)]
     pub auto_translate_selection: bool,
+    /// Deprecated: kept for migration. Use `display_mode` + `dual_pane_source`.
     #[serde(default)]
     pub dual_pane_translate: bool,
+    #[serde(default = "default_translate_display_mode")]
+    pub display_mode: String,
+    #[serde(default = "default_translate_dual_pane_source")]
+    pub dual_pane_source: String,
     #[serde(default)]
     pub agent_id: String,
     #[serde(default)]
     pub model_id: String,
-    /// Custom translate prompt replacing the built-in instructions for the
-    /// Agent and OpenAI-compatible providers (free MT and the built-in ignore
-    /// it). Empty = built-in. Max 8000 chars.
+    /// Legacy single template. Empty when `custom_system` is set. A short line
+    /// is an extra preference; a longer value replaces the academic style
+    /// block only. Engine rules always stay. Max 8000 chars.
     #[serde(default)]
     pub custom_prompt: String,
+    /// Custom system style / preference. Wins over `custom_prompt`.
+    /// Placeholders: `{{targetLang}}`, `{{sourceLang}}`, `{{text}}`.
+    #[serde(default)]
+    pub custom_system: String,
+    /// Custom user template. Applied only when it contains `{{text}}`.
+    #[serde(default)]
+    pub custom_user: String,
+    /// Persist extracted reflow character IR pages in the app cache (default on).
+    #[serde(default = "default_true")]
+    pub cache_reflow_ir: bool,
+    /// Persist the finished translated PDF in the app cache (default off;
+    /// each final is roughly 25 MB).
+    #[serde(default)]
+    pub cache_reflow_final: bool,
+    /// Full-document translation runs in the background after a paper is
+    /// imported and its layout lands (default off: it spends provider quota).
+    #[serde(default)]
+    pub auto_translate_import: bool,
+    /// How many papers the background import translation runs at once.
+    /// Seeded into the JobCenter `LayoutTranslate` cap (1–5, default 1).
+    #[serde(default = "default_auto_translate_import_concurrency")]
+    pub auto_translate_import_concurrency: u32,
 }
 
 impl Default for TranslateSettings {
@@ -264,9 +405,17 @@ impl Default for TranslateSettings {
             provider_configs: HashMap::new(),
             auto_translate_selection: false,
             dual_pane_translate: false,
+            display_mode: default_translate_display_mode(),
+            dual_pane_source: default_translate_dual_pane_source(),
             agent_id: String::new(),
             model_id: String::new(),
             custom_prompt: String::new(),
+            custom_system: String::new(),
+            custom_user: String::new(),
+            cache_reflow_ir: true,
+            cache_reflow_final: false,
+            auto_translate_import: false,
+            auto_translate_import_concurrency: default_auto_translate_import_concurrency(),
         }
     }
 }
@@ -282,6 +431,8 @@ pub struct TranslateProviderConfig {
     pub region: String,
     #[serde(default)]
     pub model: String,
+    #[serde(default)]
+    pub extra_request_body: String,
 }
 
 /// PDF layout-analysis backend selection.
@@ -329,17 +480,23 @@ pub struct LayoutProviderConfig {
     /// MinerU force-OCR: run OCR on every page regardless of the PDF text layer.
     #[serde(default)]
     pub is_ocr: bool,
+    /// Treat `base_url` as a self-hosted MinerU server (version-detected)
+    /// instead of the official cloud API (which also covers relays).
+    #[serde(default)]
+    pub self_hosted: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            translator_base_url: DEFAULT_TRANSLATOR_BASE_URL.to_string(),
+            shortcut_overrides: HashMap::new(),
             easy_scholar_key: String::new(),
+            zhihu_access_secret: String::new(),
             network_proxy_enabled: false,
             network_proxy_url: default_network_proxy_url(),
-            github_mirror_enabled: false,
-            github_mirror_base_url: GITHUB_MIRROR_PRESETS[0].to_string(),
+            institution_proxy_prefix: String::new(),
+            institution_proxy_cookie: String::new(),
+            institution_proxy_type: "auto".to_string(),
             paper_tree_label_mode: default_paper_tree_label_mode(),
             paper_tree_sort_mode: default_paper_tree_sort_mode(),
             paper_note_mode: default_paper_note_mode(),
@@ -347,10 +504,18 @@ impl Default for AppSettings {
             auto_ingest: default_true(),
             replace_current_tab_on_open_paper: false,
             auto_update_internal_links: default_auto_update_internal_links(),
+            terminal_app: String::new(),
+            pdf_scroll_strategy: default_pdf_scroll_strategy(),
+            pdf_vim_keys: true,
+            vim_mode: true,
+            hint_mode_enabled: true,
+            sound_enabled: true,
+            pdf_spread_mode: default_pdf_spread_mode(),
             library_columns: default_library_columns(),
             connector_enabled: false,
             connector_port: default_connector_port(),
             mcp_enabled: false,
+            mcp_expose_paper_text: false,
             mcp_port: default_mcp_port(),
             mcp_tunnel_id: String::new(),
             mcp_tunnel_api_key: String::new(),
@@ -366,20 +531,24 @@ impl Default for AppSettings {
             editor_line_height: default_editor_line_height(),
             ui_scale: default_ui_scale(),
             show_editor_toolbar: true,
+            wiki_embed_font_size: default_wiki_embed_font_size(),
+            markdown_max_width: default_markdown_max_width(),
             agent_permission_mode: default_permission_mode(),
             auto_paper_reader: false,
             ai_response_language: default_ai_response_language(),
             agent_personal_prompt: String::new(),
             pdf_ask: PdfAskSettings::default(),
+            paper_reader: PaperReaderSettings::default(),
+            decision: DecisionSettings::default(),
             embedding: EmbeddingSettings::default(),
             translate: TranslateSettings::default(),
             layout: LayoutSettings::default(),
-            export_watermark_enabled: false,
             telemetry_enabled: default_true(),
             plaza_enabled: default_true(),
             plaza_hidden_sources: Vec::new(),
             onboarding_done: false,
             feature_tour_done: false,
+            dismissed_reminders: Vec::new(),
         }
     }
 }
@@ -387,11 +556,17 @@ impl Default for AppSettings {
 fn default_true() -> bool {
     true
 }
-fn default_translator_base_url() -> String {
-    DEFAULT_TRANSLATOR_BASE_URL.to_string()
-}
 fn default_network_proxy_url() -> String {
     DEFAULT_NETWORK_PROXY_URL.to_string()
+}
+fn default_decision_provider() -> String {
+    "jev".to_string()
+}
+fn default_decision_base_url() -> String {
+    DEFAULT_DECISION_BASE_URL.to_string()
+}
+fn default_decision_model() -> String {
+    DEFAULT_SYSTEM_ONE_MODEL.to_string()
 }
 fn default_paper_tree_label_mode() -> String {
     "title-author".into()
@@ -404,6 +579,12 @@ fn default_paper_note_mode() -> String {
 }
 fn default_auto_update_internal_links() -> String {
     "ask".into()
+}
+fn default_pdf_scroll_strategy() -> String {
+    "vertical".into()
+}
+fn default_pdf_spread_mode() -> String {
+    "none".into()
 }
 /// Canonical papers-Library column keys, in default order.
 const LIBRARY_COLUMN_KEYS: &[&str] = &[
@@ -443,6 +624,20 @@ fn default_editor_font_size() -> u32 {
 fn default_editor_line_height() -> f64 {
     1.6
 }
+fn default_wiki_embed_font_size() -> u32 {
+    13
+}
+fn default_markdown_max_width() -> u32 {
+    0
+}
+fn normalize_markdown_max_width(value: u32) -> u32 {
+    const ALLOWED: &[u32] = &[0, 640, 720, 800, 960, 1120];
+    if ALLOWED.contains(&value) {
+        value
+    } else {
+        default_markdown_max_width()
+    }
+}
 
 fn normalize_font_family_value(raw: &str) -> String {
     let v = raw.trim();
@@ -461,11 +656,7 @@ fn default_ai_response_language() -> String {
     "auto".into()
 }
 fn default_translate_provider() -> String {
-    if builtin::available() {
-        BUILTIN_PROVIDER_ID.to_string()
-    } else {
-        "tencenttransmart".into()
-    }
+    "tencenttransmart".into()
 }
 fn default_connector_port() -> u16 {
     DEFAULT_CONNECTOR_PORT
@@ -476,11 +667,20 @@ fn default_mcp_port() -> u16 {
 fn default_batch_import_concurrency() -> u32 {
     5
 }
+fn default_auto_translate_import_concurrency() -> u32 {
+    1
+}
 fn default_translate_target() -> String {
     "ui".into()
 }
 fn default_translate_source() -> String {
     "auto".into()
+}
+fn default_translate_display_mode() -> String {
+    "overlay".into()
+}
+fn default_translate_dual_pane_source() -> String {
+    "pdf".into()
 }
 /// Layout analysis stays on the bundled offline PP-DocLayoutV3 model: it is
 /// free, local, and a cloud backend would bill every PDF for no gain. The
@@ -489,11 +689,7 @@ fn default_layout_backend() -> String {
     "local".into()
 }
 fn default_parser_backend() -> String {
-    if builtin::available() {
-        BUILTIN_PROVIDER_ID.to_string()
-    } else {
-        "local".into()
-    }
+    "local".into()
 }
 
 /// Domain reaction fired after settings are persisted. Receives the same
@@ -624,14 +820,20 @@ impl AppSettingsStore {
         }
     }
 
-    /// Custom translate prompt (Settings → 翻译; empty = built-in). Injected by
-    /// `translate_text` for the OpenAI-compatible path; the Agent path builds
-    /// its prompt on the frontend.
-    pub fn translate_custom_prompt(&self) -> String {
+    /// Custom translate templates (legacy prompt, system, user). Injected by
+    /// `translate_text` for the OpenAI-compatible path. The Agent path reads
+    /// the same fields on the frontend.
+    pub fn translate_custom_templates(&self) -> (String, String, String) {
         self.inner
             .lock()
             .ok()
-            .map(|guard| guard.translate.custom_prompt.trim().to_string())
+            .map(|guard| {
+                (
+                    guard.translate.custom_prompt.trim().to_string(),
+                    guard.translate.custom_system.trim().to_string(),
+                    guard.translate.custom_user.trim().to_string(),
+                )
+            })
             .unwrap_or_default()
     }
 
@@ -651,6 +853,30 @@ impl AppSettingsStore {
             .ok()
             .map(|guard| guard.batch_import_concurrency.max(1) as usize)
             .unwrap_or_else(|| default_batch_import_concurrency() as usize)
+    }
+
+    /// Whether imported papers get a background full-text translation job.
+    pub fn auto_translate_import(&self) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .map(|guard| guard.translate.auto_translate_import)
+            .unwrap_or(false)
+    }
+
+    /// Background import-translation parallelism, seeded into the JobCenter
+    /// `LayoutTranslate` cap (1–5; out-of-range values fall back to 1).
+    pub fn auto_translate_import_concurrency(&self) -> usize {
+        self.inner
+            .lock()
+            .ok()
+            .map(|guard| {
+                guard
+                    .translate
+                    .auto_translate_import_concurrency
+                    .clamp(1, MAX_AUTO_TRANSLATE_IMPORT_CONCURRENCY) as usize
+            })
+            .unwrap_or_else(|| default_auto_translate_import_concurrency() as usize)
     }
 
     /// PAPER.md body-parse engine backend (`local` when unset).
@@ -758,6 +984,22 @@ impl AppSettingsStore {
             .unwrap_or(false)
     }
 
+    /// Resolve the MinerU self-hosted switch (default false). Only the MinerU
+    /// engine reads it; other providers return false.
+    pub fn layout_self_hosted(&self, provider: &str) -> bool {
+        layout_provider_settings_key(provider)
+            .and_then(|key| {
+                self.inner.lock().ok().map(|guard| {
+                    guard
+                        .layout
+                        .provider_configs
+                        .get(key)
+                        .is_some_and(|cfg| cfg.self_hosted)
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// Whether [`Self::embedding_config`] resolves to the built-in gateway.
     /// Callers that accept endpoint overrides must ignore them in this case:
     /// the key is shared rather than the user's own, so honouring an override
@@ -795,6 +1037,21 @@ impl AppSettingsStore {
         Some((base_url.to_string(), key, model.to_string()))
     }
 
+    /// Decision-layer System One credentials. Returns None when the API key is
+    /// unset or is a UI mask (`*`-only), so probes never send masks.
+    pub fn decision_config(&self) -> Option<SystemOneCredentials> {
+        let guard = self.inner.lock().ok()?;
+        let api_key = guard.decision.api_key.trim();
+        if api_key.is_empty() || is_translate_api_key_mask(api_key) {
+            return None;
+        }
+        Some(SystemOneCredentials {
+            api_key: api_key.to_string(),
+            base_url: guard.decision.base_url.trim().to_string(),
+            model: guard.decision.model.trim().to_string(),
+        })
+    }
+
     /// Raw `(tunnel_id, api_key)` for the built-in ChatGPT tunnel supervisor.
     /// Returns None unless both are set; a UI mask counts as unset so a
     /// `settings_get` → `settings_set` round-trip never leaks or wipes the key.
@@ -808,11 +1065,77 @@ impl AppSettingsStore {
         Some((id, key.to_string()))
     }
 
+    /// Resolve the configured institution proxy (prefix, cookie). None when
+    /// the prefix is unset.
+    pub fn institution_proxy(
+        &self,
+    ) -> Option<(
+        agentero_core::features::paper::import::institution_proxy::InstitutionProxyKind,
+        String,
+        String,
+    )> {
+        let guard = self.inner.lock().ok()?;
+        let prefix = guard.institution_proxy_prefix.trim();
+        if prefix.is_empty() {
+            return None;
+        }
+        let kind =
+            agentero_core::features::paper::import::institution_proxy::InstitutionProxyKind::from_setting(
+                &guard.institution_proxy_type,
+            );
+        Some((
+            kind,
+            prefix.to_string(),
+            guard.institution_proxy_cookie.trim().to_string(),
+        ))
+    }
+
+    /// Persist cookies captured after an interactive gateway login without
+    /// overwriting unrelated settings changed by another window meanwhile.
+    pub fn update_institution_proxy_cookie(
+        &self,
+        prefix: &str,
+        cookie: String,
+    ) -> Result<Option<AppSettings>, AppError> {
+        let redacted = {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| AppError::message("settings lock poisoned"))?;
+            if guard.institution_proxy_prefix.trim() != prefix.trim() {
+                return Ok(None);
+            }
+            let mut next = guard.clone();
+            next.institution_proxy_cookie = cookie;
+            persist(&self.path, &next)?;
+            *guard = next.clone();
+            redact_secrets(next)
+        };
+        if let Some((kind, prefix, cookie)) = self.institution_proxy() {
+            agentero_core::features::paper::import::institution_proxy::set_institution_proxy(
+                kind, &prefix, &cookie,
+            );
+        }
+        self.notify(&redacted);
+        Ok(Some(redacted))
+    }
+
     /// Resolve the configured EasyScholar key. Returns None when unset or when
     /// the stored value is a UI mask (`*`-only), so probes never send masks.
     pub fn easy_scholar_key(&self) -> Option<String> {
         let guard = self.inner.lock().ok()?;
         let key = guard.easy_scholar_key.trim();
+        if key.is_empty() || is_translate_api_key_mask(key) {
+            None
+        } else {
+            Some(key.to_string())
+        }
+    }
+
+    /// 解析已配置的知乎 Access Secret。未配置或仍是 UI 掩码时返回 None。
+    pub fn zhihu_access_secret(&self) -> Option<String> {
+        let guard = self.inner.lock().ok()?;
+        let key = guard.zhihu_access_secret.trim();
         if key.is_empty() || is_translate_api_key_mask(key) {
             None
         } else {
@@ -903,6 +1226,12 @@ fn redact_secrets(mut settings: AppSettings) -> AppSettings {
     if !settings.easy_scholar_key.trim().is_empty() {
         settings.easy_scholar_key = mask_translate_api_key(&settings.easy_scholar_key);
     }
+    if !settings.zhihu_access_secret.trim().is_empty() {
+        settings.zhihu_access_secret = mask_translate_api_key(&settings.zhihu_access_secret);
+    }
+    if !settings.decision.api_key.trim().is_empty() {
+        settings.decision.api_key = mask_translate_api_key(&settings.decision.api_key);
+    }
     settings
 }
 
@@ -936,6 +1265,21 @@ fn merge_secrets(incoming: &mut AppSettings, previous: &AppSettings) {
     if is_translate_api_key_mask(&incoming.easy_scholar_key) {
         incoming.easy_scholar_key = previous.easy_scholar_key.clone();
     }
+    if is_translate_api_key_mask(&incoming.zhihu_access_secret) {
+        incoming.zhihu_access_secret = previous.zhihu_access_secret.clone();
+    }
+    if is_translate_api_key_mask(&incoming.decision.api_key) {
+        incoming.decision.api_key = previous.decision.api_key.clone();
+    }
+}
+
+/// Cap a translate template and drop placeholders other than
+/// `{{targetLang}}` / `{{sourceLang}}` / `{{text}}`. Does not trim.
+fn cap_translate_template(raw: &str) -> String {
+    agentero_core::features::translate::strip_unknown_translate_placeholders(raw)
+        .chars()
+        .take(8000)
+        .collect()
 }
 
 fn normalize(s: &mut AppSettings) {
@@ -952,25 +1296,62 @@ fn normalize(s: &mut AppSettings) {
         .to_ascii_lowercase();
     s.mcp_tunnel_api_key = s.mcp_tunnel_api_key.trim().to_string();
     s.easy_scholar_key = s.easy_scholar_key.trim().to_string();
+    s.zhihu_access_secret = s.zhihu_access_secret.trim().to_string();
+    s.decision.api_key = s.decision.api_key.trim().to_string();
+    let provider = s.decision.provider.trim().to_ascii_lowercase();
+    s.decision.provider = if provider.is_empty() {
+        default_decision_provider()
+    } else {
+        provider
+    };
+    let decision_url = s.decision.base_url.trim().trim_end_matches('/');
+    // Only the default jEV preset backfills the endpoint; Clef/OpenAI/custom
+    // keep whatever the user typed (empty = not configured yet).
+    s.decision.base_url = if decision_url.is_empty() && s.decision.provider == "jev" {
+        default_decision_base_url()
+    } else {
+        decision_url.to_string()
+    };
+    s.decision.model = s.decision.model.trim().to_string();
+    if s.decision.model.is_empty() && s.decision.provider == "jev" {
+        s.decision.model = default_decision_model();
+    }
     if s.batch_import_concurrency < 1 || s.batch_import_concurrency > 10 {
         s.batch_import_concurrency = default_batch_import_concurrency();
     }
-    let url = s.translator_base_url.trim().trim_end_matches('/');
-    s.translator_base_url = if url.is_empty() {
-        DEFAULT_TRANSLATOR_BASE_URL.to_string()
-    } else {
-        url.to_string()
-    };
+    if s.translate.auto_translate_import_concurrency < 1
+        || s.translate.auto_translate_import_concurrency > MAX_AUTO_TRANSLATE_IMPORT_CONCURRENCY
+    {
+        s.translate.auto_translate_import_concurrency = default_auto_translate_import_concurrency();
+    }
     s.network_proxy_url = s.network_proxy_url.trim().to_string();
     if s.network_proxy_url.is_empty() {
         s.network_proxy_url = default_network_proxy_url();
     }
-    let mirror = s.github_mirror_base_url.trim().trim_end_matches('/');
-    s.github_mirror_base_url = if GITHUB_MIRROR_PRESETS.contains(&mirror) {
-        mirror.to_string()
+    s.institution_proxy_prefix = s
+        .institution_proxy_prefix
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    s.institution_proxy_cookie = s.institution_proxy_cookie.trim().to_string();
+    s.institution_proxy_type = if s.institution_proxy_type.eq_ignore_ascii_case("wengine") {
+        "wengine".to_string()
+    } else if s.institution_proxy_type.eq_ignore_ascii_case("subdomain") {
+        "subdomain".to_string()
+    } else if s.institution_proxy_type.eq_ignore_ascii_case("ezproxy") {
+        "ezproxy".to_string()
     } else {
-        GITHUB_MIRROR_PRESETS[0].to_string()
+        "auto".to_string()
     };
+    // Keep the core download fallback in sync on both load and set paths.
+    let kind = agentero_core::features::paper::import::institution_proxy::InstitutionProxyKind::from_setting(
+        &s.institution_proxy_type,
+    );
+    agentero_core::features::paper::import::institution_proxy::set_institution_proxy(
+        kind,
+        &s.institution_proxy_prefix,
+        &s.institution_proxy_cookie,
+    );
 
     const LABEL_MODES: &[&str] = &["title-author", "title", "author-year-title", "folder"];
     if !LABEL_MODES.contains(&s.paper_tree_label_mode.as_str()) {
@@ -995,6 +1376,17 @@ fn normalize(s: &mut AppSettings) {
     if !AUTO_UPDATE_INTERNAL_LINKS.contains(&s.auto_update_internal_links.as_str()) {
         s.auto_update_internal_links = default_auto_update_internal_links();
     }
+    // Unknown ids are kept: the launch path falls back to the system default,
+    // and the settings pane can still show the saved app as unavailable.
+    s.terminal_app = s.terminal_app.trim().to_ascii_lowercase();
+    const PDF_SCROLL_STRATEGIES: &[&str] = &["vertical", "horizontal", "paginated"];
+    if !PDF_SCROLL_STRATEGIES.contains(&s.pdf_scroll_strategy.as_str()) {
+        s.pdf_scroll_strategy = default_pdf_scroll_strategy();
+    }
+    const PDF_SPREAD_MODES: &[&str] = &["none", "odd", "even"];
+    if !PDF_SPREAD_MODES.contains(&s.pdf_spread_mode.as_str()) {
+        s.pdf_spread_mode = default_pdf_spread_mode();
+    }
 
     // Library columns: drop unknown/duplicate keys, append missing ones
     // with their default visibility, and keep `title` visible.
@@ -1007,7 +1399,8 @@ fn normalize(s: &mut AppSettings) {
         } else {
             col.key
         };
-        if !LIBRARY_COLUMN_KEYS.contains(&key.as_str()) {
+        let is_custom_prop = key.starts_with("prop:");
+        if !LIBRARY_COLUMN_KEYS.contains(&key.as_str()) && !is_custom_prop {
             continue;
         }
         if seen.iter().any(|k| k == &key) {
@@ -1050,6 +1443,10 @@ fn normalize(s: &mut AppSettings) {
     if s.editor_font_size < 10 || s.editor_font_size > 32 {
         s.editor_font_size = default_editor_font_size();
     }
+    if !(12..=20).contains(&s.wiki_embed_font_size) {
+        s.wiki_embed_font_size = default_wiki_embed_font_size();
+    }
+    s.markdown_max_width = normalize_markdown_max_width(s.markdown_max_width);
     s.interface_font_family = normalize_font_family_value(&s.interface_font_family);
     s.text_font_family = normalize_font_family_value(&s.text_font_family);
     s.mono_font_family = normalize_font_family_value(&s.mono_font_family);
@@ -1092,6 +1489,8 @@ fn normalize(s: &mut AppSettings) {
 
     s.pdf_ask.agent_id = s.pdf_ask.agent_id.trim().to_string();
     s.pdf_ask.model_id = s.pdf_ask.model_id.trim().to_string();
+    s.paper_reader.agent_id = s.paper_reader.agent_id.trim().to_string();
+    s.paper_reader.model_id = s.paper_reader.model_id.trim().to_string();
 
     // Keep trailing slashes on base_url (same reason as translate/layout configs):
     // normalize runs on every save and echoes back into the settings UI.
@@ -1110,10 +1509,12 @@ fn normalize(s: &mut AppSettings) {
     if s.translate.source_lang != "auto" {
         s.translate.source_lang = default_translate_source();
     }
-    // Cap hand-edited oversized prompts; this value is echoed to a billed API
-    // on every request. No trim: leading whitespace may be intentional (the
-    // settings UI trims on blur, same as agent_personal_prompt).
-    s.translate.custom_prompt = s.translate.custom_prompt.chars().take(8000).collect();
+    // Cap hand-edited oversized prompts and drop unknown `{{…}}` tokens. The
+    // value is echoed to a billed API on every request. No trim: leading
+    // whitespace may be intentional (the settings UI trims on blur).
+    s.translate.custom_prompt = cap_translate_template(&s.translate.custom_prompt);
+    s.translate.custom_system = cap_translate_template(&s.translate.custom_system);
+    s.translate.custom_user = cap_translate_template(&s.translate.custom_user);
 
     const LAYOUT_BACKENDS: &[&str] = &["local", "paddle", "mineru"];
     if !LAYOUT_BACKENDS.contains(&s.layout.backend.as_str()) {
@@ -1129,12 +1530,27 @@ fn normalize(s: &mut AppSettings) {
         BUILTIN_PROVIDER_ID,
     ];
     if !PARSER_BACKENDS.contains(&s.layout.parser_backend.as_str()) {
-        // Not default_parser_backend(): on a keyed build that is the billed
-        // gateway, and an invalid stored value means an existing user, not a
-        // fresh install.
-        s.layout.parser_backend = "local".to_string();
+        s.layout.parser_backend = default_parser_backend();
     }
     normalize_layout_provider_configs(&mut s.layout.provider_configs);
+    s.dismissed_reminders =
+        normalize_dismissed_reminders(std::mem::take(&mut s.dismissed_reminders));
+}
+
+/// Known config-reminder ids; anything else is dropped so a hand-edited file
+/// cannot smuggle stale ids into the frontend.
+const DISMISSED_REMINDER_IDS: &[&str] = &["layout-local-model", "network-proxy"];
+
+fn normalize_dismissed_reminders(raw: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for id in raw {
+        let id = id.trim();
+        if id.is_empty() || !DISMISSED_REMINDER_IDS.contains(&id) || out.iter().any(|k| k == id) {
+            continue;
+        }
+        out.push(id.to_string());
+    }
+    out
 }
 
 /// Migration rule for `EmbeddingSettings::source`: an explicit value wins,
@@ -1222,6 +1638,31 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn captured_proxy_cookie_updates_only_matching_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AppSettingsStore {
+            inner: Mutex::new(AppSettings {
+                institution_proxy_prefix: "https://vpn.example.edu".into(),
+                institution_proxy_cookie: "old=1".into(),
+                theme: "dark".into(),
+                ..AppSettings::default()
+            }),
+            path: dir.path().join("settings.json"),
+            listeners: Mutex::new(Vec::new()),
+        };
+        assert!(store
+            .update_institution_proxy_cookie("https://other.example.edu", "wrong=1".into())
+            .unwrap()
+            .is_none());
+        store
+            .update_institution_proxy_cookie("https://vpn.example.edu", "fresh=1".into())
+            .unwrap();
+        let (saved, _) = read_file(&store.path);
+        assert_eq!(saved.institution_proxy_cookie, "fresh=1");
+        assert_eq!(saved.theme, "dark");
+    }
+
+    #[test]
     fn roundtrip_defaults() {
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1235,12 +1676,68 @@ mod tests {
         let (loaded, existed) = read_file(&path);
         assert!(existed);
         assert_eq!(loaded.theme, "system");
-        assert_eq!(loaded.translator_base_url, DEFAULT_TRANSLATOR_BASE_URL);
         assert_eq!(loaded.auto_update_internal_links, "ask");
         assert_eq!(loaded.paper_note_mode, "standard");
+        assert!(loaded.vim_mode);
         assert!(!loaded.onboarding_done);
         assert!(!loaded.feature_tour_done);
+        // Persisted wire shape is camelCase: the settings window sends
+        // `vimMode` and expects it back, otherwise the switch snaps back on.
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(json["vimMode"], serde_json::json!(true));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shortcut_overrides_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut settings = AppSettings::default();
+        settings.shortcut_overrides.insert(
+            "workspace.search".into(),
+            Some(ShortcutBinding {
+                key: "K".into(),
+                meta: Some(true),
+                ctrl: Some(false),
+                alt: Some(true),
+                shift: Some(true),
+            }),
+        );
+        settings
+            .shortcut_overrides
+            .insert("workspace.close".into(), None);
+        settings.shortcut_overrides.insert(
+            "future.command".into(),
+            Some(ShortcutBinding {
+                key: "F12".into(),
+                ..Default::default()
+            }),
+        );
+        persist(&path, &settings).expect("write");
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(json["shortcutOverrides"]["workspace.close"].is_null());
+        assert_eq!(json["shortcutOverrides"]["workspace.search"]["ctrl"], false);
+        assert_eq!(
+            json["shortcutOverrides"]["future.command"],
+            serde_json::json!({"key": "F12"})
+        );
+        let (loaded, existed) = read_file(&path);
+        assert!(existed);
+        assert_eq!(loaded.shortcut_overrides, settings.shortcut_overrides);
+    }
+
+    #[test]
+    fn legacy_settings_default_to_empty_shortcut_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"theme":"dark","locale":"zh-CN"}"#).unwrap();
+        let (loaded, existed) = read_file(&path);
+        assert!(existed);
+        assert!(loaded.shortcut_overrides.is_empty());
+        assert_eq!(loaded.theme, "dark");
+        assert_eq!(loaded.locale, "zh-CN");
     }
 
     #[test]
@@ -1279,13 +1776,21 @@ mod tests {
     }
 
     #[test]
-    fn normalize_empty_translator_url() {
+    fn dismissed_reminders_whitelist() {
         let mut s = AppSettings {
-            translator_base_url: "  ".into(),
+            dismissed_reminders: vec![
+                "layout-local-model".into(),
+                "unknown".into(),
+                "layout-local-model".into(),
+                "  network-proxy ".into(),
+            ],
             ..AppSettings::default()
         };
         normalize(&mut s);
-        assert_eq!(s.translator_base_url, DEFAULT_TRANSLATOR_BASE_URL);
+        assert_eq!(
+            s.dismissed_reminders,
+            vec!["layout-local-model", "network-proxy"]
+        );
     }
 
     #[test]
@@ -1357,6 +1862,27 @@ mod tests {
         let mut echoed = redacted_tunnel;
         merge_secrets(&mut echoed, &with_tunnel);
         assert_eq!(echoed.mcp_tunnel_api_key, "sk-tunnel-secret");
+    }
+
+    #[test]
+    fn translate_request_options_survive_settings_roundtrip() {
+        let legacy: TranslateProviderConfig = serde_json::from_str(r#"{"model":"qwen3"}"#).unwrap();
+        assert!(legacy.extra_request_body.is_empty());
+        let mut settings = AppSettings::default();
+        settings.translate.provider_configs.insert(
+            "openaiCompatible".into(),
+            TranslateProviderConfig {
+                extra_request_body: r#"{"chat_template_kwargs":{"enable_thinking":false}}"#.into(),
+                ..legacy
+            },
+        );
+        normalize(&mut settings);
+        let decoded: AppSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            decoded.translate.provider_configs,
+            settings.translate.provider_configs
+        );
     }
 
     #[test]
@@ -1483,6 +2009,23 @@ mod tests {
     }
 
     #[test]
+    fn normalize_strips_unknown_translate_placeholders() {
+        let mut s = AppSettings {
+            translate: TranslateSettings {
+                custom_prompt: "{{audience}} only".into(),
+                custom_system: "Style {{tone}} for {{targetLang}}.".into(),
+                custom_user: "<<<{{text}}>>> {{mood}}".into(),
+                ..Default::default()
+            },
+            ..AppSettings::default()
+        };
+        normalize(&mut s);
+        assert_eq!(s.translate.custom_prompt, " only");
+        assert_eq!(s.translate.custom_system, "Style  for {{targetLang}}.");
+        assert_eq!(s.translate.custom_user, "<<<{{text}}>>> ");
+    }
+
+    #[test]
     fn normalize_rejects_unknown_paper_note_mode() {
         let mut s = AppSettings {
             paper_note_mode: "fancy".into(),
@@ -1490,6 +2033,51 @@ mod tests {
         };
         normalize(&mut s);
         assert_eq!(s.paper_note_mode, "standard");
+    }
+
+    #[test]
+    fn normalize_rejects_unknown_pdf_reading_modes() {
+        let mut s = AppSettings {
+            pdf_scroll_strategy: "diagonal".into(),
+            pdf_spread_mode: "triple".into(),
+            ..AppSettings::default()
+        };
+        normalize(&mut s);
+        assert_eq!(s.pdf_scroll_strategy, "vertical");
+        assert_eq!(s.pdf_spread_mode, "none");
+    }
+
+    #[test]
+    fn normalize_preserves_paginated_pdf_mode() {
+        let mut s = AppSettings {
+            pdf_scroll_strategy: "paginated".into(),
+            pdf_spread_mode: "odd".into(),
+            ..AppSettings::default()
+        };
+        normalize(&mut s);
+        assert_eq!(s.pdf_scroll_strategy, "paginated");
+        assert_eq!(s.pdf_spread_mode, "odd");
+    }
+
+    #[test]
+    fn normalize_reading_layout_prefs() {
+        let mut invalid = AppSettings {
+            wiki_embed_font_size: 99,
+            markdown_max_width: 500,
+            ..AppSettings::default()
+        };
+        normalize(&mut invalid);
+        assert_eq!(invalid.wiki_embed_font_size, 13);
+        assert_eq!(invalid.markdown_max_width, 0);
+
+        let mut valid = AppSettings {
+            wiki_embed_font_size: 18,
+            markdown_max_width: 800,
+            ..AppSettings::default()
+        };
+        normalize(&mut valid);
+        assert_eq!(valid.wiki_embed_font_size, 18);
+        assert_eq!(valid.markdown_max_width, 800);
     }
 
     #[test]
@@ -1586,17 +2174,23 @@ mod tests {
                     width_rem: None,
                     visible: false,
                 },
+                LibraryColumnPref {
+                    key: "prop:test_prop".into(),
+                    width_rem: Some(9.0),
+                    visible: true,
+                },
             ],
             ..AppSettings::default()
         };
         normalize(&mut s);
         let keys: Vec<&str> = s.library_columns.iter().map(|c| c.key.as_str()).collect();
-        // Unknown dropped; `year` renamed in place; missing columns appended.
+        // Unknown dropped; `year` renamed in place; custom prop kept; missing columns appended.
         assert_eq!(
             keys,
             vec![
                 "title",
                 "date",
+                "prop:test_prop",
                 "authors",
                 "publication",
                 "tags",
@@ -1717,6 +2311,9 @@ mod tests {
             assert!(!raw.contains(key), "built-in key reached settings.json");
         }
         assert!(raw.contains(BUILTIN_PROVIDER_ID), "parserBackend kept");
+        let (reloaded, existed) = read_file(store.path());
+        assert!(existed);
+        assert_eq!(reloaded.layout.parser_backend, BUILTIN_PROVIDER_ID);
         let _ = fs::remove_file(store.path());
     }
 
@@ -1846,16 +2443,112 @@ mod tests {
     }
 
     #[test]
-    fn fresh_install_defaults_follow_builtin_availability() {
-        let s = AppSettings::default();
-        if builtin::available() {
-            assert_eq!(s.translate.provider, BUILTIN_PROVIDER_ID);
-            assert_eq!(s.layout.parser_backend, BUILTIN_PROVIDER_ID);
-        } else {
-            assert_eq!(s.translate.provider, "tencenttransmart");
-            assert_eq!(s.layout.parser_backend, "local");
-        }
+    fn decision_config_never_returns_masked_key() {
+        let store = AppSettingsStore::for_tests(AppSettings {
+            decision: DecisionSettings {
+                provider: "jev".into(),
+                api_key: "sk-jev-secret".into(),
+                base_url: "https://jev.test/v1".into(),
+                model: "jev-latest".into(),
+                smart_highlight: false,
+            },
+            ..AppSettings::default()
+        });
+        assert_eq!(
+            store.decision_config(),
+            Some(SystemOneCredentials {
+                api_key: "sk-jev-secret".into(),
+                base_url: "https://jev.test/v1".into(),
+                model: "jev-latest".into(),
+            })
+        );
+
+        // After redaction the getter must treat the mask as unset.
+        let redacted = redact_secrets(AppSettings {
+            decision: DecisionSettings {
+                provider: "jev".into(),
+                api_key: "sk-jev-secret".into(),
+                base_url: "https://jev.test/v1".into(),
+                model: "jev-latest".into(),
+                smart_highlight: false,
+            },
+            ..AppSettings::default()
+        });
+        let masked_store = AppSettingsStore::for_tests(redacted);
+        assert!(masked_store.decision_config().is_none());
+    }
+
+    #[test]
+    fn fresh_install_defaults_use_local_parser() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let (s, existed) = read_file(&path);
+        assert!(!existed);
+        assert_eq!(s.translate.provider, "tencenttransmart");
+        assert_eq!(s.layout.parser_backend, "local");
         assert_eq!(s.layout.backend, "local");
+
+        persist(&path, &s).expect("write");
+        let (reloaded, existed) = read_file(&path);
+        assert!(existed);
+        assert_eq!(reloaded.layout, s.layout);
+    }
+
+    #[test]
+    fn legacy_settings_without_parser_backend_use_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for (json, layout_backend) in [
+            (r#"{}"#, "local"),
+            (r#"{"layout":{"backend":"paddle"}}"#, "paddle"),
+        ] {
+            fs::write(&path, json).unwrap();
+            let (loaded, existed) = read_file(&path);
+            assert!(existed);
+            assert_eq!(loaded.layout.parser_backend, "local");
+            assert_eq!(loaded.layout.backend, layout_backend);
+        }
+    }
+
+    #[test]
+    fn translate_default_survives_settings_roundtrip() {
+        for raw in [
+            None,
+            Some("{}"),
+            Some(r#"{"translate":{"targetLang":"en"}}"#),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            if let Some(raw) = raw {
+                fs::write(&path, raw).unwrap();
+            }
+            let (settings, existed) = read_file(&path);
+            assert_eq!(existed, raw.is_some());
+            assert_eq!(settings.translate.provider, "tencenttransmart");
+            persist(&path, &settings).unwrap();
+            let (reloaded, existed) = read_file(&path);
+            assert!(existed);
+            assert_eq!(reloaded.translate, settings.translate);
+        }
+    }
+
+    #[test]
+    fn explicit_translate_provider_survives_settings_roundtrip() {
+        for provider in [BUILTIN_PROVIDER_ID, "deepl"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            fs::write(
+                &path,
+                serde_json::json!({"translate": {"provider": provider}}).to_string(),
+            )
+            .unwrap();
+            let (settings, existed) = read_file(&path);
+            assert!(existed);
+            assert_eq!(settings.translate.provider, provider);
+            persist(&path, &settings).unwrap();
+            let (reloaded, _) = read_file(&path);
+            assert_eq!(reloaded.translate.provider, provider);
+        }
     }
 }
 

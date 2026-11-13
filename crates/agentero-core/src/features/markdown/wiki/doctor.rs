@@ -4,7 +4,7 @@
 //! (or CLI) supplies a replacement for a residual range; Host only checks that
 //! the expected bytes still match and that the rewrite is in-bounds.
 
-use crate::features::wiki::index::WikiIndex;
+use crate::features::wiki::index::{is_image, is_markdown, is_pdf, WikiIndex};
 use crate::features::wiki::models::{
     InternalLinkSyntax, LinkFragment, LinkResolutionStatus, ResolvedLink, SourceRange,
 };
@@ -17,9 +17,10 @@ use crate::fs::{normalize_rel_lexical, normalize_rel_separators, safe_relative_p
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use uuid::Uuid;
 
+use crate::features::doctor::note_writes::{commit_note_writes, PlannedNoteWrite};
 use crate::features::doctor::DoctorRepairError;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, specta::Type)]
@@ -165,6 +166,14 @@ fn score_document_match(raw: &str, path: &str, aliases: &[String]) -> i32 {
     let path_key = normalize_key(path);
     let stem = normalize_key(&stem_of(path));
     let raw_stem = normalize_key(&stem_of(raw));
+    let raw_ext = Path::new(raw)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    let path_ext = Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
     let mut best = 0;
     if path_key == raw_key || stem == raw_key {
         return 100;
@@ -200,30 +209,72 @@ fn score_document_match(raw: &str, path: &str, aliases: &[String]) -> i32 {
     if !raw_stem.is_empty() && distance <= 2 {
         best = best.max(55 - distance as i32 * 5);
     }
+    if best > 0 && raw_ext.is_some() && raw_ext == path_ext {
+        // Same stem, different image format: keep the author's extension when
+        // both variants exist, then let the caller's media-kind filter decide.
+        best += 10;
+    }
     best
+}
+
+/// Repairing an image link to a PDF renders a broken image, and vice versa.
+/// Only documents of the extension family the author wrote are candidates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinkTargetKind {
+    Markdown,
+    Pdf,
+    Image,
+}
+
+fn link_target_kind(target: &str) -> Option<LinkTargetKind> {
+    let path = Path::new(target);
+    if is_markdown(path) {
+        Some(LinkTargetKind::Markdown)
+    } else if is_pdf(path) {
+        Some(LinkTargetKind::Pdf)
+    } else if is_image(path) {
+        Some(LinkTargetKind::Image)
+    } else {
+        None
+    }
+}
+
+fn matches_target_kind(path: &str, kind: Option<LinkTargetKind>) -> bool {
+    let path = Path::new(path);
+    match kind {
+        Some(LinkTargetKind::Markdown) => is_markdown(path),
+        Some(LinkTargetKind::Pdf) => is_pdf(path),
+        Some(LinkTargetKind::Image) => is_image(path),
+        None => true,
+    }
 }
 
 fn pick_document_path(link: &ResolvedLink, index: &WikiIndex) -> Option<String> {
     if let Some(path) = &link.target_path {
         return Some(path.clone());
     }
-    if link.candidates.len() == 1 {
-        return Some(link.candidates[0].clone());
+    let kind = link_target_kind(&link.occurrence.target_raw);
+    let candidates = link
+        .candidates
+        .iter()
+        .filter(|path| matches_target_kind(path, kind))
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        return Some(candidates[0].to_string());
     }
-    if !link.candidates.is_empty() {
-        let scored = link
-            .candidates
+    if !candidates.is_empty() {
+        let scored = candidates
             .iter()
             .map(|path| {
                 let aliases = index
                     .documents()
                     .iter()
-                    .find(|document| document.path == *path)
+                    .find(|document| document.path == **path)
                     .map(|document| document.aliases.as_slice())
                     .unwrap_or(&[]);
                 (
-                    path.clone(),
-                    score_document_match(&link.occurrence.target_raw, path, aliases),
+                    (*path).clone(),
+                    score_document_match(&link.occurrence.target_raw, path.as_str(), aliases),
                 )
             })
             .collect::<Vec<_>>();
@@ -232,6 +283,7 @@ fn pick_document_path(link: &ResolvedLink, index: &WikiIndex) -> Option<String> 
     let scored = index
         .documents()
         .iter()
+        .filter(|document| matches_target_kind(&document.path, kind))
         .map(|document| {
             (
                 document.path.clone(),
@@ -671,17 +723,6 @@ pub fn plan_wikilink_repairs(vault: &Path) -> Result<WikilinkRepairPlan, DoctorR
     })
 }
 
-fn write_note_bytes(path: &Path, contents: &[u8]) -> Result<(), String> {
-    fs::write(path, contents).map_err(|error| error.to_string())
-}
-
-struct PlannedWikilinkWrite {
-    path: String,
-    absolute: PathBuf,
-    original: String,
-    rewritten: String,
-}
-
 /// Apply selected wikilink byte-range edits with dirty/hash checks and rollback.
 pub fn apply_wikilink_repairs(
     vault: &Path,
@@ -775,7 +816,7 @@ pub fn apply_wikilink_repairs(
         for (start, end, _, replacement) in ordered {
             rewritten.replace_range(start..end, replacement);
         }
-        planned.push(PlannedWikilinkWrite {
+        planned.push(PlannedNoteWrite {
             path,
             absolute,
             original,
@@ -783,47 +824,7 @@ pub fn apply_wikilink_repairs(
         });
     }
 
-    for write in &planned {
-        let current = fs::read_to_string(&write.absolute).map_err(|error| {
-            DoctorRepairError::new(
-                "readFailed",
-                format!("could not re-read {}: {error}", write.path),
-                vec![write.path.clone()],
-            )
-        })?;
-        if current != write.original {
-            return Err(DoctorRepairError::new(
-                "sourceChanged",
-                format!("source changed after preflight: {}", write.path),
-                vec![write.path.clone()],
-            ));
-        }
-    }
-
-    let mut written: Vec<&PlannedWikilinkWrite> = Vec::new();
-    for write in &planned {
-        if let Err(error) = write_note_bytes(&write.absolute, write.rewritten.as_bytes()) {
-            let mut rollback_complete = true;
-            for previous in written.iter().rev() {
-                if write_note_bytes(&previous.absolute, previous.original.as_bytes()).is_err() {
-                    rollback_complete = false;
-                }
-            }
-            let mut failure = DoctorRepairError::new(
-                "writeFailed",
-                format!("could not write {}: {error}", write.path),
-                planned.iter().map(|item| item.path.clone()).collect(),
-            );
-            failure.rollback = if rollback_complete {
-                "completed"
-            } else {
-                "manualRecoveryRequired"
-            }
-            .into();
-            return Err(failure);
-        }
-        written.push(write);
-    }
+    commit_note_writes(&planned, "source")?;
 
     Ok(WikilinkRepairResult {
         updated_paths: planned.into_iter().map(|write| write.path).collect(),
@@ -899,6 +900,67 @@ mod tests {
             report.issues.is_empty(),
             "source should be clean after repair: {:?}",
             report.issues
+        );
+        let _ = fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn image_repairs_keep_image_media_kind() {
+        let vault =
+            std::env::temp_dir().join(format!("agentero-wiki-doctor-image-{}", Uuid::new_v4()));
+        write(
+            &vault.join("Source.md"),
+            "![distribution](images/class_distribution.jpg)\n",
+        );
+        write(&vault.join("images/class_distribution.png"), "png");
+        write(&vault.join("images/class_distribution.pdf"), "%PDF");
+
+        let plan = plan_wikilink_repairs(&vault).expect("plan");
+        let suggestion = plan
+            .suggestions
+            .iter()
+            .find(|item| item.target_raw.contains("class_distribution"))
+            .expect("image suggestion");
+        assert_eq!(suggestion.layer, WikilinkRepairLayer::Deterministic);
+        assert_eq!(
+            suggestion.suggested_replacement,
+            "images/class_distribution.png"
+        );
+
+        // A wrong directory still matches by stem; keep the author's image
+        // extension when both JPG and PNG variants exist.
+        write(
+            &vault.join("Source.md"),
+            "![distribution](missing/class_distribution.jpg)\n",
+        );
+        write(&vault.join("images/class_distribution.jpg"), "jpg");
+        let plan = plan_wikilink_repairs(&vault).expect("plan");
+        let suggestion = plan
+            .suggestions
+            .iter()
+            .find(|item| item.target_raw.contains("class_distribution"))
+            .expect("image suggestion");
+        assert_eq!(
+            suggestion.suggested_replacement,
+            "images/class_distribution.jpg"
+        );
+
+        fs::remove_file(vault.join("images/class_distribution.png")).unwrap();
+        fs::remove_file(vault.join("images/class_distribution.jpg")).unwrap();
+        let plan = plan_wikilink_repairs(&vault).expect("plan");
+        assert!(
+            !plan.suggestions.iter().any(|item| {
+                item.layer == WikilinkRepairLayer::Deterministic
+                    && item.target_raw.contains("class_distribution")
+            }),
+            "a PDF must not replace a missing image: {:?}",
+            plan.suggestions
+        );
+        assert!(
+            plan.residuals
+                .iter()
+                .any(|item| item.target_raw.contains("class_distribution")),
+            "missing image without an image candidate stays manual"
         );
         let _ = fs::remove_dir_all(vault);
     }

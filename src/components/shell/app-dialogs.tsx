@@ -3,15 +3,17 @@
  * papers, and the command palette. Each subscribes to its own store slice.
  */
 
+import { useSyncExternalStore } from "react";
 import { CommandPalette } from "@/components/dialogs/command-palette";
 import { ExternalRenameDialog } from "@/components/dialogs/external-rename-dialog";
 import { PaperSearchDialog } from "@/components/dialogs/paper-search-dialog";
 import { SkillImportDialog } from "@/components/dialogs/skill-import-dialog";
+import { WordCitationDialog } from "@/components/dialogs/word-citation-dialog";
 import { ZoteroMigrateDialog } from "@/components/dialogs/zotero-migrate-dialog";
 import { ZoteroSyncDialog } from "@/components/dialogs/zotero-sync-dialog";
 import { CitingScanDialog } from "@/components/library/citing-scan-dialog";
 import { EditPaperMetaDialog } from "@/components/library/edit-paper-meta-dialog";
-import { paletteCommands } from "@/components/shell/palette-commands";
+import "@/components/shell/palette-commands";
 import {
 	useLibraryStore,
 	useUiStore,
@@ -28,6 +30,11 @@ import {
 import { paperMetaChange } from "@/lib/paper/library-actions";
 import { setEditMetaDraft } from "@/lib/paper/library-store";
 import {
+	commandRegistryRevision,
+	listCommands,
+	subscribeCommands,
+} from "@/lib/shell/commands/registry";
+import {
 	setCommandOpen,
 	setZoteroOpen,
 	setZoteroSyncOpen,
@@ -37,6 +44,7 @@ import { refreshAll } from "@/lib/vault/actions";
 import { openPaper, openVaultRel } from "@/lib/workspace/actions";
 
 export function AppDialogs() {
+	useSyncExternalStore(subscribeCommands, commandRegistryRevision);
 	const vaultPath = useVaultStore((s) => s.vaultPath);
 	const zoteroOpen = useUiStore((s) => s.zoteroOpen);
 	const zoteroSyncOpen = useUiStore((s) => s.zoteroSyncOpen);
@@ -50,6 +58,7 @@ export function AppDialogs() {
 
 	return (
 		<>
+			<WordCitationDialog />
 			<ZoteroMigrateDialog
 				open={zoteroOpen}
 				onOpenChange={setZoteroOpen}
@@ -97,7 +106,7 @@ export function AppDialogs() {
 				mode={commandMode}
 				vaultPath={vaultPath}
 				papers={libraryPapers}
-				commands={paletteCommands}
+				commands={listCommands()}
 				onOpenPaper={(rel) => {
 					if (vaultPath) openPaper(joinVaultPath(vaultPath, rel));
 				}}

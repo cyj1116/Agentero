@@ -4,23 +4,20 @@
 //! npm fallback; login-shell PATH for GUI apps; no `curl | bash` pipes).
 //! Scoped to Motif catalog templates.
 
-use crate::features::agent::registry::antigravity;
-#[cfg(target_os = "windows")]
-use crate::features::agent::registry::discovery::path_entries;
-use crate::features::agent::registry::discovery::resolve_command;
+use crate::core::process::SanitizeAppImageEnv;
+use crate::features::agent::registry::discovery::{login_shell_env, path_entries, resolve_command};
 use crate::features::agent::registry::templates::{
-    antigravity_install_dir, antigravity_server_name, kimi_launcher_dir, template_info,
-    CLAUDE_ACP_INSTALL_COMMAND, CODEX_ACP_INSTALL_COMMAND, DSH_INSTALL_COMMAND,
-    MINIMAX_CODE_INSTALL_COMMAND, PI_ACP_INSTALL_COMMAND, PI_HOST_INSTALL_COMMAND,
-    ZCODE_ACP_INSTALL_COMMAND,
+    kimi_launcher_dir, template_info, zcode_host_path, CLAUDE_ACP_INSTALL_COMMAND,
+    CODEBUDDY_NPM_INSTALL_COMMAND, CODEX_ACP_INSTALL_COMMAND, CODEX_HOST_INSTALL_COMMAND,
+    DSH_INSTALL_COMMAND, MIMO_CODE_INSTALL_COMMAND, MINIMAX_CODE_INSTALL_COMMAND,
+    PI_ACP_INSTALL_COMMAND, PI_HOST_INSTALL_COMMAND, ZCODE_ACP_INSTALL_COMMAND,
 };
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     thread,
     time::{Duration, Instant},
@@ -32,12 +29,9 @@ use std::fs::OpenOptions;
 #[cfg(target_os = "windows")]
 use std::io::Write;
 #[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
-#[cfg(target_os = "windows")]
 use std::sync::atomic::{AtomicU64, Ordering};
-
 #[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static TOOL_LIFECYCLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -66,7 +60,7 @@ pub fn clear_lifecycle_cancel(task_id: &str) {
     }
 }
 
-fn lifecycle_cancel_requested(task_id: &str) -> bool {
+pub(crate) fn lifecycle_cancel_requested(task_id: &str) -> bool {
     lifecycle_cancel_set()
         .lock()
         .is_ok_and(|ids| ids.contains(task_id))
@@ -78,18 +72,20 @@ static WINDOWS_BATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Catalog template ids that support silent install/update.
 pub const LIFECYCLE_TEMPLATES: &[&str] = &[
     "opencode",
-    "openclaw",
     "claude-acp",
     "codex-acp",
+    "cursor-agent",
     "hermes",
+    "qodercli",
+    "qoder-cn",
     "grok-build",
     "pi",
     "dsh",
     "kimi-code",
     "zcode",
     "minimax-code",
-    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
-    "antigravity-acp",
+    "mimo-code",
+    "codebuddy",
 ];
 
 /// Launcher directory of the retired dsh ACP-demo scheme (managed `npm i` of
@@ -128,11 +124,29 @@ struct ToolLifecycleProgress {
 /// Windows builds use npm / PowerShell installers instead — keep these out of that target.
 #[cfg(not(target_os = "windows"))]
 const CLAUDE_INSTALL_UNIX: &str = "bash -c 'tmp=$(mktemp) && curl -fsSL https://claude.ai/install.sh -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'";
+/// npm fallback for Claude Code. Unix uses the user prefix so a failed official
+/// installer does not fall through to the root-owned system prefix (#791).
+const CLAUDE_NPM_INSTALL_COMMAND: &str = if cfg!(windows) {
+    "npm i -g @anthropic-ai/claude-code@latest"
+} else {
+    "npm i -g @anthropic-ai/claude-code@latest --prefix \"$HOME/.local\""
+};
 #[cfg(not(target_os = "windows"))]
 const OPENCODE_INSTALL_UNIX: &str = "bash -c 'tmp=$(mktemp) && curl -fsSL https://opencode.ai/v2/install -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'";
-const OPENCODE_NPM_INSTALL_COMMAND: &str = "npm i -g @opencode/cli@latest";
+/// npm fallback for OpenCode, with the same user-prefix reasoning (#791).
+const OPENCODE_NPM_INSTALL_COMMAND: &str = if cfg!(windows) {
+    "npm i -g @opencode/cli@latest"
+} else {
+    "npm i -g @opencode/cli@latest --prefix \"$HOME/.local\""
+};
 #[cfg(not(target_os = "windows"))]
 const GROK_INSTALL_UNIX: &str = "bash -c 'tmp=$(mktemp) && curl -fsSL https://x.ai/cli/install.sh -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'";
+/// npm fallback for Grok Build (#791).
+const GROK_NPM_INSTALL_COMMAND: &str = if cfg!(windows) {
+    "npm i -g @xai-official/grok@latest"
+} else {
+    "npm i -g @xai-official/grok@latest --prefix \"$HOME/.local\""
+};
 #[cfg(not(target_os = "windows"))]
 const HERMES_INSTALL_UNIX: &str = "bash -c 'tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'";
 #[cfg(not(target_os = "windows"))]
@@ -145,7 +159,45 @@ const HERMES_UPDATE_UNIX: &str = "hermes update || bash -c 'tmp=$(mktemp) && cur
 const KIMI_INSTALL_UNIX: &str = "bash -c 'tmp=$(mktemp) && curl -fsSL https://code.kimi.com/kimi-code/install.sh -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'";
 
 /// npm fallback for Kimi Code (npm installs the same `kimi` binary).
-pub const KIMI_NPM_INSTALL_COMMAND: &str = "npm i -g @moonshot-ai/kimi-code@latest";
+/// Unix uses the user prefix so the fallback does not need a writable system
+/// prefix (#791).
+pub const KIMI_NPM_INSTALL_COMMAND: &str = if cfg!(windows) {
+    "npm i -g @moonshot-ai/kimi-code@latest"
+} else {
+    "npm i -g @moonshot-ai/kimi-code@latest --prefix \"$HOME/.local\""
+};
+
+/// Qoder CLI official installer. The script downloads a native `qodercli`
+/// and delegates to `qodercli install --force` (non-interactive). npm is only
+/// the Node compatibility build, so it stays the fallback.
+#[cfg(not(target_os = "windows"))]
+const QODER_INSTALL_UNIX: &str = "bash -c 'tmp=$(mktemp) && curl -fsSL https://qoder.com/install -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'";
+/// npm fallback for Qoder CLI (#791).
+const QODER_NPM_INSTALL_COMMAND: &str = if cfg!(windows) {
+    "npm i -g @qoder-ai/qodercli@latest"
+} else {
+    "npm i -g @qoder-ai/qodercli@latest --prefix \"$HOME/.local\""
+};
+
+/// Qoder CN (mainland build) official installer. Installs a native `qodercn`
+/// dispatcher under `~/.qoder-cn/entry`; npm is only the Node compatibility
+/// build, so it stays the fallback. Windows-arm64 has no native build.
+#[cfg(not(target_os = "windows"))]
+const QODER_CN_INSTALL_UNIX: &str = "bash -c 'tmp=$(mktemp) && curl -fsSL https://static.qoder.com.cn/qoder-cli-cn/install.sh -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'";
+const QODER_CN_NPM_INSTALL_COMMAND: &str = if cfg!(windows) {
+    "npm i -g @qodercn-ai/qoderclicn@latest"
+} else {
+    "npm i -g @qodercn-ai/qoderclicn@latest --prefix \"$HOME/.local\""
+};
+
+/// Cursor Agent CLI official installer. Downloads a native `cursor-agent`
+/// into `~/.local/share/cursor-agent/versions/<release>` and symlinks
+/// `~/.local/bin/{agent,cursor-agent}`. There is no npm package.
+#[cfg(not(target_os = "windows"))]
+const CURSOR_INSTALL_UNIX: &str = "bash -c 'tmp=$(mktemp) && curl -fsSL https://cursor.com/install -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'";
+
+#[cfg(target_os = "windows")]
+const CURSOR_INSTALL_WINDOWS_SCRIPT: &str = "irm 'https://cursor.com/install?win32=true' | iex";
 
 #[cfg(target_os = "windows")]
 const GROK_INSTALL_WINDOWS_SCRIPT: &str = "irm https://x.ai/cli/install.ps1 | iex";
@@ -154,6 +206,20 @@ const HERMES_INSTALL_WINDOWS_SCRIPT: &str =
     "irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex";
 #[cfg(target_os = "windows")]
 const KIMI_INSTALL_WINDOWS_SCRIPT: &str = "irm https://code.kimi.com/kimi-code/install.ps1 | iex";
+#[cfg(target_os = "windows")]
+const QODER_INSTALL_WINDOWS_SCRIPT: &str = "irm https://qoder.com/install.ps1 | iex";
+#[cfg(target_os = "windows")]
+const QODER_CN_INSTALL_WINDOWS_SCRIPT: &str =
+    "irm https://static.qoder.com.cn/qoder-cli-cn/install.ps1 | iex";
+
+/// CodeBuddy Code native installer (Beta) — no Node.js required, installs into
+/// `~/.local/bin` on Unix and `%USERPROFILE%\AppData\Local\codebuddy\bin` on
+/// Windows. Same download-then-exec shape as the other official installers.
+#[cfg(not(target_os = "windows"))]
+const CODEBUDDY_INSTALL_UNIX: &str = "bash -c 'tmp=$(mktemp) && curl -fsSL https://copilot.tencent.com/cli/install.sh -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'";
+#[cfg(target_os = "windows")]
+const CODEBUDDY_INSTALL_WINDOWS_SCRIPT: &str =
+    "irm https://copilot.tencent.com/cli/install.ps1 | iex";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolLifecycleAction {
@@ -192,9 +258,6 @@ impl UninstallScope {
 }
 
 pub fn supports_lifecycle(template_id: &str) -> bool {
-    if template_id == "antigravity-acp" && cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        return false;
-    }
     LIFECYCLE_TEMPLATES.contains(&template_id)
 }
 
@@ -250,86 +313,110 @@ impl UninstallInfo {
     }
 }
 
-pub fn uninstall_info(template_id: &str) -> Option<UninstallInfo> {
-    #[cfg(target_os = "windows")]
-    let claude_acp = "npm uninstall -g @agentclientprotocol/claude-agent-acp".to_string();
-    #[cfg(not(target_os = "windows"))]
-    let claude_acp =
-        "npm uninstall -g @agentclientprotocol/claude-agent-acp --prefix \"$HOME/.local\""
-            .to_string();
-    #[cfg(target_os = "windows")]
-    let pi_acp = "npm uninstall -g pi-acp".to_string();
-    #[cfg(not(target_os = "windows"))]
-    let pi_acp = "npm uninstall -g pi-acp --prefix \"$HOME/.local\"".to_string();
-    #[cfg(target_os = "windows")]
-    let zcode_acp = "npm uninstall -g zcode-acp-server".to_string();
-    #[cfg(not(target_os = "windows"))]
-    let zcode_acp = "npm uninstall -g zcode-acp-server --prefix \"$HOME/.local\"".to_string();
-    // Mirrors CODEX_ACP_INSTALL_COMMAND: uninstall must target the same prefix
-    // the install used, or a user-prefix adapter leaves an orphan on Unix.
-    let codex_acp = if cfg!(windows) {
-        "npm uninstall -g @agentclientprotocol/codex-acp".to_string()
+/// `npm uninstall -g` must target the same prefix the install used. On Unix that
+/// is always the user prefix (adapters and hosts), so a user-installed copy is
+/// actually removed instead of looking at the root-owned `/usr/local` (#791).
+fn npm_uninstall_global(package: &str) -> String {
+    if cfg!(windows) {
+        format!("npm uninstall -g {package}")
     } else {
-        "npm uninstall -g @agentclientprotocol/codex-acp --prefix \"$HOME/.local\"".to_string()
-    };
-    #[cfg(target_os = "windows")]
-    let dsh_host = "npm uninstall -g @deepseek-ai/dsh".to_string();
-    #[cfg(not(target_os = "windows"))]
-    let dsh_host = "npm uninstall -g @deepseek-ai/dsh --prefix \"$HOME/.local\"".to_string();
+        format!("npm uninstall -g {package} --prefix \"$HOME/.local\"")
+    }
+}
+
+pub fn uninstall_info(template_id: &str) -> Option<UninstallInfo> {
+    let claude_acp = npm_uninstall_global("@agentclientprotocol/claude-agent-acp");
+    let pi_acp = npm_uninstall_global("pi-acp");
+    let zcode_acp = npm_uninstall_global("zcode-acp-server");
+    // Mirrors CODEX_ACP_INSTALL_COMMAND and CODEX_HOST_INSTALL_COMMAND: install
+    // and uninstall must share the same prefix or user-prefix copies leak.
+    let codex_acp = npm_uninstall_global("@agentclientprotocol/codex-acp");
+    let codex_host = npm_uninstall_global("@openai/codex");
+    let dsh_host = npm_uninstall_global("@deepseek-ai/dsh");
 
     let (agent_commands, acp_commands): (Vec<String>, Vec<String>) = match template_id {
         // Single-package agents: host CLI and ACP are the same binary.
         "opencode" => (
             vec![
-                "npm uninstall -g @opencode/cli".to_string(),
-                "npm uninstall -g opencode-ai".to_string(),
+                npm_uninstall_global("@opencode/cli"),
+                npm_uninstall_global("opencode-ai"),
             ],
             Vec::new(),
         ),
-        "openclaw" => (vec!["npm uninstall -g openclaw".to_string()], Vec::new()),
         "claude-acp" => (
-            vec!["npm uninstall -g @anthropic-ai/claude-code".to_string()],
+            vec![npm_uninstall_global("@anthropic-ai/claude-code")],
             vec![claude_acp],
         ),
-        "codex-acp" => (
-            vec!["npm uninstall -g @openai/codex".to_string()],
-            vec![codex_acp],
-        ),
+        "codex-acp" => (vec![codex_host], vec![codex_acp]),
+        // Official-installer-only: no npm package to reverse, only the
+        // launcher dirs and symlinks the installer created.
+        "cursor-agent" => (Vec::new(), Vec::new()),
         "pi" => (
-            vec!["npm uninstall -g @earendil-works/pi-coding-agent".to_string()],
+            vec![npm_uninstall_global("@earendil-works/pi-coding-agent")],
             vec![pi_acp],
         ),
-        "grok-build" => (
-            vec!["npm uninstall -g @xai-official/grok".to_string()],
+        "grok-build" => (vec![npm_uninstall_global("@xai-official/grok")], Vec::new()),
+        // npm covers the Node fallback. The official script writes the paths
+        // in `qoder_managed_install_paths` (not the ~/.qoder session dir).
+        "qodercli" => (vec![npm_uninstall_global("@qoder-ai/qodercli")], Vec::new()),
+        "qoder-cn" => (
+            vec![npm_uninstall_global("@qodercn-ai/qoderclicn")],
             Vec::new(),
         ),
         // The ACP profile lives inside the umbrella CLI; the dir entry below
         // only cleans up the retired dsh-acp-demo launcher.
         "dsh" => (vec![dsh_host], Vec::new()),
         "kimi-code" => (
-            vec!["npm uninstall -g @moonshot-ai/kimi-code".to_string()],
+            vec![npm_uninstall_global("@moonshot-ai/kimi-code")],
             Vec::new(),
         ),
-        "minimax-code" => (
-            vec!["npm uninstall -g @minimax-ai/code".to_string()],
+        "minimax-code" => (vec![npm_uninstall_global("@minimax-ai/code")], Vec::new()),
+        "mimo-code" => (vec![npm_uninstall_global("mimocode")], Vec::new()),
+        "codebuddy" => (
+            vec![npm_uninstall_global("@tencent-ai/codebuddy-code")],
             Vec::new(),
         ),
-        // Single-package adapter: the ACP bridge is the only npm artifact
-        // (the zcode CLI itself ships inside the ZCode desktop app).
-        "zcode" => (vec![zcode_acp], Vec::new()),
+        // The desktop app owns the ZCode host. Agentero only manages the ACP
+        // bridge npm package, so uninstall must never imply that it removed
+        // the user's desktop app or login data.
+        "zcode" => (Vec::new(), vec![zcode_acp]),
         "antigravity-acp" => (Vec::new(), Vec::new()),
         // hermes: official-script-only install, nothing we can reverse.
         _ => return None,
     };
     let (agent_dirs, acp_dirs): (Vec<String>, Vec<String>) = match template_id {
+        "cursor-agent" => (
+            cursor_managed_install_paths()
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            Vec::new(),
+        ),
         "dsh" => (
             Vec::new(),
             vec![legacy_dsh_launcher_dir().display().to_string()],
         ),
         "kimi-code" => (vec![kimi_launcher_dir().display().to_string()], Vec::new()),
-        "antigravity-acp" => (
+        "qodercli" => (
+            qoder_managed_install_paths()
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect(),
             Vec::new(),
-            vec![antigravity_install_dir().display().to_string()],
+        ),
+        "qoder-cn" => (
+            qoder_cn_managed_install_paths()
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            Vec::new(),
+        ),
+        "codebuddy" => (
+            codebuddy_managed_install_paths()
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            Vec::new(),
         ),
         _ => (Vec::new(), Vec::new()),
     };
@@ -345,31 +432,129 @@ pub fn uninstall_info(template_id: &str) -> Option<UninstallInfo> {
     })
 }
 
-/// Chain best-effort uninstall commands: each failure is non-fatal (idempotent
-/// uninstall, packages may be absent or root-owned). Unix `|| true`; Windows
-/// `|| echo skip` (cmd has no `true`, and `exit /b 0` would abort the bat).
-fn best_effort_chain(cmds: &[String]) -> String {
+/// Official Qoder installer layout. The versioned binary lives in
+/// `~/.qoder/bin/qodercli`, the `qoder` dispatcher in `~/.qoder/entry`, and
+/// PATH sees a symlink at `~/.local/bin/qodercli`. `~/.qoder` itself holds
+/// sessions and auth, and `~/.local/bin` is shared, so neither directory is
+/// removed. Shell rc PATH lines are left in place.
+fn qoder_managed_install_paths() -> Vec<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
-    {
-        cmds.iter()
-            .map(|c| format!("{c} || echo skip"))
-            .collect::<Vec<_>>()
-            .join("\r\n")
-    }
+    let home = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from);
     #[cfg(not(target_os = "windows"))]
-    {
-        cmds.iter()
-            .map(|c| format!("{c} || true"))
-            .collect::<Vec<_>>()
-            .join("; ")
-    }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let Some(home) = home.filter(|path| !path.as_os_str().is_empty()) else {
+        return Vec::new();
+    };
+    #[cfg(not(target_os = "windows"))]
+    let paths = vec![
+        home.join(".qoder").join("bin").join("qodercli"),
+        home.join(".qoder").join("entry"),
+        home.join(".local").join("bin").join("qodercli"),
+    ];
+    #[cfg(target_os = "windows")]
+    let paths = {
+        let bin = home.join(".local").join("bin");
+        vec![
+            home.join(".qoder").join("bin").join("qodercli"),
+            home.join(".qoder").join("entry"),
+            bin.join("qodercli"),
+            bin.join("qodercli.exe"),
+            bin.join("qodercli.cmd"),
+        ]
+    };
+    paths
 }
 
-fn remove_managed_dir(dir: &std::path::Path) -> Result<(), String> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    fs::remove_dir_all(dir).map_err(|e| format!("failed to remove {}: {e}", dir.display()))
+/// Official Qoder CN installer layout. The versioned binaries live in
+/// `~/.qoder-cn/bin/qoderclicn`, the `qodercn` / `qoder-cn` dispatchers in
+/// `~/.qoder-cn/entry`, and Unix also symlinks `~/.local/bin/qoderclicn`.
+/// `~/.qoder-cn` itself holds auth, sessions and logs, so only the managed
+/// binary and dispatcher directories are removed.
+fn qoder_cn_managed_install_paths() -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    let home = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from);
+    #[cfg(not(target_os = "windows"))]
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let Some(home) = home.filter(|path| !path.as_os_str().is_empty()) else {
+        return Vec::new();
+    };
+    #[cfg(not(target_os = "windows"))]
+    let paths = vec![
+        home.join(".qoder-cn").join("bin").join("qoderclicn"),
+        home.join(".qoder-cn").join("entry"),
+        home.join(".local").join("bin").join("qoderclicn"),
+    ];
+    #[cfg(target_os = "windows")]
+    let paths = vec![
+        home.join(".qoder-cn").join("bin").join("qoderclicn"),
+        home.join(".qoder-cn").join("entry"),
+    ];
+    paths
+}
+
+/// Official CodeBuddy installer layout. Unix links `~/.local/bin/codebuddy`;
+/// Windows puts the launcher in `%USERPROFILE%\AppData\Local\codebuddy\bin`.
+/// `~/.codebuddy` holds login and settings, so it is never removed.
+fn codebuddy_managed_install_paths() -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    let home = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from);
+    #[cfg(not(target_os = "windows"))]
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let Some(home) = home.filter(|path| !path.as_os_str().is_empty()) else {
+        return Vec::new();
+    };
+    #[cfg(not(target_os = "windows"))]
+    let paths = vec![home.join(".local").join("bin").join("codebuddy")];
+    #[cfg(target_os = "windows")]
+    let paths = vec![home
+        .join("AppData")
+        .join("Local")
+        .join("codebuddy")
+        .join("bin")];
+    paths
+}
+
+/// Official Cursor installer layout. Unix keeps versioned binaries under
+/// `~/.local/share/cursor-agent` and symlinks `agent` / `cursor-agent` into
+/// `~/.local/bin`; Windows installs the launchers plus `versions/` under
+/// `%LOCALAPPDATA%\cursor-agent`. The shared `bin` dir and the `~/.cursor`
+/// login/config dir are never removed.
+fn cursor_managed_install_paths() -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+    #[cfg(not(target_os = "windows"))]
+    let base = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let Some(base) = base.filter(|path| !path.as_os_str().is_empty()) else {
+        return Vec::new();
+    };
+    #[cfg(not(target_os = "windows"))]
+    let paths = vec![
+        base.join(".local").join("share").join("cursor-agent"),
+        base.join(".local").join("bin").join("cursor-agent"),
+        base.join(".local").join("bin").join("agent"),
+    ];
+    #[cfg(target_os = "windows")]
+    let paths = vec![base.join("cursor-agent")];
+    paths
+}
+
+/// Remove one managed uninstall path. A symlink is unlinked and not followed,
+/// so `~/.local/bin/qodercli` goes away even after its target is already gone,
+/// and the shared `~/.local/bin` directory stays.
+fn remove_managed_path(path: &std::path::Path) -> Result<(), String> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(format!("failed to inspect {}: {err}", path.display()));
+        }
+    };
+    let result = if meta.file_type().is_symlink() || meta.is_file() {
+        fs::remove_file(path)
+    } else {
+        fs::remove_dir_all(path)
+    };
+    result.map_err(|err| format!("failed to remove {}: {err}", path.display()))
 }
 
 /// Uninstall path: npm uninstall chains plus managed directory removal.
@@ -386,22 +571,59 @@ pub fn run_partial_template_uninstall(
         return Ok(());
     };
     let payload = info.for_scope(scope);
+    #[cfg(windows)]
+    let npm_prefix =
+        if template_id == "dsh" && matches!(scope, UninstallScope::Agent | UninstallScope::All) {
+            resolve_command("dsh")
+                .map(|command| super::dsh::npm_prefix(&command))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+    #[cfg(not(windows))]
+    let npm_prefix: Option<std::path::PathBuf> = None;
     if !payload.npm_commands.is_empty() {
         // A fully `|| true` chain would silently succeed when npm is missing.
-        if resolve_command("npm").is_none() {
+        // Qoder's official installers do not need Node, so a missing npm must
+        // not block removal of the script-installed binary.
+        let npm_available = resolve_command("npm").is_some();
+        if !npm_available && !matches!(template_id, "qodercli" | "qoder-cn" | "codebuddy") {
             return Err("npm is not available on PATH; cannot uninstall npm packages".to_string());
         }
-        run_tool_lifecycle_silently(
-            &best_effort_chain(&payload.npm_commands),
-            app,
-            task_id,
-            "agent-lifecycle-uninstall",
-            proxy_enabled,
-            proxy_url,
-        )?;
+        if npm_available {
+            run_tool_lifecycle_silently(
+                &payload.npm_commands.join("\n"),
+                app,
+                task_id,
+                "agent-lifecycle-uninstall",
+                proxy_enabled,
+                proxy_url,
+                npm_prefix.as_deref(),
+            )?;
+        }
     }
     for dir in &payload.dirs {
-        remove_managed_dir(std::path::Path::new(dir))?;
+        remove_managed_path(std::path::Path::new(dir))?;
+    }
+    #[cfg(windows)]
+    if template_id == "dsh"
+        && matches!(scope, UninstallScope::Agent | UninstallScope::All)
+        && resolve_command("dsh").is_some()
+    {
+        return Err(
+            "Dsh is still on PATH after npm uninstall; another npm installation or a desktop-managed launcher remains. Remove it with the installation that owns that command"
+                .to_string(),
+        );
+    }
+    if template_id == "zcode"
+        && matches!(scope, UninstallScope::Acp | UninstallScope::All)
+        && resolve_command("zcode-acp-server").is_some()
+    {
+        return Err(
+            "zcode-acp-server is still on PATH after npm uninstall; remove it with the npm installation that owns that command"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -446,15 +668,18 @@ pub fn run_template_lifecycle(
         return run_template_uninstall(template_id, app, task_id, proxy_enabled, proxy_url);
     }
 
-    if template_id == "antigravity-acp" {
-        return install_antigravity(app, task_id, proxy_enabled, proxy_url);
-    }
-
     let detect = info
         .detect_command
         .as_deref()
         .unwrap_or(info.command.as_str());
-    let host_present = resolve_command(detect).is_some();
+    let host_present = if template_id == "zcode" {
+        // Match catalog scanning: custom desktop installs can be supplied
+        // through ZCODE_BIN in the app's launch environment.
+        let environment = std::env::vars().collect::<HashMap<_, _>>();
+        zcode_host_path(&environment).is_some()
+    } else {
+        resolve_command(detect).is_some()
+    };
     let acp_path_present = resolve_command(&info.command).is_some();
     // Bundled adapter tier keeps the ACP layer ready without an npm install;
     // it only counts when nothing is PATH-installed (PATH always wins) and it
@@ -462,11 +687,12 @@ pub fn run_template_lifecycle(
     // the bundled adapter moves with app releases.
     let bundled_tier_active = !acp_path_present && super::bundled::bundled_spawnable(template_id);
     let acp_present = acp_path_present || bundled_tier_active;
-    // Same binary for host and ACP (opencode, openclaw, hermes, grok via npx).
-    let needs_separate_adapter = info
-        .detect_command
-        .as_ref()
-        .is_some_and(|d| d != &info.command);
+    // Same binary for host and ACP (opencode, hermes, qodercli, grok).
+    let needs_separate_adapter = template_id == "zcode"
+        || info
+            .detect_command
+            .as_ref()
+            .is_some_and(|d| d != &info.command);
 
     let command = match action {
         ToolLifecycleAction::Install => {
@@ -513,6 +739,15 @@ pub fn run_template_lifecycle(
     if command.trim().is_empty() {
         return Err(format!("empty lifecycle command for {template_id}"));
     }
+    // Fail with the message the UI already recognizes before starting a doomed
+    // `bash -c "npm ..."`. Commands that put an official installer first (with
+    // npm only as an `||` fallback) are not npm-only and stay allowed.
+    if command_needs_npm(&command) && !npm_available_for_lifecycle() {
+        return Err(
+            "npm is not available on PATH; install Node.js (npm ships with it), then retry"
+                .to_string(),
+        );
+    }
 
     log::info!(
         target: "agentero::agent",
@@ -527,244 +762,8 @@ pub fn run_template_lifecycle(
         "agent-lifecycle-install",
         proxy_enabled,
         proxy_url,
+        None,
     )
-}
-
-/// Download and stage the official Antigravity ACP server without invoking a
-/// shell or touching the user's Google login. The release (version + archive)
-/// comes from the ACP registry, so the installer always follows the version
-/// Google publishes; the archive is extracted into a temporary sibling
-/// directory and swapped into place only after both required files are present.
-fn install_antigravity(
-    app: Option<&AppHandle>,
-    task_id: Option<&str>,
-    proxy_enabled: bool,
-    proxy_url: &str,
-) -> Result<(), String> {
-    // Registry lookup before the lifecycle lock: another install must not be
-    // held up by a manifest request, and an unreachable registry fails with a
-    // clear error here instead of installing a guessed version.
-    let release = antigravity::resolve_release(proxy_enabled, proxy_url)?;
-    let _guard = acquire_lifecycle_lock(app, task_id)?;
-    check_lifecycle_cancelled(task_id)?;
-    emit_lifecycle_progress(app, task_id, "agent-lifecycle-download", Some(5));
-    log::info!(
-        target: "agentero::agent",
-        "antigravity install version={} archive={}",
-        release.version,
-        release.archive_url
-    );
-
-    let client = antigravity::build_client(
-        &format!("Agentero/antigravity-acp/{}", release.version),
-        proxy_enabled,
-        proxy_url,
-        Duration::from_secs(180),
-    )?;
-    let mut response = client
-        .get(&release.archive_url)
-        .send()
-        .map_err(|e| format!("Antigravity download failed: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Antigravity download failed with HTTP {}",
-            response.status()
-        ));
-    }
-
-    let total = response.content_length();
-    let mut archive = Vec::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = response
-            .read(&mut buffer)
-            .map_err(|e| format!("Antigravity download read failed: {e}"))?;
-        if read == 0 {
-            break;
-        }
-        check_lifecycle_cancelled(task_id)?;
-        archive.extend_from_slice(&buffer[..read]);
-        let progress = total.map(|size| ((archive.len() as u64 * 70) / size).min(70) as u8);
-        emit_lifecycle_progress(app, task_id, "agent-lifecycle-download", progress);
-    }
-    if archive.is_empty() {
-        return Err("Antigravity download was empty".to_string());
-    }
-
-    let install_dir = antigravity_install_dir();
-    let parent = install_dir
-        .parent()
-        .ok_or_else(|| "invalid Antigravity install directory".to_string())?;
-    fs::create_dir_all(parent)
-        .map_err(|e| format!("failed to create Agentero install directory: {e}"))?;
-    let staging = parent.join(format!(
-        ".antigravity-acp-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| format!("failed to create staging name: {e}"))?
-            .as_nanos()
-    ));
-    let _ = fs::remove_dir_all(&staging);
-    fs::create_dir_all(&staging)
-        .map_err(|e| format!("failed to create Antigravity staging directory: {e}"))?;
-
-    let extraction = extract_antigravity_zip(&archive, &staging);
-    if let Err(error) = extraction {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(error);
-    }
-    let server_name = antigravity_server_name();
-    if let Err(error) = normalize_antigravity_layout(&staging, server_name) {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(error);
-    }
-    if let Err(error) = check_lifecycle_cancelled(task_id) {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(error);
-    }
-    if !staging.join(server_name).is_file() || !has_localharness_external(&staging) {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(
-            "Antigravity archive is missing the ACP server or localharness_external".to_string(),
-        );
-    }
-    #[cfg(unix)]
-    if let Err(error) = make_antigravity_executables(&staging) {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(error);
-    }
-    // The release marker travels with the payload: it is written into the
-    // staging directory, so it appears only for a successful install and is
-    // rolled back with the rest when the swap fails. version_check reads it
-    // instead of running the ACP server.
-    if let Err(error) = antigravity::write_version_marker(&staging, &release.version) {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(error);
-    }
-    emit_lifecycle_progress(app, task_id, "agent-lifecycle-install", Some(90));
-    if let Err(error) = replace_antigravity_install(&staging, &install_dir) {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(error);
-    }
-    emit_lifecycle_progress(app, task_id, "agent-lifecycle-install", Some(100));
-    Ok(())
-}
-
-fn replace_antigravity_install(
-    staging: &std::path::Path,
-    install_dir: &std::path::Path,
-) -> Result<(), String> {
-    if !install_dir.exists() {
-        return fs::rename(staging, install_dir)
-            .map_err(|e| format!("failed to install Antigravity ACP server: {e}"));
-    }
-    let backup = install_dir.with_extension(format!(
-        "old-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| format!("failed to create backup name: {e}"))?
-            .as_nanos()
-    ));
-    fs::rename(install_dir, &backup)
-        .map_err(|e| format!("failed to prepare Antigravity update: {e}"))?;
-    if let Err(error) = fs::rename(staging, install_dir) {
-        let _ = fs::rename(&backup, install_dir);
-        return Err(format!("failed to install Antigravity ACP server: {error}"));
-    }
-    let _ = fs::remove_dir_all(backup);
-    Ok(())
-}
-
-fn extract_antigravity_zip(archive: &[u8], dest: &std::path::Path) -> Result<(), String> {
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive))
-        .map_err(|e| format!("invalid Antigravity archive: {e}"))?;
-    for index in 0..zip.len() {
-        let mut entry = zip
-            .by_index(index)
-            .map_err(|e| format!("invalid Antigravity archive entry: {e}"))?;
-        let name = std::path::Path::new(entry.name());
-        if name.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::RootDir
-            )
-        }) {
-            return Err("Antigravity archive contains an unsafe path".to_string());
-        }
-        let output = dest.join(name);
-        if entry.is_dir() {
-            fs::create_dir_all(&output).map_err(|e| format!("failed to extract archive: {e}"))?;
-            continue;
-        }
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("failed to extract archive: {e}"))?;
-        }
-        let mut file =
-            fs::File::create(&output).map_err(|e| format!("failed to extract archive: {e}"))?;
-        std::io::copy(&mut entry, &mut file)
-            .map_err(|e| format!("failed to extract archive: {e}"))?;
-    }
-    Ok(())
-}
-
-fn normalize_antigravity_layout(root: &std::path::Path, server_name: &str) -> Result<(), String> {
-    if root.join(server_name).is_file() {
-        return Ok(());
-    }
-    let Some(server) = walkdir::WalkDir::new(root)
-        .into_iter()
-        .flatten()
-        .find(|entry| entry.file_type().is_file() && entry.file_name() == server_name)
-    else {
-        return Ok(());
-    };
-    let Some(parent) = server.path().parent() else {
-        return Ok(());
-    };
-    if parent == root {
-        return Ok(());
-    }
-    for entry in fs::read_dir(parent).map_err(|e| format!("failed to normalize archive: {e}"))? {
-        let entry = entry.map_err(|e| format!("failed to normalize archive: {e}"))?;
-        let target = root.join(entry.file_name());
-        fs::rename(entry.path(), target)
-            .map_err(|e| format!("failed to normalize archive: {e}"))?;
-    }
-    Ok(())
-}
-
-fn has_localharness_external(root: &std::path::Path) -> bool {
-    walkdir::WalkDir::new(root)
-        .into_iter()
-        .flatten()
-        .any(|entry| {
-            entry.file_type().is_file()
-                && entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("localharness_external")
-        })
-}
-
-#[cfg(unix)]
-fn make_antigravity_executables(root: &std::path::Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    for entry in walkdir::WalkDir::new(root).into_iter().flatten() {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy();
-        if name == "agy_acp_server.par" || name.starts_with("localharness_external") {
-            let mut permissions = fs::metadata(entry.path())
-                .map_err(|e| format!("failed to inspect extracted file: {e}"))?
-                .permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(entry.path(), permissions)
-                .map_err(|e| format!("failed to mark extracted file executable: {e}"))?;
-        }
-    }
-    Ok(())
 }
 
 fn host_update_includes_adapter(template_id: &str) -> bool {
@@ -780,6 +779,11 @@ fn update_command(
     needs_separate_adapter: bool,
     bundled_tier_active: bool,
 ) -> Result<String, String> {
+    // Agentero cannot update the ZCode desktop app safely; update only the
+    // bridge package it installed and leave the app/login untouched.
+    if template_id == "zcode" {
+        return adapter_install_command(template_id);
+    }
     if needs_separate_adapter {
         let mut parts = Vec::new();
         if host_present {
@@ -808,6 +812,7 @@ fn adapter_install_command(template_id: &str) -> Result<String, String> {
         "claude-acp" => Ok(CLAUDE_ACP_INSTALL_COMMAND.to_string()),
         "codex-acp" => Ok(CODEX_ACP_INSTALL_COMMAND.to_string()),
         "pi" => Ok(PI_ACP_INSTALL_COMMAND.to_string()),
+        "zcode" => Ok(ZCODE_ACP_INSTALL_COMMAND.to_string()),
         _ => Err(format!("no ACP adapter install for {template_id}")),
     }
 }
@@ -816,11 +821,19 @@ fn host_install_command(template_id: &str) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
         match template_id {
-            "claude-acp" => Ok("npm i -g @anthropic-ai/claude-code@latest".to_string()),
-            "codex-acp" => Ok("npm i -g @openai/codex@latest".to_string()),
+            "claude-acp" => Ok(CLAUDE_NPM_INSTALL_COMMAND.to_string()),
+            "codex-acp" => Ok(CODEX_HOST_INSTALL_COMMAND.to_string()),
+            "cursor-agent" => Ok(cursor_install_windows_command()),
             "opencode" => Ok(OPENCODE_NPM_INSTALL_COMMAND.to_string()),
-            "openclaw" => Ok("npm i -g openclaw@latest".to_string()),
             "hermes" => Ok(hermes_install_windows_command()),
+            "qodercli" => Ok(chain_or(
+                &qoder_install_windows_command(),
+                QODER_NPM_INSTALL_COMMAND,
+            )),
+            "qoder-cn" => Ok(chain_or(
+                &qoder_cn_install_windows_command(),
+                QODER_CN_NPM_INSTALL_COMMAND,
+            )),
             "pi" => Ok(PI_HOST_INSTALL_COMMAND.to_string()),
             "dsh" => Ok(DSH_INSTALL_COMMAND.to_string()),
             "kimi-code" => Ok(chain_or(
@@ -828,37 +841,52 @@ fn host_install_command(template_id: &str) -> Result<String, String> {
                 KIMI_NPM_INSTALL_COMMAND,
             )),
             "minimax-code" => Ok(MINIMAX_CODE_INSTALL_COMMAND.to_string()),
+            "mimo-code" => Ok(MIMO_CODE_INSTALL_COMMAND.to_string()),
+            "codebuddy" => Ok(chain_or(
+                &codebuddy_install_windows_command(),
+                CODEBUDDY_NPM_INSTALL_COMMAND,
+            )),
             "grok-build" => Ok(chain_or(
                 &grok_install_windows_command(),
-                "npm i -g @xai-official/grok@latest",
+                GROK_NPM_INSTALL_COMMAND,
             )),
-            "zcode" => Ok(ZCODE_ACP_INSTALL_COMMAND.to_string()),
+            "zcode" => Err(
+                "ZCode desktop app is required; install it first, then install the ACP bridge"
+                    .to_string(),
+            ),
             _ => Err(format!("no host install for {template_id}")),
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
         match template_id {
-            "claude-acp" => Ok(chain_or(
-                CLAUDE_INSTALL_UNIX,
-                "npm i -g @anthropic-ai/claude-code@latest",
-            )),
-            "codex-acp" => Ok("npm i -g @openai/codex@latest".to_string()),
+            "claude-acp" => Ok(chain_or(CLAUDE_INSTALL_UNIX, CLAUDE_NPM_INSTALL_COMMAND)),
+            "codex-acp" => Ok(CODEX_HOST_INSTALL_COMMAND.to_string()),
+            "cursor-agent" => Ok(CURSOR_INSTALL_UNIX.to_string()),
             "opencode" => Ok(chain_or(
                 OPENCODE_INSTALL_UNIX,
                 OPENCODE_NPM_INSTALL_COMMAND,
             )),
-            "openclaw" => Ok("npm i -g openclaw@latest".to_string()),
             "hermes" => Ok(HERMES_INSTALL_UNIX.to_string()),
+            "qodercli" => Ok(chain_or(QODER_INSTALL_UNIX, QODER_NPM_INSTALL_COMMAND)),
+            "qoder-cn" => Ok(chain_or(
+                QODER_CN_INSTALL_UNIX,
+                QODER_CN_NPM_INSTALL_COMMAND,
+            )),
             "pi" => Ok(PI_HOST_INSTALL_COMMAND.to_string()),
             "dsh" => Ok(DSH_INSTALL_COMMAND.to_string()),
             "kimi-code" => Ok(chain_or(KIMI_INSTALL_UNIX, KIMI_NPM_INSTALL_COMMAND)),
             "minimax-code" => Ok(MINIMAX_CODE_INSTALL_COMMAND.to_string()),
-            "grok-build" => Ok(chain_or(
-                GROK_INSTALL_UNIX,
-                "npm i -g @xai-official/grok@latest",
+            "mimo-code" => Ok(MIMO_CODE_INSTALL_COMMAND.to_string()),
+            "codebuddy" => Ok(chain_or(
+                CODEBUDDY_INSTALL_UNIX,
+                CODEBUDDY_NPM_INSTALL_COMMAND,
             )),
-            "zcode" => Ok(ZCODE_ACP_INSTALL_COMMAND.to_string()),
+            "grok-build" => Ok(chain_or(GROK_INSTALL_UNIX, GROK_NPM_INSTALL_COMMAND)),
+            "zcode" => Err(
+                "ZCode desktop app is required; install it first, then install the ACP bridge"
+                    .to_string(),
+            ),
             _ => Err(format!("no host install for {template_id}")),
         }
     }
@@ -872,27 +900,32 @@ fn host_update_command(template_id: &str) -> Result<String, String> {
         "claude-acp" => {
             #[cfg(target_os = "windows")]
             {
-                Ok(chain_or(
-                    "claude update",
-                    "npm i -g @anthropic-ai/claude-code@latest",
-                ))
+                Ok(chain_or("claude update", CLAUDE_NPM_INSTALL_COMMAND))
             }
             #[cfg(not(target_os = "windows"))]
             {
                 Ok(chain_or(
                     "claude update",
-                    &chain_or(
-                        CLAUDE_INSTALL_UNIX,
-                        "npm i -g @anthropic-ai/claude-code@latest",
-                    ),
+                    &chain_or(CLAUDE_INSTALL_UNIX, CLAUDE_NPM_INSTALL_COMMAND),
                 ))
             }
         }
-        "codex-acp" => Ok("npm i -g @openai/codex@latest".to_string()),
-        "openclaw" => Ok(chain_or(
-            "openclaw update --yes",
-            "npm i -g openclaw@latest",
-        )),
+        "codex-acp" => Ok(CODEX_HOST_INSTALL_COMMAND.to_string()),
+        "cursor-agent" => {
+            // Cursor also auto-updates on launch; `cursor-agent update` is the
+            // documented manual path, with the installer as the fallback.
+            #[cfg(target_os = "windows")]
+            {
+                Ok(chain_or(
+                    "cursor-agent update",
+                    &cursor_install_windows_command(),
+                ))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Ok(chain_or("cursor-agent update", CURSOR_INSTALL_UNIX))
+            }
+        }
         "pi" => {
             // pi is a host CLI plus a community ACP adapter. Updating only the
             // host frequently leaves the adapter out of sync after a `pi` release,
@@ -908,6 +941,26 @@ fn host_update_command(template_id: &str) -> Result<String, String> {
         // (latest version) with the npm install as fallback.
         "kimi-code" => Ok(host_install_command(template_id)?),
         "minimax-code" => Ok(MINIMAX_CODE_INSTALL_COMMAND.to_string()),
+        "mimo-code" => Ok(MIMO_CODE_INSTALL_COMMAND.to_string()),
+        "codebuddy" => {
+            #[cfg(target_os = "windows")]
+            {
+                Ok(chain_or(
+                    "codebuddy update",
+                    &chain_or(
+                        &codebuddy_install_windows_command(),
+                        CODEBUDDY_NPM_INSTALL_COMMAND,
+                    ),
+                ))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Ok(chain_or(
+                    "codebuddy update",
+                    &chain_or(CODEBUDDY_INSTALL_UNIX, CODEBUDDY_NPM_INSTALL_COMMAND),
+                ))
+            }
+        }
         "hermes" => {
             #[cfg(target_os = "windows")]
             {
@@ -936,17 +989,53 @@ fn host_update_command(template_id: &str) -> Result<String, String> {
             {
                 Ok(chain_or(
                     "grok update",
-                    &chain_or(
-                        &grok_install_windows_command(),
-                        "npm i -g @xai-official/grok@latest",
-                    ),
+                    &chain_or(&grok_install_windows_command(), GROK_NPM_INSTALL_COMMAND),
                 ))
             }
             #[cfg(not(target_os = "windows"))]
             {
                 Ok(chain_or(
                     "grok update",
-                    &chain_or(GROK_INSTALL_UNIX, "npm i -g @xai-official/grok@latest"),
+                    &chain_or(GROK_INSTALL_UNIX, GROK_NPM_INSTALL_COMMAND),
+                ))
+            }
+        }
+        // `qodercli update` is a non-interactive self-update. If it fails,
+        // re-run the official installer (already passes --force) then npm.
+        "qodercli" => {
+            #[cfg(target_os = "windows")]
+            {
+                Ok(chain_or(
+                    "qodercli update",
+                    &chain_or(&qoder_install_windows_command(), QODER_NPM_INSTALL_COMMAND),
+                ))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Ok(chain_or(
+                    "qodercli update",
+                    &chain_or(QODER_INSTALL_UNIX, QODER_NPM_INSTALL_COMMAND),
+                ))
+            }
+        }
+        // Qoder CN's dispatcher forwards `update` to the CLI's non-interactive
+        // self-updater; fall back to the official installer then npm.
+        "qoder-cn" => {
+            #[cfg(target_os = "windows")]
+            {
+                Ok(chain_or(
+                    "qodercn update",
+                    &chain_or(
+                        &qoder_cn_install_windows_command(),
+                        QODER_CN_NPM_INSTALL_COMMAND,
+                    ),
+                ))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Ok(chain_or(
+                    "qodercn update",
+                    &chain_or(QODER_CN_INSTALL_UNIX, QODER_CN_NPM_INSTALL_COMMAND),
                 ))
             }
         }
@@ -973,6 +1062,31 @@ fn chain_commands(parts: &[String]) -> String {
     {
         parts.join(" && ")
     }
+}
+
+/// True when every non-empty line is a direct `npm` invocation. Official
+/// installers that only use npm as an `||` fallback are excluded: they can
+/// succeed without Node, so a missing npm must not reject them up front.
+fn command_needs_npm(command: &str) -> bool {
+    let mut lines = command
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .peekable();
+    lines.peek().is_some()
+        && lines.all(|line| line.starts_with("npm ") || line.starts_with("npm.cmd "))
+}
+
+fn npm_available_for_lifecycle() -> bool {
+    if resolve_command("npm").is_some() {
+        return true;
+    }
+    login_shell_env()
+        .and_then(|environment| environment.get("PATH").cloned())
+        .is_some_and(|path| {
+            let paths = std::env::split_paths(&path).collect::<Vec<_>>();
+            crate::core::process::resolve_command_in_paths("npm", &paths).is_some()
+        })
 }
 
 #[cfg(target_os = "windows")]
@@ -1009,44 +1123,97 @@ fn kimi_install_windows_command() -> String {
     )
 }
 
+#[cfg(target_os = "windows")]
+fn codebuddy_install_windows_command() -> String {
+    format!(
+        "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {}",
+        powershell_encoded_command(CODEBUDDY_INSTALL_WINDOWS_SCRIPT)
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn qoder_install_windows_command() -> String {
+    format!(
+        "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {}",
+        powershell_encoded_command(QODER_INSTALL_WINDOWS_SCRIPT)
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn qoder_cn_install_windows_command() -> String {
+    format!(
+        "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {}",
+        powershell_encoded_command(QODER_CN_INSTALL_WINDOWS_SCRIPT)
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn cursor_install_windows_command() -> String {
+    format!(
+        "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {}",
+        powershell_encoded_command(CURSOR_INSTALL_WINDOWS_SCRIPT)
+    )
+}
+
 /// Manual one-click install text for Settings (copyable). Matches backend install chains.
 pub fn manual_install_commands_text() -> String {
     #[cfg(target_os = "windows")]
     {
         format!(
             r#"# Claude Code + ACP adapter
-npm i -g @anthropic-ai/claude-code@latest
+{claude_npm}
 {claude_acp}
 # Codex + ACP adapter
-npm i -g @openai/codex@latest
+{codex_host}
 {codex_acp}
+# Cursor Agent CLI
+{cursor}
 # OpenCode
-npm i -g @opencode/cli@latest
-# OpenClaw
-npm i -g openclaw@latest
+{opencode_npm}
 # Pi + ACP adapter
 {pi_host}
 {pi_acp}
 # Hermes Agent
 {hermes}
+# Qoder CLI
+{qoder}
+# (or) {qoder_npm}
+# Qoder CN
+{qoder_cn}
+# (or) {qoder_cn_npm}
 # Grok Build
 {grok}
-# (or) npm i -g @xai-official/grok@latest
+# (or) {grok_npm}
 # Kimi Code
 {kimi}
-# (or) npm i -g @moonshot-ai/kimi-code@latest
+# (or) {kimi_npm}
 # MiniMax Code
 {minimax}
+# CodeBuddy Code
+{codebuddy}
+# (or) {codebuddy_npm}
 # Dsh (DeepSeek Harness, ACP via dsh --profile acp)
 {dsh}"#,
+            claude_npm = CLAUDE_NPM_INSTALL_COMMAND,
             claude_acp = CLAUDE_ACP_INSTALL_COMMAND,
+            codex_host = CODEX_HOST_INSTALL_COMMAND,
             codex_acp = CODEX_ACP_INSTALL_COMMAND,
+            cursor = cursor_install_windows_command(),
+            opencode_npm = OPENCODE_NPM_INSTALL_COMMAND,
             pi_host = PI_HOST_INSTALL_COMMAND,
             pi_acp = PI_ACP_INSTALL_COMMAND,
             hermes = hermes_install_windows_command(),
+            qoder = qoder_install_windows_command(),
+            qoder_npm = QODER_NPM_INSTALL_COMMAND,
+            qoder_cn = qoder_cn_install_windows_command(),
+            qoder_cn_npm = QODER_CN_NPM_INSTALL_COMMAND,
             grok = grok_install_windows_command(),
+            grok_npm = GROK_NPM_INSTALL_COMMAND,
             kimi = kimi_install_windows_command(),
+            kimi_npm = KIMI_NPM_INSTALL_COMMAND,
             minimax = MINIMAX_CODE_INSTALL_COMMAND,
+            codebuddy = codebuddy_install_windows_command(),
+            codebuddy_npm = CODEBUDDY_NPM_INSTALL_COMMAND,
             dsh = DSH_INSTALL_COMMAND,
         )
     }
@@ -1054,38 +1221,56 @@ npm i -g openclaw@latest
     {
         format!(
             r#"# Claude Code + ACP adapter
-{claude_host} || npm i -g @anthropic-ai/claude-code@latest
+{claude_host} || {claude_npm}
 {claude_acp}
 # Codex + ACP adapter
-npm i -g @openai/codex@latest
+{codex_host}
 {codex_acp}
+# Cursor Agent CLI
+{cursor}
 # OpenCode
-{opencode} || npm i -g @opencode/cli@latest
-# OpenClaw
-npm i -g openclaw@latest
+{opencode} || {opencode_npm}
 # Pi + ACP adapter
 {pi_host}
 {pi_acp}
 # Hermes Agent
 {hermes}
+# Qoder CLI
+{qoder} || {qoder_npm}
+# Qoder CN
+{qoder_cn} || {qoder_cn_npm}
 # Grok Build
-{grok} || npm i -g @xai-official/grok@latest
+{grok} || {grok_npm}
 # Kimi Code
-{kimi} || npm i -g @moonshot-ai/kimi-code@latest
+{kimi} || {kimi_npm}
 # MiniMax Code
 {minimax}
+# CodeBuddy Code
+{codebuddy} || {codebuddy_npm}
 # Dsh (DeepSeek Harness, ACP via dsh --profile acp)
 {dsh}"#,
             claude_host = CLAUDE_INSTALL_UNIX,
+            claude_npm = CLAUDE_NPM_INSTALL_COMMAND,
             claude_acp = CLAUDE_ACP_INSTALL_COMMAND,
+            codex_host = CODEX_HOST_INSTALL_COMMAND,
             codex_acp = CODEX_ACP_INSTALL_COMMAND,
+            cursor = CURSOR_INSTALL_UNIX,
             opencode = OPENCODE_INSTALL_UNIX,
+            opencode_npm = OPENCODE_NPM_INSTALL_COMMAND,
             pi_host = PI_HOST_INSTALL_COMMAND,
             pi_acp = PI_ACP_INSTALL_COMMAND,
             hermes = HERMES_INSTALL_UNIX,
+            qoder = QODER_INSTALL_UNIX,
+            qoder_npm = QODER_NPM_INSTALL_COMMAND,
+            qoder_cn = QODER_CN_INSTALL_UNIX,
+            qoder_cn_npm = QODER_CN_NPM_INSTALL_COMMAND,
             grok = GROK_INSTALL_UNIX,
+            grok_npm = GROK_NPM_INSTALL_COMMAND,
             kimi = KIMI_INSTALL_UNIX,
+            kimi_npm = KIMI_NPM_INSTALL_COMMAND,
             minimax = MINIMAX_CODE_INSTALL_COMMAND,
+            codebuddy = CODEBUDDY_INSTALL_UNIX,
+            codebuddy_npm = CODEBUDDY_NPM_INSTALL_COMMAND,
             dsh = DSH_INSTALL_COMMAND,
         )
     }
@@ -1098,6 +1283,7 @@ fn run_tool_lifecycle_silently(
     phase: &str,
     proxy_enabled: bool,
     proxy_url: &str,
+    npm_prefix: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let _guard = acquire_lifecycle_lock(app, task_id)?;
     check_lifecycle_cancelled(task_id)?;
@@ -1110,12 +1296,36 @@ fn run_tool_lifecycle_silently(
         cmd.arg("-c").arg(script);
         apply_proxy_env_to_command(&mut cmd, proxy_enabled, proxy_url);
         apply_npm_cache_env(&mut cmd, effective_npm_cache_dir().as_deref());
-        if let Some(login_path) = login_shell_path() {
-            let inherited = std::env::var("PATH").unwrap_or_default();
-            cmd.env("PATH", merge_path_segments(&login_path, &inherited));
+        if let Some(prefix) = npm_prefix {
+            cmd.env("npm_config_prefix", prefix);
         }
-        let output = run_command_with_cancellation(cmd, app, task_id, phase)
-            .map_err(format_lifecycle_process_error)?;
+        let shell_env = crate::core::process::discover::refresh_login_shell_env();
+        // Match `diagnose_host` / ACP spawn: nvm, fnm, Homebrew and the
+        // agent-specific user bins are often absent from both a GUI-launched
+        // process and a non-interactive login shell. Without them npm can be
+        // reported available by Doctor and still be `command not found` here.
+        let inherited = std::env::var("PATH").unwrap_or_default();
+        let base_path = shell_env
+            .as_ref()
+            .and_then(|env| env.get("PATH"))
+            .map_or(inherited.clone(), |login_path| {
+                merge_path_segments(login_path, &inherited)
+            });
+        let mut merged_paths = std::env::split_paths(&base_path).collect::<Vec<_>>();
+        for entry in path_entries() {
+            if !merged_paths.iter().any(|existing| existing == &entry) {
+                merged_paths.push(entry);
+            }
+        }
+        if let Ok(path) = std::env::join_paths(&merged_paths) {
+            cmd.env("PATH", path);
+        }
+        // Installers run npm/node; the AppImage's bundled libraries must not
+        // shadow the distro's when those child processes start (#1002).
+        cmd.sanitize_appimage_env();
+        let output = run_command_with_cancellation(cmd, app, task_id, phase);
+        crate::core::process::discover::invalidate_login_shell_env();
+        let output = output.map_err(format_lifecycle_process_error)?;
         check_lifecycle_cancelled(task_id)?;
         finish_lifecycle_output(&output)
     }
@@ -1129,10 +1339,14 @@ fn run_tool_lifecycle_silently(
         cmd.arg("/D")
             .arg("/C")
             .arg(&bat_file)
-            .env("PATH", merged_path)
-            .creation_flags(CREATE_NO_WINDOW);
+            .env("PATH", merged_path);
+        cmd.sanitize_appimage_env();
+        crate::core::process::hide_console_window(&mut cmd);
         apply_proxy_env_to_command(&mut cmd, proxy_enabled, proxy_url);
         apply_npm_cache_env(&mut cmd, effective_npm_cache_dir().as_deref());
+        if let Some(prefix) = npm_prefix {
+            cmd.env("npm_config_prefix", prefix);
+        }
         let output = run_command_with_cancellation(cmd, app, task_id, phase);
         let _ = fs::remove_file(&bat_file);
         check_lifecycle_cancelled(task_id)?;
@@ -1143,7 +1357,9 @@ fn run_tool_lifecycle_silently(
 /// Mirror `store::apply_proxy_to_agent`: inject HTTP_PROXY/HTTPS_PROXY/ALL_PROXY
 /// into the lifecycle child when the Agentero proxy is enabled, so curl/npm
 /// based installers (Kimi, Claude, Grok, Hermes, OpenCode, …)
-/// can reach the network through the user's configured proxy.
+/// can reach the network through the user's configured proxy. The loopback
+/// NO_PROXY bypass keeps install scripts that also talk to localhost (npm
+/// postinstall hooks, local registries) out of the proxy.
 fn apply_proxy_env_to_command(cmd: &mut Command, proxy_enabled: bool, proxy_url: &str) {
     for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
         cmd.env_remove(key);
@@ -1154,6 +1370,12 @@ fn apply_proxy_env_to_command(cmd: &mut Command, proxy_enabled: bool, proxy_url:
             for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
                 cmd.env(key, proxy_url);
             }
+            cmd.env(
+                "NO_PROXY",
+                crate::features::agent::models::merge_no_proxy(
+                    std::env::var("NO_PROXY").ok().as_ref(),
+                ),
+            );
         }
     }
 }
@@ -1227,11 +1449,7 @@ fn effective_npm_cache_dir() -> Option<std::path::PathBuf> {
 }
 
 fn managed_npm_cache_dir() -> std::path::PathBuf {
-    dirs::data_local_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("Agentero")
-        .join("npm-cache")
+    crate::core::paths::agentero_cache_dir().join("npm-cache")
 }
 
 /// True when `dir` exists (or can be created) and accepts a new file.
@@ -1288,14 +1506,12 @@ fn run_command_with_cancellation(
     phase: &str,
 ) -> io::Result<Output> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn()?;
+    let mut child = crate::core::process::BlockingProcessTree::spawn(&mut command)?;
     let mut stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .map(|mut pipe| thread::spawn(move || read_pipe_to_end(&mut pipe)));
     let mut stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .map(|mut pipe| thread::spawn(move || read_pipe_to_end(&mut pipe)));
     let started_at = Instant::now();
     let mut last_emit = Instant::now() - Duration::from_secs(1);
@@ -1327,7 +1543,7 @@ fn run_command_with_cancellation(
     }
 }
 
-fn emit_lifecycle_progress(
+pub(crate) fn emit_lifecycle_progress(
     app: Option<&AppHandle>,
     task_id: Option<&str>,
     phase: &str,
@@ -1462,26 +1678,6 @@ fn last_lines(text: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-/// GUI apps inherit a narrow PATH; install scripts need the login shell PATH
-/// so bare `npm` / `brew` resolve like a normal terminal session.
-#[cfg(not(target_os = "windows"))]
-fn login_shell_path() -> Option<String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let output = Command::new(&shell)
-        .args(["-lic", "printf '%s' \"$PATH\""])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path)
-    }
-}
-
 #[cfg(not(target_os = "windows"))]
 fn merge_path_segments(primary: &str, extra: &str) -> String {
     let mut seen = std::collections::HashSet::new();
@@ -1501,6 +1697,7 @@ fn merge_path_segments(primary: &str, extra: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn lifecycle_templates_match_catalog() {
@@ -1508,82 +1705,25 @@ mod tests {
             assert!(template_info(id).is_some(), "missing template {id}");
             assert!(supports_lifecycle(id));
         }
-        assert!(!supports_lifecycle("qodercli"));
+        assert!(supports_lifecycle("qodercli"));
         assert!(!supports_lifecycle("custom"));
     }
 
     #[test]
-    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
-    fn antigravity_lifecycle_has_registry_platform_and_managed_uninstall() {
-        // The registry manifest, not Agentero, decides version and archive URL
-        // (parsed in `registry::antigravity`).
-        assert!(antigravity::current_platform_key().is_some());
-        let info = uninstall_info("antigravity-acp").expect("antigravity uninstall");
-        assert!(info.agent.npm_commands.is_empty());
-        assert_eq!(
-            info.acp.dirs,
-            vec![antigravity_install_dir().display().to_string()]
-        );
-        assert!(template_info("antigravity-acp")
-            .expect("antigravity template")
-            .command
-            .ends_with(antigravity_server_name()));
-    }
-
-    #[test]
-    fn antigravity_zip_extraction_rejects_traversal_and_keeps_runtime_files() {
-        use std::io::Write;
-        let mut bytes = Vec::new();
-        {
-            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
-            let options = zip::write::SimpleFileOptions::default();
-            writer.start_file("agy_acp_server.par", options).unwrap();
-            writer.write_all(b"server").unwrap();
-            writer.start_file("localharness_external", options).unwrap();
-            writer.write_all(b"helper").unwrap();
-            writer.finish().unwrap();
-        }
-        let root = tempfile::tempdir().unwrap();
-        extract_antigravity_zip(&bytes, root.path()).unwrap();
-        assert!(root.path().join("agy_acp_server.par").is_file());
-        assert!(has_localharness_external(root.path()));
-
-        let mut unsafe_bytes = Vec::new();
-        {
-            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut unsafe_bytes));
-            let options = zip::write::SimpleFileOptions::default();
-            writer.start_file("../escape", options).unwrap();
-            writer.write_all(b"bad").unwrap();
-            writer.finish().unwrap();
-        }
-        assert!(extract_antigravity_zip(&unsafe_bytes, root.path()).is_err());
-    }
-
-    #[test]
-    fn antigravity_install_swap_replaces_managed_copy() {
-        let root = tempfile::tempdir().unwrap();
-        let install = root.path().join("antigravity-acp");
-        let staging = root.path().join(".staging");
-        std::fs::create_dir_all(&install).unwrap();
-        std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(install.join("version"), b"old").unwrap();
-        std::fs::write(staging.join("version"), b"new").unwrap();
-        antigravity::write_version_marker(&staging, "1.2.0").unwrap();
-        replace_antigravity_install(&staging, &install).unwrap();
-        assert_eq!(std::fs::read(install.join("version")).unwrap(), b"new");
-        // The release marker travels with the swapped payload, so the Settings
-        // version check sees it without running the server.
-        assert_eq!(
-            antigravity::installed_version_in(&install).as_deref(),
-            Some("1.2.0")
-        );
-        assert!(!staging.exists());
+    fn antigravity_has_no_lifecycle_support() {
+        assert!(!supports_lifecycle("antigravity-acp"));
+        let template = template_info("antigravity-acp").expect("antigravity template");
+        assert_eq!(template.command, "agy");
+        assert_eq!(template.args, vec!["acp"]);
+        assert_eq!(template.detect_command.as_deref(), Some("agy"));
+        assert!(template.install_command.is_none());
+        assert!(host_install_command("antigravity-acp").is_err());
     }
 
     #[test]
     fn host_install_nonempty() {
         for id in LIFECYCLE_TEMPLATES {
-            if *id == "antigravity-acp" {
+            if *id == "zcode" {
                 continue;
             }
             let cmd = host_install_command(id).expect(id);
@@ -1594,15 +1734,6 @@ mod tests {
             );
             assert!(!cmd.contains("curl|bash"), "{id}");
         }
-    }
-
-    #[test]
-    fn antigravity_has_no_shell_install_command() {
-        assert!(template_info("antigravity-acp")
-            .expect("antigravity template")
-            .install_command
-            .is_none());
-        assert!(host_install_command("antigravity-acp").is_err());
     }
 
     #[test]
@@ -1636,6 +1767,9 @@ mod tests {
             .unwrap()
             .contains("codex-acp"));
         assert!(adapter_install_command("pi").unwrap().contains("pi-acp"));
+        assert!(adapter_install_command("zcode")
+            .unwrap()
+            .contains("zcode-acp-server"));
     }
 
     /// Codex was the last adapter installed into the global npm prefix on Unix,
@@ -1657,6 +1791,103 @@ mod tests {
             install.contains("--prefix"),
             uninstall.contains("--prefix"),
             "codex-acp uninstall must mirror the install prefix: {uninstall}"
+        );
+    }
+
+    /// The host CLI is a separate npm package from the adapter. `@openai/codex`
+    /// kept the bare global install after 7c76448a4 fixed the adapter, so macOS
+    /// users with the root-owned `/usr/local` prefix still hit EPERM (#791).
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn codex_host_commands_share_the_user_prefix() {
+        let uninstall = uninstall_info("codex-acp").unwrap().agent.npm_commands[0].clone();
+        for command in [
+            host_install_command("codex-acp").unwrap(),
+            host_update_command("codex-acp").unwrap(),
+            uninstall,
+        ] {
+            assert!(
+                command.contains("@openai/codex") && command.contains("--prefix \"$HOME/.local\""),
+                "codex host install/update/uninstall must all target the user prefix: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn npm_guard_only_covers_pure_npm_commands() {
+        assert!(command_needs_npm("npm i -g @openai/codex@latest"));
+        assert!(command_needs_npm(
+            "npm i -g @openai/codex@latest && npm i -g @agentclientprotocol/codex-acp@latest"
+        ));
+        assert!(!command_needs_npm(
+            "bash -c 'curl -fsSL https://example.test/install.sh | bash' || npm i -g foo"
+        ));
+        assert!(!command_needs_npm(""));
+    }
+
+    /// Every npm global install/uninstall on Unix must use the user prefix.
+    /// The macOS pkg installer leaves npm's prefix at the root-owned
+    /// `/usr/local`, where a bare `npm i -g` fails with EPERM (#791).
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unix_npm_lifecycle_commands_use_the_user_prefix() {
+        let mut checked = 0;
+        let mut check = |command: &str| {
+            for segment in command.split(|c| ['&', '|', '\n', ';'].contains(&c)) {
+                let segment = segment.trim().trim_start_matches('#').trim();
+                if segment.starts_with("npm i -g")
+                    || segment.starts_with("npm install --global")
+                    || segment.starts_with("npm uninstall -g")
+                {
+                    checked += 1;
+                    assert!(
+                        segment.contains("--prefix \"$HOME/.local\""),
+                        "npm command must target the user prefix: {segment}"
+                    );
+                }
+            }
+        };
+
+        for id in [
+            "claude-acp",
+            "codex-acp",
+            "opencode",
+            "hermes",
+            "qodercli",
+            "qoder-cn",
+            "grok-build",
+            "pi",
+            "dsh",
+            "kimi-code",
+            "minimax-code",
+            "mimo-code",
+            "zcode",
+            "codebuddy",
+        ] {
+            if let Ok(command) = host_install_command(id) {
+                check(&command);
+            }
+            if let Ok(command) = host_update_command(id) {
+                check(&command);
+            }
+            if let Some(info) = uninstall_info(id) {
+                for command in info
+                    .agent
+                    .npm_commands
+                    .iter()
+                    .chain(info.acp.npm_commands.iter())
+                {
+                    check(command);
+                }
+            }
+        }
+        for id in ["claude-acp", "codex-acp", "pi", "zcode"] {
+            check(&adapter_install_command(id).unwrap());
+        }
+        check(&manual_install_commands_text());
+        assert!(
+            checked >= 20,
+            "expected to inspect the full npm lifecycle matrix, saw {checked} commands"
         );
     }
 
@@ -1694,11 +1925,12 @@ mod tests {
         let text = manual_install_commands_text();
         assert!(text.contains("Claude"));
         assert!(text.contains("OpenCode"));
-        assert!(text.contains("OpenClaw"));
         assert!(text.contains("Hermes"));
+        assert!(text.contains("Qoder"));
         assert!(text.contains("Grok"));
         assert!(text.contains("Pi"));
         assert!(text.contains("Kimi"));
+        assert!(text.contains("CodeBuddy"));
         assert!(text.contains("Dsh"));
     }
 
@@ -1749,6 +1981,187 @@ mod tests {
     }
 
     #[test]
+    fn qoder_install_prefers_official_script_with_npm_fallback() {
+        let cmd = host_install_command("qodercli").expect("qoder install");
+        let script = if cfg!(target_os = "windows") {
+            decode_encoded_commands(&cmd)
+        } else {
+            cmd.clone()
+        };
+        assert!(
+            script.contains("qoder.com/install"),
+            "qoder install must use the official script: {script}"
+        );
+        assert!(
+            !script.contains("curl | bash"),
+            "must not pipe curl to bash"
+        );
+        assert!(
+            cmd.contains("@qoder-ai/qodercli"),
+            "qoder install must fall back to npm: {cmd}"
+        );
+        let update = host_update_command("qodercli").expect("qoder update");
+        let update_text = if cfg!(target_os = "windows") {
+            format!("{update}\n{}", decode_encoded_commands(&update))
+        } else {
+            update.clone()
+        };
+        assert!(
+            update_text.contains("qodercli update"),
+            "qoder update must try the built-in updater: {update_text}"
+        );
+        assert!(
+            update_text.contains("qoder.com/install"),
+            "qoder update must fall back to the official installer: {update_text}"
+        );
+        let info = uninstall_info("qodercli").expect("qoder uninstall");
+        assert!(info
+            .agent
+            .npm_commands
+            .iter()
+            .any(|c| c.contains("@qoder-ai/qodercli")));
+        let dirs: Vec<String> = info
+            .agent
+            .dirs
+            .iter()
+            .map(|dir| dir.replace('\\', "/"))
+            .collect();
+        assert!(dirs.iter().any(|dir| dir.ends_with(".qoder/bin/qodercli")));
+        assert!(dirs.iter().any(|dir| dir.ends_with(".qoder/entry")));
+        assert!(dirs.iter().any(|dir| dir.ends_with(".local/bin/qodercli")));
+        assert!(dirs.iter().all(|dir| {
+            let name = std::path::Path::new(dir)
+                .file_name()
+                .and_then(|name| name.to_str());
+            name != Some(".qoder") && name != Some(".local") && name != Some("bin")
+        }));
+        #[cfg(target_os = "windows")]
+        {
+            assert!(dirs
+                .iter()
+                .any(|dir| dir.ends_with(".local/bin/qodercli.exe")));
+            assert!(dirs
+                .iter()
+                .any(|dir| dir.ends_with(".local/bin/qodercli.cmd")));
+        }
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(dirs.len(), 3);
+    }
+
+    #[test]
+    fn qoder_cn_install_prefers_official_script_with_npm_fallback() {
+        let cmd = host_install_command("qoder-cn").expect("Qoder CN install");
+        let script = if cfg!(target_os = "windows") {
+            decode_encoded_commands(&cmd)
+        } else {
+            cmd.clone()
+        };
+        assert!(
+            script.contains("static.qoder.com.cn/qoder-cli-cn/install"),
+            "Qoder CN install must use the official script: {script}"
+        );
+        assert!(
+            !script.contains("curl | bash"),
+            "must not pipe curl to bash"
+        );
+        assert!(
+            cmd.contains("@qodercn-ai/qoderclicn"),
+            "Qoder CN install must fall back to npm: {cmd}"
+        );
+        let update = host_update_command("qoder-cn").expect("Qoder CN update");
+        assert!(
+            update.contains("qodercn update"),
+            "Qoder CN update must try the built-in updater: {update}"
+        );
+        let info = uninstall_info("qoder-cn").expect("Qoder CN uninstall");
+        assert!(info
+            .agent
+            .npm_commands
+            .iter()
+            .any(|c| c.contains("@qodercn-ai/qoderclicn")));
+        let dirs: Vec<String> = info
+            .agent
+            .dirs
+            .iter()
+            .map(|dir| dir.replace('\\', "/"))
+            .collect();
+        assert!(dirs
+            .iter()
+            .any(|dir| dir.ends_with(".qoder-cn/bin/qoderclicn")));
+        assert!(dirs.iter().any(|dir| dir.ends_with(".qoder-cn/entry")));
+        assert!(dirs.iter().all(|dir| {
+            let name = std::path::Path::new(dir)
+                .file_name()
+                .and_then(|name| name.to_str());
+            name != Some(".qoder-cn") && name != Some(".local") && name != Some("bin")
+        }));
+        #[cfg(not(target_os = "windows"))]
+        assert!(dirs
+            .iter()
+            .any(|dir| dir.ends_with(".local/bin/qoderclicn")));
+    }
+
+    #[test]
+    fn remove_managed_path_removes_file_and_directory_and_ignores_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "agentero-managed-path-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("dir")).unwrap();
+        fs::write(root.join("dir").join("f"), b"x").unwrap();
+        fs::write(root.join("file"), b"y").unwrap();
+
+        remove_managed_path(&root.join("dir")).unwrap();
+        remove_managed_path(&root.join("file")).unwrap();
+        remove_managed_path(&root.join("absent")).unwrap();
+
+        assert!(!root.join("dir").exists());
+        assert!(!root.join("file").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_managed_path_unlinks_symlink_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "agentero-qoder-unlink-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("shared-bin")).unwrap();
+        fs::create_dir_all(root.join("versioned")).unwrap();
+        let binary = root.join("versioned").join("qodercli-1");
+        fs::write(&binary, b"bin").unwrap();
+        let link = root.join("shared-bin").join("qodercli");
+        symlink(&binary, &link).unwrap();
+        let dangling = root.join("shared-bin").join("gone");
+        symlink(root.join("missing-target"), &dangling).unwrap();
+
+        remove_managed_path(&link).unwrap();
+        remove_managed_path(&dangling).unwrap();
+
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert!(fs::symlink_metadata(&dangling).is_err());
+        assert!(
+            binary.exists(),
+            "unlinking the shim must not delete its target"
+        );
+        assert!(root.join("shared-bin").is_dir());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn dsh_install_uses_global_npm_package() {
         let cmd = host_install_command("dsh").expect("dsh install");
         assert!(cmd.contains("@deepseek-ai/dsh@latest"), "{cmd}");
@@ -1773,6 +2186,73 @@ mod tests {
 
         let update = host_update_command("minimax-code").expect("MiniMax Code update");
         assert_eq!(update, cmd);
+    }
+
+    #[test]
+    fn mimo_install_update_and_uninstall_use_the_npm_package() {
+        let cmd = host_install_command("mimo-code").expect("MiMo Code install");
+        assert!(cmd.contains("mimocode"), "{cmd}");
+        let update = host_update_command("mimo-code").expect("MiMo Code update");
+        assert_eq!(update, cmd);
+        assert!(supports_lifecycle("mimo-code"));
+        let info = uninstall_info("mimo-code").expect("MiMo Code uninstall");
+        assert_eq!(
+            info.agent.npm_commands,
+            vec![npm_uninstall_global("mimocode")]
+        );
+    }
+
+    #[test]
+    fn codebuddy_install_prefers_official_script_with_npm_fallback() {
+        let cmd = host_install_command("codebuddy").expect("CodeBuddy install");
+        let script = if cfg!(target_os = "windows") {
+            decode_encoded_commands(&cmd)
+        } else {
+            cmd.clone()
+        };
+        assert!(
+            script.contains("copilot.tencent.com/cli/install"),
+            "CodeBuddy install must use the official script: {script}"
+        );
+        assert!(
+            !script.contains("curl | bash"),
+            "must not pipe curl to bash"
+        );
+        assert!(
+            cmd.contains("@tencent-ai/codebuddy-code"),
+            "CodeBuddy install must fall back to npm: {cmd}"
+        );
+        let update = host_update_command("codebuddy").expect("CodeBuddy update");
+        let update_text = if cfg!(target_os = "windows") {
+            format!("{update}\n{}", decode_encoded_commands(&update))
+        } else {
+            update.clone()
+        };
+        assert!(
+            update_text.contains("codebuddy update"),
+            "CodeBuddy update must try the built-in updater: {update_text}"
+        );
+        assert!(
+            update_text.contains("copilot.tencent.com/cli/install"),
+            "CodeBuddy update must fall back to the official installer: {update_text}"
+        );
+        let info = uninstall_info("codebuddy").expect("CodeBuddy uninstall");
+        assert_eq!(
+            info.agent.npm_commands,
+            vec![npm_uninstall_global("@tencent-ai/codebuddy-code")]
+        );
+        let dirs: Vec<String> = info
+            .agent
+            .dirs
+            .iter()
+            .map(|dir| dir.replace('\\', "/"))
+            .collect();
+        #[cfg(target_os = "windows")]
+        assert!(dirs
+            .iter()
+            .any(|dir| dir.ends_with("AppData/Local/codebuddy/bin")));
+        #[cfg(not(target_os = "windows"))]
+        assert!(dirs.iter().any(|dir| dir.ends_with(".local/bin/codebuddy")));
     }
 
     #[test]
@@ -1828,7 +2308,8 @@ mod tests {
                 assert!(!cmd.contains("@latest"), "{id}: {cmd}");
             }
         }
-        assert!(uninstall_info("qodercli").is_none());
+        assert!(uninstall_info("qodercli").is_some());
+        assert!(uninstall_info("qoder-cn").is_some());
         assert!(uninstall_info("custom").is_none());
     }
 
@@ -1905,6 +2386,13 @@ mod tests {
             kimi.agent.dirs,
             vec![kimi_launcher_dir().display().to_string()]
         );
+        let zcode = uninstall_info("zcode").unwrap();
+        assert!(zcode.agent.npm_commands.is_empty());
+        assert!(zcode
+            .acp
+            .npm_commands
+            .iter()
+            .any(|c| c.contains("zcode-acp-server")));
     }
 
     #[test]
@@ -1926,61 +2414,66 @@ mod tests {
         assert_eq!(all.npm_commands.len(), 2);
     }
 
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn best_effort_chain_windows_echo() {
-        let chain = best_effort_chain(&["npm uninstall -g a".to_string()]);
-        assert_eq!(chain, "npm uninstall -g a || echo skip");
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn best_effort_chain_unix_true() {
-        let chain = best_effort_chain(&[
-            "npm uninstall -g a".to_string(),
-            "npm uninstall -g b".to_string(),
-        ]);
-        assert_eq!(
-            chain,
-            "npm uninstall -g a || true; npm uninstall -g b || true"
-        );
+    /// `Some(None)` means the child variable is explicitly removed.
+    fn configured_var(cmd: &std::process::Command, key: &str) -> Option<Option<String>> {
+        cmd.get_envs().find_map(|(name, value)| {
+            name.to_string_lossy()
+                .eq_ignore_ascii_case(key)
+                .then(|| value.map(|value| value.to_string_lossy().into_owned()))
+        })
     }
 
     #[test]
     fn proxy_env_is_injected_into_lifecycle_command() {
-        let mut cmd = std::process::Command::new("env");
+        let mut cmd = std::process::Command::new("agentero");
         apply_proxy_env_to_command(&mut cmd, true, "http://127.0.0.1:7890");
-        let output = cmd.output().expect("run env");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("HTTP_PROXY=http://127.0.0.1:7890"));
-        assert!(stdout.contains("HTTPS_PROXY=http://127.0.0.1:7890"));
-        assert!(stdout.contains("ALL_PROXY=http://127.0.0.1:7890"));
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+            assert_eq!(
+                configured_var(&cmd, key),
+                Some(Some("http://127.0.0.1:7890".to_string())),
+                "{key}"
+            );
+        }
+        // Loopback bypass keeps localhost traffic out of the proxy. The ambient
+        // NO_PROXY list is preserved, so only assert membership, not order.
+        let no_proxy = configured_var(&cmd, "NO_PROXY")
+            .expect("NO_PROXY is set")
+            .expect("NO_PROXY is not removed");
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            assert!(
+                no_proxy
+                    .split(',')
+                    .any(|entry| entry.eq_ignore_ascii_case(host)),
+                "NO_PROXY must bypass {host}: {no_proxy}"
+            );
+        }
     }
 
     #[test]
     fn proxy_env_is_cleared_when_disabled() {
-        let mut cmd = std::process::Command::new("env");
-        // Start with a proxy var in the inherited env.
+        let mut cmd = std::process::Command::new("agentero");
+        // Start with a proxy var that the disabled proxy must take back off.
         cmd.env("HTTP_PROXY", "http://old");
         apply_proxy_env_to_command(&mut cmd, false, "http://127.0.0.1:7890");
-        let output = cmd.output().expect("run env");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(!stdout.contains("HTTP_PROXY"));
-        assert!(!stdout.contains("HTTPS_PROXY"));
-        assert!(!stdout.contains("ALL_PROXY"));
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+            assert_eq!(
+                configured_var(&cmd, key),
+                Some(None),
+                "{key} must be removed from the child"
+            );
+        }
     }
 
     #[test]
     fn npm_cache_env_keeps_a_writable_default() {
         let writable = std::env::temp_dir().join("agentero-npm-cache-test-ok");
         fs::create_dir_all(&writable).expect("create probe dir");
-        let mut cmd = std::process::Command::new("env");
+        let mut cmd = std::process::Command::new("agentero");
         apply_npm_cache_env(&mut cmd, Some(&writable));
-        let output = cmd.output().expect("run env");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            !stdout.contains("npm_config_cache="),
-            "a healthy cache must be left alone: {stdout}"
+        assert_eq!(
+            configured_var(&cmd, "npm_config_cache"),
+            None,
+            "a healthy cache must be left alone"
         );
         let _ = fs::remove_dir_all(&writable);
     }
@@ -2002,13 +2495,13 @@ mod tests {
     fn npm_cache_env_injects_managed_cache_when_default_unwritable() {
         let file = std::env::temp_dir().join("agentero-npm-cache-test-file-2");
         fs::write(&file, b"x").expect("write probe file");
-        let mut cmd = std::process::Command::new("env");
+        let mut cmd = std::process::Command::new("agentero");
         apply_npm_cache_env(&mut cmd, Some(&file));
-        let output = cmd.output().expect("run env");
-        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains("npm_config_cache="),
-            "unwritable default must be replaced: {stdout}"
+            configured_var(&cmd, "npm_config_cache")
+                .and_then(|value| value)
+                .is_some(),
+            "unwritable default must be replaced"
         );
         let _ = fs::remove_file(&file);
     }

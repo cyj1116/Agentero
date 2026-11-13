@@ -1,9 +1,19 @@
 //! Open the system default terminal at a local path, or with a confirm-then-run command.
 
 use crate::core::error::AppError;
+use crate::core::process::SanitizeAppImageEnv;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Terminal launchers inherit the Host environment, including any loader paths
+/// an AppImage injected. Strip them so a node/npm started in the new terminal
+/// loads the distribution's libraries (#1002).
+fn sanitized_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.sanitize_appimage_env();
+    command
+}
 
 #[cfg(all(unix, not(target_os = "macos")))]
 type TerminalCommandFactory = fn(&str) -> Command;
@@ -29,14 +39,39 @@ pub fn terminal_cwd_for_path(path: &Path) -> Result<PathBuf, AppError> {
 }
 
 /// Open the system default terminal with cwd at `path` (or its parent if a file).
-pub fn open_in_terminal(path: &Path) -> Result<PathBuf, AppError> {
+///
+/// `preferred` is a preset id from Settings; empty means the system default.
+/// A missing or failing preset logs and falls back to the system default so the
+/// action never fails just because a terminal was uninstalled.
+pub fn open_in_terminal(path: &Path, preferred: &str) -> Result<PathBuf, AppError> {
     let cwd = terminal_cwd_for_path(path)?;
+    let preferred = preferred.trim();
+    if !preferred.is_empty() {
+        log::debug!(
+            target: "agentero::terminal",
+            "opening '{preferred}' at {}",
+            cwd.display()
+        );
+        match presets::launch(preferred, &cwd) {
+            Ok(()) => return Ok(cwd),
+            Err(error) => log::warn!(
+                target: "agentero::terminal",
+                "preferred terminal '{preferred}' unavailable, using system default: {error}"
+            ),
+        }
+    } else {
+        log::debug!(
+            target: "agentero::terminal",
+            "no terminal preference, opening system default at {}",
+            cwd.display()
+        );
+    }
     open_terminal_at(&cwd)?;
     Ok(cwd)
 }
 
-/// Copy shown inside a confirm-to-run terminal (banner title, post-run hint and
-/// temp script name prefix), so install and login flows read correctly.
+/// Copy and temp-script identity shared by terminal launches (banner title for
+/// confirm-to-run flows, post-run hint and temp script name prefix).
 struct ConfirmCopy {
     /// Temp script file prefix ("install" / "login").
     stem: &'static str,
@@ -74,21 +109,52 @@ const CONFIRM_LOGIN: ConfirmCopy = ConfirmCopy {
     done_hint: "Done. Agentero will re-check the login status automatically.",
 };
 
+#[cfg(windows)]
+const CONFIRM_AGENT_CLI: ConfirmCopy = ConfirmCopy {
+    stem: "agent-cli",
+    title: "Agentero - agent CLI",
+    done_hint: "Agent CLI session ended. You can close this window.",
+};
+
+#[cfg(not(windows))]
+const CONFIRM_AGENT_CLI: ConfirmCopy = ConfirmCopy {
+    stem: "agent-cli",
+    title: "Agentero — agent CLI",
+    done_hint: "Agent CLI session ended. You can close this window.",
+};
+
+/// How the terminal should run the command: `Confirm` prints it and waits for
+/// Enter, `Direct` runs it immediately.
+#[derive(Clone, Copy)]
+enum RunMode {
+    Confirm,
+    Direct,
+}
+
 /// Open a system terminal that prints `command`, waits for Enter (or Ctrl+C), then runs it.
 ///
 /// Used for guided installs (e.g. Claude ACP adapter). The shell never auto-runs without
 /// confirmation. Only trusted Host-side callers should pass commands.
 pub fn open_terminal_confirm_command(command: &str) -> Result<(), AppError> {
-    confirm_script(command, &CONFIRM_INSTALL)
+    run_terminal_script(command, &CONFIRM_INSTALL, RunMode::Confirm)
 }
 
 /// Same confirm-to-run terminal as [`open_terminal_confirm_command`], worded for
 /// agent CLI OAuth login flows (e.g. `codex login`, `claude auth login`).
 pub fn open_terminal_confirm_login(command: &str) -> Result<(), AppError> {
-    confirm_script(command, &CONFIRM_LOGIN)
+    run_terminal_script(command, &CONFIRM_LOGIN, RunMode::Confirm)
 }
 
-fn confirm_script(command: &str, copy: &ConfirmCopy) -> Result<(), AppError> {
+/// Open a system terminal that immediately launches an installed Agent's
+/// interactive CLI (e.g. `claude`, `codex`).
+///
+/// No Enter gate: the click is an explicit launch of the user's own installed
+/// CLI, not an unattended installer.
+pub fn open_terminal_agent_cli(command: &str) -> Result<(), AppError> {
+    run_terminal_script(command, &CONFIRM_AGENT_CLI, RunMode::Direct)
+}
+
+fn run_terminal_script(command: &str, copy: &ConfirmCopy, mode: RunMode) -> Result<(), AppError> {
     let command = command.trim();
     if command.is_empty() {
         return Err(AppError::message("command is required"));
@@ -100,11 +166,11 @@ fn confirm_script(command: &str, copy: &ConfirmCopy) -> Result<(), AppError> {
 
     #[cfg(windows)]
     {
-        open_terminal_confirm_command_windows(command, copy)
+        open_terminal_command_windows(command, copy, mode)
     }
     #[cfg(not(windows))]
     {
-        open_terminal_confirm_command_unix(command, copy)
+        open_terminal_command_unix(command, copy, mode)
     }
 }
 
@@ -147,7 +213,7 @@ pub fn open_terminal_confirm_remote_install(
     {
         // Single remote command string so the whole npm line is the -c payload.
         let command = format!("ssh -t {destination} -- \"bash -lc {install_command:?}\"");
-        open_terminal_confirm_command_windows(&command, &CONFIRM_INSTALL)
+        open_terminal_command_windows(&command, &CONFIRM_INSTALL, RunMode::Confirm)
     }
     #[cfg(not(windows))]
     {
@@ -192,7 +258,7 @@ status=$?
 echo ""
 if [ "$status" -eq 0 ]; then
   echo "Done. Verifying on remote…"
-  ssh -T "$DEST" "bash -lc $(printf '%q' 'command -v claude-agent-acp || command -v opencode || command -v openclaw || command -v hermes || true; ls -la \"$HOME/.local/bin\" 2>/dev/null | head -20')" || true
+  ssh -T "$DEST" "bash -lc $(printf '%q' 'command -v claude-agent-acp || command -v opencode || command -v hermes || true; ls -la \"$HOME/.local/bin\" 2>/dev/null | head -20')" || true
   echo ""
   echo "Return to Agentero → Settings → Agent and click Refresh."
 else
@@ -220,7 +286,7 @@ echo "You can close this window."
     #[cfg(target_os = "macos")]
     {
         let apple = format!("tell application \"Terminal\" to do script \"bash '{script}'\"");
-        let status = Command::new("osascript")
+        let status = sanitized_command("osascript")
             .arg("-e")
             .arg(&apple)
             .status()
@@ -230,7 +296,7 @@ echo "You can close this window."
                 "failed to open Terminal (exit {status})"
             )));
         }
-        let _ = Command::new("osascript")
+        let _ = sanitized_command("osascript")
             .args(["-e", "tell application \"Terminal\" to activate"])
             .status();
         return Ok(());
@@ -239,7 +305,7 @@ echo "You can close this window."
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let bash_cmd = format!("bash '{script}'; exec bash");
-        if Command::new("xdg-terminal-exec")
+        if sanitized_command("xdg-terminal-exec")
             .args(["bash", "-lc", &bash_cmd])
             .spawn()
             .is_ok()
@@ -248,7 +314,7 @@ echo "You can close this window."
         }
         if let Ok(term) = std::env::var("TERMINAL") {
             if !term.is_empty()
-                && Command::new(&term)
+                && sanitized_command(&term)
                     .args(["-e", "bash", "-lc", &bash_cmd])
                     .spawn()
                     .is_ok()
@@ -266,15 +332,19 @@ echo "You can close this window."
 }
 
 #[cfg(not(windows))]
-fn open_terminal_confirm_command_unix(command: &str, copy: &ConfirmCopy) -> Result<(), AppError> {
-    let script_path = write_confirm_script_unix(command, copy)?;
+fn open_terminal_command_unix(
+    command: &str,
+    copy: &ConfirmCopy,
+    mode: RunMode,
+) -> Result<(), AppError> {
+    let script_path = write_terminal_script_unix(command, copy, mode)?;
     let script = script_path.to_string_lossy().replace('\'', "'\\''");
 
     #[cfg(target_os = "macos")]
     {
-        // Terminal.app: run the script in a new window (user must press Enter to install).
+        // Terminal.app: run the script in a new window.
         let apple = format!("tell application \"Terminal\" to do script \"bash '{script}'\"");
-        let status = Command::new("osascript")
+        let status = sanitized_command("osascript")
             .arg("-e")
             .arg(&apple)
             .status()
@@ -285,7 +355,7 @@ fn open_terminal_confirm_command_unix(command: &str, copy: &ConfirmCopy) -> Resu
             )));
         }
         // Bring Terminal to front.
-        let _ = Command::new("osascript")
+        let _ = sanitized_command("osascript")
             .args(["-e", "tell application \"Terminal\" to activate"])
             .status();
         return Ok(());
@@ -294,7 +364,7 @@ fn open_terminal_confirm_command_unix(command: &str, copy: &ConfirmCopy) -> Resu
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let bash_cmd = format!("bash '{script}'; exec bash");
-        if Command::new("xdg-terminal-exec")
+        if sanitized_command("xdg-terminal-exec")
             .args(["bash", "-lc", &bash_cmd])
             .spawn()
             .is_ok()
@@ -303,7 +373,7 @@ fn open_terminal_confirm_command_unix(command: &str, copy: &ConfirmCopy) -> Resu
         }
         if let Ok(term) = std::env::var("TERMINAL") {
             if !term.is_empty()
-                && Command::new(&term)
+                && sanitized_command(&term)
                     .args(["-e", "bash", "-lc", &bash_cmd])
                     .spawn()
                     .is_ok()
@@ -313,32 +383,32 @@ fn open_terminal_confirm_command_unix(command: &str, copy: &ConfirmCopy) -> Resu
         }
         let candidates: &[(&str, TerminalCommandFactory)] = &[
             ("gnome-terminal", |c| {
-                let mut cmd = Command::new("gnome-terminal");
+                let mut cmd = sanitized_command("gnome-terminal");
                 cmd.args(["--", "bash", "-lc", c]);
                 cmd
             }),
             ("konsole", |c| {
-                let mut cmd = Command::new("konsole");
+                let mut cmd = sanitized_command("konsole");
                 cmd.args(["-e", "bash", "-lc", c]);
                 cmd
             }),
             ("xfce4-terminal", |c| {
-                let mut cmd = Command::new("xfce4-terminal");
+                let mut cmd = sanitized_command("xfce4-terminal");
                 cmd.args(["-e", &format!("bash -lc {c:?}")]);
                 cmd
             }),
             ("alacritty", |c| {
-                let mut cmd = Command::new("alacritty");
+                let mut cmd = sanitized_command("alacritty");
                 cmd.args(["-e", "bash", "-lc", c]);
                 cmd
             }),
             ("kitty", |c| {
-                let mut cmd = Command::new("kitty");
+                let mut cmd = sanitized_command("kitty");
                 cmd.args(["bash", "-lc", c]);
                 cmd
             }),
             ("x-terminal-emulator", |c| {
-                let mut cmd = Command::new("x-terminal-emulator");
+                let mut cmd = sanitized_command("x-terminal-emulator");
                 cmd.args(["-e", "bash", "-lc", c]);
                 cmd
             }),
@@ -359,7 +429,11 @@ fn open_terminal_confirm_command_unix(command: &str, copy: &ConfirmCopy) -> Resu
 }
 
 #[cfg(not(windows))]
-fn write_confirm_script_unix(command: &str, copy: &ConfirmCopy) -> Result<PathBuf, AppError> {
+fn write_terminal_script_unix(
+    command: &str,
+    copy: &ConfirmCopy,
+    mode: RunMode,
+) -> Result<PathBuf, AppError> {
     let dir = std::env::temp_dir().join("agentero-install");
     fs::create_dir_all(&dir)
         .map_err(|e| AppError::message(format!("failed to create temp dir: {e}")))?;
@@ -368,8 +442,9 @@ fn write_confirm_script_unix(command: &str, copy: &ConfirmCopy) -> Result<PathBu
     let quoted = command.replace('\'', "'\\''");
     let title = copy.title;
     let done_hint = copy.done_hint;
-    let body = format!(
-        r#"#!/usr/bin/env bash
+    let body = match mode {
+        RunMode::Confirm => format!(
+            r#"#!/usr/bin/env bash
 set +e
 echo ""
 echo "{title}"
@@ -390,9 +465,16 @@ else
 fi
 echo "You can close this window."
 "#
-    );
+        ),
+        RunMode::Direct => format!(
+            r#"#!/usr/bin/env bash
+set +e
+bash -lc '{quoted}'
+"#
+        ),
+    };
     fs::write(&path, body)
-        .map_err(|e| AppError::message(format!("failed to write install script: {e}")))?;
+        .map_err(|e| AppError::message(format!("failed to write script: {e}")))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -407,9 +489,10 @@ echo "You can close this window."
 }
 
 #[cfg(windows)]
-fn open_terminal_confirm_command_windows(
+fn open_terminal_command_windows(
     command: &str,
     copy: &ConfirmCopy,
+    mode: RunMode,
 ) -> Result<(), AppError> {
     let dir = std::env::temp_dir().join("agentero-install");
     fs::create_dir_all(&dir)
@@ -417,13 +500,23 @@ fn open_terminal_confirm_command_windows(
     let path = dir.join(format!("{}-{}.cmd", copy.stem, std::process::id()));
     let title = copy.title;
     let done_hint = copy.done_hint;
-    // Escape ^ and & for cmd.exe display; the install command itself is simple npm.
-    let body = format!(
-        "@echo off\r\n\
+    // The display `echo` line must not execute the command's shell syntax:
+    // escape cmd metacharacters for display only. The run line below stays
+    // raw so multi-statement logins (`mkdir … & if not exist … echo …> …`)
+    // keep working.
+    let display = command
+        .replace('^', "^^")
+        .replace('&', "^&")
+        .replace('>', "^>")
+        .replace('|', "^|")
+        .replace('<', "^<");
+    let body = match mode {
+        RunMode::Confirm => format!(
+            "@echo off\r\n\
 echo.\r\n\
 echo {title}\r\n\
 echo Command:\r\n\
-echo   {command}\r\n\
+echo   {display}\r\n\
 echo.\r\n\
 echo Press any key to run, or close this window to cancel...\r\n\
 pause >nul\r\n\
@@ -439,9 +532,11 @@ if %STATUS%==0 (\r\n\
 )\r\n\
 echo You can close this window.\r\n\
 pause\r\n"
-    );
+        ),
+        RunMode::Direct => format!("@echo off\r\n{command}\r\n"),
+    };
     fs::write(&path, body)
-        .map_err(|e| AppError::message(format!("failed to write install script: {e}")))?;
+        .map_err(|e| AppError::message(format!("failed to write script: {e}")))?;
 
     // Rust's `Command` spawns wt directly (no shell), so a literal
     // `%USERPROFILE%` is never expanded and wt fails with "cannot access startup
@@ -453,7 +548,7 @@ pause\r\n"
         .filter(|p| !p.trim().is_empty())
         .unwrap_or_else(|| dir.display().to_string());
 
-    if Command::new("wt")
+    if sanitized_command("wt")
         .arg("-d")
         .arg(&start_dir)
         .args(["cmd", "/K"])
@@ -463,7 +558,7 @@ pause\r\n"
     {
         return Ok(());
     }
-    Command::new("cmd")
+    sanitized_command("cmd")
         .args(["/C", "start", "", "cmd", "/K"])
         .arg(&path)
         .spawn()
@@ -475,7 +570,7 @@ pause\r\n"
 fn open_terminal_at(cwd: &Path) -> Result<(), AppError> {
     // Terminal.app is the system default terminal on macOS.
     // `open -a Terminal <dir>` opens a new window with that directory as cwd.
-    let status = Command::new("open")
+    let status = sanitized_command("open")
         .args(["-a", "Terminal"])
         .arg(cwd)
         .status()
@@ -491,7 +586,12 @@ fn open_terminal_at(cwd: &Path) -> Result<(), AppError> {
 #[cfg(target_os = "windows")]
 fn open_terminal_at(cwd: &Path) -> Result<(), AppError> {
     // Prefer Windows Terminal when available (often the system default on Win11).
-    if Command::new("wt.exe").arg("-d").arg(cwd).spawn().is_ok() {
+    if sanitized_command("wt.exe")
+        .arg("-d")
+        .arg(cwd)
+        .spawn()
+        .is_ok()
+    {
         return Ok(());
     }
     let status = cmd_terminal_command(cwd)
@@ -507,23 +607,22 @@ fn open_terminal_at(cwd: &Path) -> Result<(), AppError> {
 
 #[cfg(windows)]
 fn cmd_terminal_command(cwd: &Path) -> Command {
-    use std::os::windows::process::CommandExt;
-
     // `start` gives the interactive shell its own console handles. Directly
     // spawning cmd with CREATE_NEW_CONSOLE can inherit closed/redirected stdin
     // from the desktop app and exit immediately. Never put the path in script.
-    let mut command = Command::new("cmd.exe");
+    let mut command = sanitized_command("cmd.exe");
     command
         .args(["/D", "/C", "start", "", "cmd.exe", "/D"])
-        .current_dir(cwd)
-        .creation_flags(0x0800_0000); // CREATE_NO_WINDOW for the launcher only.
+        .current_dir(cwd);
+    // Hide only the launcher; `start` still opens the interactive console.
+    crate::core::process::hide_console_window(&mut command);
     command
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn open_terminal_at(cwd: &Path) -> Result<(), AppError> {
     // FreeDesktop default terminal launcher (when installed).
-    if Command::new("xdg-terminal-exec")
+    if sanitized_command("xdg-terminal-exec")
         .current_dir(cwd)
         .spawn()
         .is_ok()
@@ -533,7 +632,7 @@ fn open_terminal_at(cwd: &Path) -> Result<(), AppError> {
 
     // $TERMINAL if the user set it.
     if let Ok(term) = std::env::var("TERMINAL") {
-        if !term.is_empty() && Command::new(&term).current_dir(cwd).spawn().is_ok() {
+        if !term.is_empty() && sanitized_command(&term).current_dir(cwd).spawn().is_ok() {
             return Ok(());
         }
     }
@@ -549,7 +648,7 @@ fn open_terminal_at(cwd: &Path) -> Result<(), AppError> {
         ("kitty", &["--directory"]),
     ];
     for (bin, flag) in candidates {
-        let mut cmd = Command::new(bin);
+        let mut cmd = sanitized_command(bin);
         if flag.len() == 1 {
             cmd.arg(flag[0]).arg(cwd);
         }
@@ -559,7 +658,7 @@ fn open_terminal_at(cwd: &Path) -> Result<(), AppError> {
     }
 
     // Debian/Ubuntu alternative; cwd via process current_dir when supported.
-    if Command::new("x-terminal-emulator")
+    if sanitized_command("x-terminal-emulator")
         .current_dir(cwd)
         .spawn()
         .is_ok()
@@ -627,7 +726,12 @@ $result = @{
                 .status()
                 .unwrap();
             assert!(status.success(), "{status}");
-            let deadline = Instant::now() + Duration::from_secs(10);
+            // The chain `start` → new console → cmd.exe → powershell.exe pays
+            // the full PowerShell cold start (CLR + assemblies), which can
+            // exceed 10s on a cold CI runner while hundreds of tests spawn
+            // processes at once. Keep a generous budget: a warm probe finishes
+            // in ~1s, so only genuinely broken consoles reach the deadline.
+            let deadline = Instant::now() + Duration::from_secs(60);
             let result = loop {
                 if let Some(result) = fs::read_to_string(&probe)
                     .ok()
@@ -669,3 +773,4 @@ $result = @{
 
 /// Tauri command shells for this feature.
 pub mod commands;
+pub(crate) mod presets;

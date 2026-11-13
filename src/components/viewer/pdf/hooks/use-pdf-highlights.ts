@@ -20,12 +20,14 @@
  * resulting arrays.
  */
 
+import { useCapability } from "@embedpdf/core/react";
 import type {
 	PdfHighlightAnnoObject,
 	PdfLinkAnnoObject,
 } from "@embedpdf/models";
 import { PdfAnnotationSubtype } from "@embedpdf/models";
 import type {
+	AnnotationEvent,
 	AnnotationTransferItem,
 	useAnnotationCapability,
 } from "@embedpdf/plugin-annotation/react";
@@ -35,20 +37,37 @@ import {
 	type RefObject,
 	useCallback,
 	useEffect,
+	useLayoutEffect,
 	useRef,
 	useState,
 } from "react";
 import { isLinkObject } from "@/components/viewer/pdf/layers/citation-links";
 import type { PdfViewerProps } from "@/components/viewer/pdf/types";
+import i18n from "@/i18n";
+import { errorText } from "@/lib/core/error";
+import { notifyError } from "@/lib/core/notify";
+import { planAnnotationItemImport } from "@/lib/pdf/highlight/annotation-items";
 import {
 	ANNOTATIONS_FILE,
 	type HighlightCustom,
 	hasAnnotationsFile,
 	highlightViewFromObject,
 	isHighlightObject,
+	isLiveAnnotation,
 	loadAnnotationItems,
 	saveAnnotationItems,
 } from "@/lib/pdf/highlight/annotation-store";
+import {
+	applyAnnotationMutation,
+	enqueueAnnotationSave,
+	publishAnnotationMutation,
+	subscribeAnnotationPeer,
+} from "@/lib/pdf/highlight/annotation-sync";
+import { createAnnotationDeleteQueue } from "@/lib/pdf/highlight/delete-queue";
+import {
+	createAnnotationHistoryReplay,
+	type PdfHistoryPlugin,
+} from "@/lib/pdf/highlight/history";
 import { migrateHighlightMarks } from "@/lib/pdf/highlight/migrate-marks";
 import {
 	HIGHLIGHT_HEX,
@@ -56,6 +75,7 @@ import {
 	type HighlightColor,
 } from "@/lib/pdf/highlight/palette";
 import type { PdfHighlight } from "@/lib/pdf/highlight/types";
+import type { VisibleSelectionPage } from "@/lib/pdf/layout/visible-selection-rects";
 import type { NormalizedRect } from "@/lib/pdf/selection";
 import { marksDir } from "@/lib/pdf/selection";
 import { isRecentSelfWrite } from "@/lib/pdf/selection/marks-io";
@@ -93,6 +113,8 @@ export type UsePdfHighlightsOptions = {
 };
 
 export type PdfHighlights = {
+	runAnnotationBatch: (action: () => void) => void;
+	replayAnnotationHistory: (redo: boolean) => void;
 	highlights: PdfHighlight[];
 	/** Mirror for the imperative handle (must not re-register per change). */
 	highlightsRef: RefObject<PdfHighlight[]>;
@@ -107,6 +129,11 @@ export type PdfHighlights = {
 		pages: FormattedSelection[],
 		color: HighlightColor,
 		quote: string,
+		/**
+		 * Translated selection, in page fractions. Stored beside the English
+		 * glyph boxes and painted only while the translation overlay is on.
+		 */
+		translatedPages?: readonly VisibleSelectionPage[],
 	) => { pageIndex: number; id: string }[];
 	/** Write a 批注 comment onto an existing highlight (empty clears it). */
 	updateHighlightComment: (
@@ -132,6 +159,21 @@ export function usePdfHighlights({
 	totalPages,
 	onHighlightsChangeRef,
 }: UsePdfHighlightsOptions): PdfHighlights {
+	const { provides: historyCap } = useCapability<PdfHistoryPlugin>("history");
+	const history = historyCap?.forDocument(docId);
+	const historyReplayRef = useRef<ReturnType<
+		typeof createAnnotationHistoryReplay
+	> | null>(null);
+	const runAnnotationBatch = useCallback(
+		(action: () => void) => {
+			if (history) history.batch(action);
+			else action();
+		},
+		[history],
+	);
+	const replayAnnotationHistory = useCallback((redo: boolean) => {
+		void historyReplayRef.current?.replay(redo);
+	}, []);
 	const [highlights, setHighlights] = useState<PdfHighlight[]>([]);
 	/** Normalized annotation rects for pin placement, keyed by annotation id. */
 	const [highlightAnchors, setHighlightAnchors] = useState(
@@ -145,11 +187,58 @@ export function usePdfHighlights({
 	const importedRef = useRef(false);
 	const importingRef = useRef(false);
 	const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const deleteQueueRef = useRef<ReturnType<
+		typeof createAnnotationDeleteQueue
+	> | null>(null);
+	const initialImportDoneRef = useRef(false);
+	const pendingPeerEventsRef = useRef<
+		Exclude<AnnotationEvent, { type: "loaded" }>[]
+	>([]);
+	const applyPeerEvent = useCallback(
+		(event: Exclude<AnnotationEvent, { type: "loaded" }>) => {
+			if (!initialImportDoneRef.current) {
+				pendingPeerEventsRef.current.push(event);
+				return;
+			}
+			const scope = annotationCap?.forDocument(docId);
+			if (!scope) return;
+			const wasImporting = importingRef.current;
+			importingRef.current = true;
+			try {
+				history?.invalidate([event.annotation.id]);
+				const apply = () => {
+					if (event.type === "delete" && deleteQueueRef.current) {
+						const tracked = scope.getAnnotationById(event.annotation.id);
+						if (tracked && isLiveAnnotation(tracked))
+							deleteQueueRef.current.delete(
+								event.pageIndex,
+								event.annotation.id,
+							);
+					} else applyAnnotationMutation(scope, event);
+				};
+				if (history) history.withoutRecording(apply);
+				else apply();
+				scope.commit();
+			} catch (error) {
+				notifyError(errorText(error));
+			} finally {
+				importingRef.current = wasImporting;
+			}
+		},
+		[annotationCap, docId, history],
+	);
+	useEffect(() => {
+		if (!paperAbsPath || !annotationCap) return;
+		return subscribeAnnotationPeer(paperAbsPath, docId, applyPeerEvent);
+	}, [paperAbsPath, docId, annotationCap, applyPeerEvent]);
 
 	const rebuildHighlights = useCallback(() => {
 		if (!annotationCap) return;
 		const scope = annotationCap.forDocument(docId);
-		const all = scope.getAnnotations();
+		// Deleted annotations stay in the plugin's tracked list until an async
+		// commit purges them (and a dropped commit can leave them there for the
+		// session). They must not reach the rail, pins or paint layers.
+		const all = scope.getAnnotations().filter(isLiveAnnotation);
 		const doc = docCap?.getDocument(docId);
 		const objects = all.map((a) => a.object).filter(isHighlightObject);
 		const list = objects.map((o) => {
@@ -193,7 +282,29 @@ export function usePdfHighlights({
 				else links.set(o.pageIndex, [o]);
 			}
 		}
-		setCitationLinks(links);
+		// The link set only changes when a link annotation is added / removed /
+		// retargeted — saving a comment or recoloring a highlight leaves it
+		// identical. Keep the previous map reference then, so the pages' link
+		// layers don't re-render (elements are the plugin's tracked annotation
+		// objects, so identity per element is the equality that matters).
+		setCitationLinks((prev) => {
+			if (prev.size === links.size) {
+				let unchanged = true;
+				for (const [page, next] of links) {
+					const old = prev.get(page);
+					if (
+						!old ||
+						old.length !== next.length ||
+						next.some((link, i) => link !== old[i])
+					) {
+						unchanged = false;
+						break;
+					}
+				}
+				if (unchanged) return prev;
+			}
+			return links;
+		});
 	}, [annotationCap, docCap, docId, paperKey, onHighlightsChangeRef]);
 
 	// A batch import emits one event per annotation within a single task;
@@ -208,32 +319,67 @@ export function usePdfHighlights({
 		});
 	}, [rebuildHighlights]);
 
-	const scheduleSave = useCallback(() => {
+	const persistAnnotations = useCallback(() => {
 		if (!paperAbsPath || !annotationCap) return;
-		if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-		saveTimerRef.current = setTimeout(async () => {
-			try {
-				const items = await annotationCap
-					.forDocument(docId)
-					.exportAnnotations()
-					.toPromise();
-				await saveAnnotationItems(paperAbsPath, items);
-			} catch {
-				// transient export failures are non-fatal; next change retries
-			}
-		}, HIGHLIGHT_SAVE_DEBOUNCE_MS);
+		// Capture while this document still exists, including an unmount flush.
+		const snapshot = annotationCap
+			.forDocument(docId)
+			.exportAnnotations()
+			.toPromise();
+		void enqueueAnnotationSave(paperAbsPath, async () => {
+			await saveAnnotationItems(paperAbsPath, await snapshot);
+		}).catch((error) => notifyError(errorText(error)));
 	}, [paperAbsPath, annotationCap, docId]);
+
+	/** Deletions bypass the normal debounce. */
+	const scheduleSave = useCallback(
+		(immediate = false) => {
+			if (!paperAbsPath || !annotationCap) return;
+			if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+			saveTimerRef.current = setTimeout(
+				() => {
+					saveTimerRef.current = null;
+					persistAnnotations();
+				},
+				immediate ? 0 : HIGHLIGHT_SAVE_DEBOUNCE_MS,
+			);
+		},
+		[paperAbsPath, annotationCap, persistAnnotations],
+	);
+	useLayoutEffect(
+		() => () => {
+			if (!saveTimerRef.current) return;
+			clearTimeout(saveTimerRef.current);
+			saveTimerRef.current = null;
+			persistAnnotations();
+		},
+		[persistAnnotations],
+	);
 
 	useEffect(() => {
 		if (!annotationCap) return;
 		const scope = annotationCap.forDocument(docId);
 		const off = scope.onAnnotationEvent((event) => {
 			scheduleRebuild();
-			if (event.type !== "loaded" && !importingRef.current) scheduleSave();
+			if (
+				event.type !== "loaded" &&
+				!event.committed &&
+				!importingRef.current
+			) {
+				if (paperAbsPath) publishAnnotationMutation(paperAbsPath, event);
+				scheduleSave(event.type === "delete");
+			}
 		});
 		rebuildHighlights();
 		return () => off();
-	}, [annotationCap, docId, rebuildHighlights, scheduleRebuild, scheduleSave]);
+	}, [
+		annotationCap,
+		docId,
+		paperAbsPath,
+		rebuildHighlights,
+		scheduleRebuild,
+		scheduleSave,
+	]);
 
 	useEffect(() => {
 		if (importedRef.current || !annotationCap || !docCap || totalPages <= 0)
@@ -261,12 +407,28 @@ export function usePdfHighlights({
 			}
 			if (items.length) {
 				importingRef.current = true;
-				scope.importAnnotations(items);
-				setTimeout(() => {
-					importingRef.current = false;
-					rebuildHighlights();
-				}, 0);
+				const plan = planAnnotationItemImport(
+					items,
+					scope
+						.getAnnotations()
+						.filter(isLiveAnnotation)
+						.map((item) => item.object),
+				);
+				if (plan.imports.length) scope.importAnnotations(plan.imports);
+				if (plan.highlightOverrides.length) {
+					const apply = () => scope.updateAnnotations(plan.highlightOverrides);
+					if (history) history.withoutRecording(apply);
+					else apply();
+					scope.commit();
+				}
 			}
+			setTimeout(() => {
+				importingRef.current = false;
+				initialImportDoneRef.current = true;
+				for (const event of pendingPeerEventsRef.current.splice(0))
+					applyPeerEvent(event);
+				rebuildHighlights();
+			}, 0);
 		})();
 	}, [
 		annotationCap,
@@ -275,6 +437,8 @@ export function usePdfHighlights({
 		totalPages,
 		paperAbsPath,
 		rebuildHighlights,
+		applyPeerEvent,
+		history,
 	]);
 
 	// The CLI/Agent appends highlights straight into `marks/annotations.json`
@@ -305,15 +469,26 @@ export function usePdfHighlights({
 				return;
 			}
 			const scope = annotationCap.forDocument(docId);
-			const known = new Set(scope.getAnnotations().map((a) => a.object.id));
+			const existing = scope
+				.getAnnotations()
+				.filter(isLiveAnnotation)
+				.map((a) => a.object);
 			const items = await loadAnnotationItems(paperAbsPath);
 			if (cancelled) return;
-			const fresh = items.filter(
-				(i) => i.annotation?.id && !known.has(i.annotation.id),
-			);
-			if (!fresh.length) return;
+			const plan = planAnnotationItemImport(items, existing);
+			if (!plan.imports.length && !plan.highlightOverrides.length) return;
 			importingRef.current = true;
-			scope.importAnnotations(fresh);
+			history?.invalidate([
+				...plan.imports.map((item) => item.annotation.id),
+				...plan.highlightOverrides.map((item) => item.id),
+			]);
+			if (plan.imports.length) scope.importAnnotations(plan.imports);
+			if (plan.highlightOverrides.length) {
+				const apply = () => scope.updateAnnotations(plan.highlightOverrides);
+				if (history) history.withoutRecording(apply);
+				else apply();
+				scope.commit();
+			}
 			setTimeout(() => {
 				importingRef.current = false;
 				rebuildHighlights();
@@ -335,37 +510,65 @@ export function usePdfHighlights({
 			if (burstTimer !== null) window.clearTimeout(burstTimer);
 			unsub();
 		};
-	}, [annotationCap, docId, paperAbsPath, totalPages, rebuildHighlights]);
+	}, [
+		annotationCap,
+		docId,
+		paperAbsPath,
+		totalPages,
+		rebuildHighlights,
+		history,
+	]);
 
 	const createHighlights = useCallback(
-		(pages: FormattedSelection[], color: HighlightColor, quote: string) => {
+		(
+			pages: FormattedSelection[],
+			color: HighlightColor,
+			quote: string,
+			translatedPages?: readonly VisibleSelectionPage[],
+		) => {
 			const scope = annotationCap?.forDocument(docId);
 			if (!scope) return [] as { pageIndex: number; id: string }[];
 			const created: { pageIndex: number; id: string }[] = [];
-			for (const page of pages) {
-				const id = crypto.randomUUID();
-				const obj: PdfHighlightAnnoObject = {
-					type: PdfAnnotationSubtype.HIGHLIGHT,
-					id,
-					pageIndex: page.pageIndex,
-					rect: page.rect,
-					segmentRects: page.segmentRects,
-					strokeColor: HIGHLIGHT_HEX[color],
-					opacity: HIGHLIGHT_OPACITY,
-					created: new Date(),
-					custom: { app: "agentero", paletteKey: color, quote },
-				};
-				scope.createAnnotation(page.pageIndex, obj);
-				created.push({ pageIndex: page.pageIndex, id });
-			}
+			runAnnotationBatch(() => {
+				for (const page of pages) {
+					const id = crypto.randomUUID();
+					const translatedRects = translatedPages?.find(
+						(item) => item.pageIndex === page.pageIndex,
+					)?.rects;
+					const custom: HighlightCustom = {
+						app: "agentero",
+						paletteKey: color,
+						quote,
+					};
+					if (translatedRects?.length) custom.translatedRects = translatedRects;
+					const obj: PdfHighlightAnnoObject = {
+						type: PdfAnnotationSubtype.HIGHLIGHT,
+						id,
+						pageIndex: page.pageIndex,
+						rect: page.rect,
+						segmentRects: page.segmentRects,
+						strokeColor: HIGHLIGHT_HEX[color],
+						opacity: HIGHLIGHT_OPACITY,
+						created: new Date(),
+						custom,
+					};
+					scope.createAnnotation(page.pageIndex, obj);
+					created.push({ pageIndex: page.pageIndex, id });
+				}
+			});
 			return created;
 		},
-		[annotationCap, docId],
+		[annotationCap, docId, runAnnotationBatch],
 	);
 
 	const updateHighlightComment = useCallback(
 		(pageIndex: number, id: string, comment: string) => {
-			annotationCap?.forDocument(docId).updateAnnotation(pageIndex, id, {
+			const scope = annotationCap?.forDocument(docId);
+			if (!scope) return;
+			const tracked = scope.getAnnotationById(id);
+			if (!tracked || !isLiveAnnotation(tracked)) return;
+			if ((tracked.object.contents?.trim() ?? "") === comment.trim()) return;
+			scope.updateAnnotation(pageIndex, id, {
 				contents: comment.trim() || undefined,
 			});
 		},
@@ -376,9 +579,21 @@ export function usePdfHighlights({
 		(pageIndex: number, id: string, color: HighlightColor) => {
 			const scope = annotationCap?.forDocument(docId);
 			if (!scope) return;
-			const obj = scope.getAnnotationById(id)?.object;
-			if (!obj || !isHighlightObject(obj)) return;
+			const tracked = scope.getAnnotationById(id);
+			if (
+				!tracked ||
+				!isLiveAnnotation(tracked) ||
+				!isHighlightObject(tracked.object)
+			) {
+				return;
+			}
+			const obj = tracked.object;
 			const custom = (obj.custom ?? {}) as HighlightCustom;
+			if (
+				custom.paletteKey === color &&
+				obj.strokeColor === HIGHLIGHT_HEX[color]
+			)
+				return;
 			scope.updateAnnotation(pageIndex, id, {
 				strokeColor: HIGHLIGHT_HEX[color],
 				custom: { ...custom, paletteKey: color },
@@ -387,14 +602,52 @@ export function usePdfHighlights({
 		[annotationCap, docId],
 	);
 
+	useEffect(() => {
+		if (!annotationCap) return;
+		const queue = createAnnotationDeleteQueue(
+			annotationCap.forDocument(docId),
+			(error) =>
+				notifyError(i18n.t("viewer:pdf.annotationDeleteFailed"), {
+					description: error === undefined ? undefined : errorText(error),
+				}),
+			history
+				? (action) => {
+						history.withoutRecording(action);
+						annotationCap.forDocument(docId).commit();
+					}
+				: undefined,
+		);
+		deleteQueueRef.current = queue;
+		return () => {
+			queue.dispose();
+			if (deleteQueueRef.current === queue) deleteQueueRef.current = null;
+		};
+	}, [annotationCap, docId, history]);
+
+	useEffect(() => {
+		if (!annotationCap || !history) return;
+		const replay = createAnnotationHistoryReplay(
+			annotationCap.forDocument(docId),
+			history,
+			(error) => notifyError(errorText(error)),
+		);
+		historyReplayRef.current = replay;
+		return () => {
+			replay.dispose();
+			if (historyReplayRef.current === replay) historyReplayRef.current = null;
+		};
+	}, [annotationCap, docId, history]);
+
 	const deleteHighlightAnnotation = useCallback(
 		(pageIndex: number, id: string) => {
-			annotationCap?.forDocument(docId).deleteAnnotation(pageIndex, id);
+			deleteQueueRef.current?.delete(pageIndex, id);
 		},
-		[annotationCap, docId],
+		[],
 	);
 
 	return {
+		runAnnotationBatch,
+		replayAnnotationHistory,
 		highlights,
 		highlightsRef,
 		highlightAnchors,

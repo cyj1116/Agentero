@@ -22,33 +22,48 @@ import {
 } from "@/lib/pdf/layout/settings";
 import {
 	clampEditorLineHeight,
+	clampMarkdownMaxWidth,
+	clampWikiEmbedFontSize,
+	DECISION_PROVIDER_PRESETS,
+	DEFAULT_DECISION_SETTINGS,
 	DEFAULT_EMBEDDING_SETTINGS,
+	DEFAULT_PAPER_READER_SETTINGS,
 	DEFAULT_PDF_ASK_SETTINGS,
 	DEFAULT_SETTINGS,
-	DEFAULT_TRANSLATOR_BASE_URL,
-	GITHUB_MIRROR_PRESETS,
 	snapUiScale,
 } from "@/lib/settings/defaults";
 import { normalizeFontFamilyValue } from "@/lib/settings/fonts";
+import { normalizeShortcutOverrides } from "@/lib/settings/shortcut-bindings";
 import {
 	type AppSettings,
 	DEFAULT_LIBRARY_COLUMNS,
+	type DecisionSettings,
 	type EmbeddingSettings,
 	type EmbeddingSource,
+	isConfigReminderId,
+	isDecisionProviderId,
 	isPaperNoteMode,
+	isPdfScrollStrategy,
+	isPdfSpreadMode,
 	LIBRARY_COLUMN_KEYS,
 	type LibraryColumnKey,
 	type LibraryColumnPref,
+	type PaperReaderSettings,
 	type PdfAskSettings,
 } from "@/lib/settings/types";
 import { DEFAULT_TRANSLATE_SETTINGS } from "@/lib/translate/defaults";
+import { stripUnknownTranslatePlaceholders } from "@/lib/translate/prompt";
 import {
 	isCommercialTranslateProvider,
 	isTranslateProviderId,
 } from "@/lib/translate/services";
-import type {
-	TranslateSettings,
-	TranslateTargetLang,
+import {
+	DUAL_PANE_SOURCES,
+	type DualPaneSource,
+	TRANSLATION_DISPLAY_MODES,
+	type TranslateSettings,
+	type TranslateTargetLang,
+	type TranslationDisplayMode,
 } from "@/lib/translate/types";
 import { isKnownUiTheme } from "@/lib/ui/theme";
 
@@ -73,11 +88,15 @@ function fromSettingsWire(raw: SettingsWire): AppSettings {
 /** In-memory snapshot (source of truth between Host round-trips). */
 let cache: AppSettings = {
 	...DEFAULT_SETTINGS,
+	shortcutOverrides: {},
 	libraryColumns: DEFAULT_LIBRARY_COLUMNS.map((c) => ({ ...c })),
 	translate: { ...DEFAULT_TRANSLATE_SETTINGS },
 	layout: { ...DEFAULT_SETTINGS.layout, providerConfigs: {} },
 	pdfAsk: { ...DEFAULT_PDF_ASK_SETTINGS },
+	paperReader: { ...DEFAULT_PAPER_READER_SETTINGS },
 	embedding: { ...DEFAULT_EMBEDDING_SETTINGS },
+	dismissedReminders: [],
+	decision: { ...DEFAULT_DECISION_SETTINGS },
 };
 let loaded = false;
 let loadPromise: Promise<AppSettings> | null = null;
@@ -85,11 +104,15 @@ let loadPromise: Promise<AppSettings> | null = null;
 function cloneSettings(s: AppSettings): AppSettings {
 	return {
 		...s,
+		shortcutOverrides: normalizeShortcutOverrides(s.shortcutOverrides),
 		libraryColumns: s.libraryColumns.map((c) => ({ ...c })),
 		pdfAsk: { ...s.pdfAsk },
+		paperReader: { ...s.paperReader },
 		embedding: { ...s.embedding },
 		translate: { ...s.translate },
 		layout: { ...s.layout, providerConfigs: { ...s.layout.providerConfigs } },
+		dismissedReminders: [...s.dismissedReminders],
+		decision: { ...s.decision },
 	};
 }
 
@@ -154,7 +177,7 @@ export async function ensureSettingsLoaded(): Promise<AppSettings> {
  */
 export function saveSettings(settings: AppSettings): void {
 	const next = normalizeSettings(settings);
-	setCache(next);
+	applyExternalSettings(next);
 	if (!isTauri()) return;
 	void persistToHost(next).catch((e) => {
 		console.warn("[settings] save failed", e);
@@ -165,7 +188,7 @@ type SettingsListener = (settings: AppSettings) => void;
 
 const settingsListeners = new Set<SettingsListener>();
 
-/** Subscribe to settings changes coming from other windows. Returns unsubscribe. */
+/** Subscribe to local saves and cross-window settings. Returns unsubscribe. */
 export function subscribeSettings(listener: SettingsListener): () => void {
 	settingsListeners.add(listener);
 	return () => {
@@ -224,7 +247,7 @@ export async function saveSettingsAsync(
 	settings: AppSettings,
 ): Promise<AppSettings> {
 	const next = normalizeSettings(settings);
-	setCache(next);
+	applyExternalSettings(next);
 	if (!isTauri()) return loadSettings();
 	return persistToHost(next);
 }
@@ -233,7 +256,8 @@ async function persistToHost(settings: AppSettings): Promise<AppSettings> {
 	const res = await callApi(() => commands.settingsSet(settings), {
 		fallback: "settings_set failed",
 	});
-	return setCache(normalizeSettings(fromSettingsWire(res)));
+	setCache(normalizeSettings(fromSettingsWire(res)));
+	return loadSettings();
 }
 
 function readLegacyLocalStorage(): AppSettings | null {
@@ -291,23 +315,24 @@ function normalizePartial(
 		...rest
 	} = parsed;
 	const merged = { ...DEFAULT_SETTINGS, ...rest };
+	merged.shortcutOverrides = normalizeShortcutOverrides(
+		parsed.shortcutOverrides,
+	);
 	if (
 		parsed.agentYolo !== undefined &&
 		rest.agentPermissionMode === undefined
 	) {
 		merged.agentPermissionMode = parsed.agentYolo ? "auto" : "restricted";
 	}
-	if (!merged.translatorBaseUrl?.trim()) {
-		merged.translatorBaseUrl = DEFAULT_TRANSLATOR_BASE_URL;
-	} else {
-		merged.translatorBaseUrl = merged.translatorBaseUrl
-			.trim()
-			.replace(/\/+$/, "");
-	}
 	if (typeof parsed.easyScholarKey !== "string") {
 		merged.easyScholarKey = DEFAULT_SETTINGS.easyScholarKey;
 	} else {
 		merged.easyScholarKey = parsed.easyScholarKey.trim();
+	}
+	if (typeof parsed.zhihuAccessSecret !== "string") {
+		merged.zhihuAccessSecret = DEFAULT_SETTINGS.zhihuAccessSecret;
+	} else {
+		merged.zhihuAccessSecret = parsed.zhihuAccessSecret.trim();
 	}
 	if (typeof parsed.networkProxyEnabled !== "boolean") {
 		merged.networkProxyEnabled = DEFAULT_SETTINGS.networkProxyEnabled;
@@ -319,19 +344,6 @@ function normalizePartial(
 		merged.networkProxyUrl = DEFAULT_SETTINGS.networkProxyUrl;
 	} else {
 		merged.networkProxyUrl = parsed.networkProxyUrl.trim();
-	}
-	if (typeof parsed.githubMirrorEnabled !== "boolean") {
-		merged.githubMirrorEnabled = DEFAULT_SETTINGS.githubMirrorEnabled;
-	}
-	if (typeof parsed.githubMirrorBaseUrl !== "string") {
-		merged.githubMirrorBaseUrl = DEFAULT_SETTINGS.githubMirrorBaseUrl;
-	} else {
-		const trimmed = parsed.githubMirrorBaseUrl.trim().replace(/\/+$/, "");
-		merged.githubMirrorBaseUrl = (
-			GITHUB_MIRROR_PRESETS as readonly string[]
-		).includes(trimmed)
-			? trimmed
-			: GITHUB_MIRROR_PRESETS[0];
 	}
 	if (!isPaperTreeLabelMode(merged.paperTreeLabelMode)) {
 		merged.paperTreeLabelMode = DEFAULT_SETTINGS.paperTreeLabelMode;
@@ -357,6 +369,29 @@ function normalizePartial(
 		merged.autoUpdateInternalLinks !== "always"
 	) {
 		merged.autoUpdateInternalLinks = DEFAULT_SETTINGS.autoUpdateInternalLinks;
+	}
+	if (typeof parsed.terminalApp !== "string") {
+		merged.terminalApp = DEFAULT_SETTINGS.terminalApp;
+	} else {
+		merged.terminalApp = parsed.terminalApp.trim().toLowerCase();
+	}
+	if (!isPdfScrollStrategy(merged.pdfScrollStrategy)) {
+		merged.pdfScrollStrategy = DEFAULT_SETTINGS.pdfScrollStrategy;
+	}
+	if (typeof parsed.pdfVimKeys !== "boolean") {
+		merged.pdfVimKeys = DEFAULT_SETTINGS.pdfVimKeys;
+	}
+	if (typeof parsed.vimMode !== "boolean") {
+		merged.vimMode = DEFAULT_SETTINGS.vimMode;
+	}
+	if (typeof parsed.hintModeEnabled !== "boolean") {
+		merged.hintModeEnabled = DEFAULT_SETTINGS.hintModeEnabled;
+	}
+	if (typeof parsed.soundEnabled !== "boolean") {
+		merged.soundEnabled = DEFAULT_SETTINGS.soundEnabled;
+	}
+	if (!isPdfSpreadMode(merged.pdfSpreadMode)) {
+		merged.pdfSpreadMode = DEFAULT_SETTINGS.pdfSpreadMode;
 	}
 	merged.libraryColumns = normalizeLibraryColumns(merged.libraryColumns);
 	if (typeof parsed.autoPaperReader !== "boolean") {
@@ -387,9 +422,6 @@ function normalizePartial(
 	if (typeof merged.mcpTunnelApiKey !== "string") {
 		merged.mcpTunnelApiKey = DEFAULT_SETTINGS.mcpTunnelApiKey;
 	}
-	if (typeof parsed.exportWatermarkEnabled !== "boolean") {
-		merged.exportWatermarkEnabled = DEFAULT_SETTINGS.exportWatermarkEnabled;
-	}
 	if (typeof parsed.telemetryEnabled !== "boolean") {
 		merged.telemetryEnabled = DEFAULT_SETTINGS.telemetryEnabled;
 	}
@@ -412,6 +444,13 @@ function normalizePartial(
 	}
 	if (typeof parsed.featureTourDone !== "boolean") {
 		merged.featureTourDone = DEFAULT_SETTINGS.featureTourDone;
+	}
+	if (!Array.isArray(parsed.dismissedReminders)) {
+		merged.dismissedReminders = DEFAULT_SETTINGS.dismissedReminders;
+	} else {
+		merged.dismissedReminders = [
+			...new Set(parsed.dismissedReminders.filter(isConfigReminderId)),
+		];
 	}
 	if (
 		!Number.isInteger(merged.batchImportConcurrency) ||
@@ -466,6 +505,8 @@ function normalizePartial(
 		merged.textFontFamily = normalizeFontFamilyValue(legacyEditorFontFamily);
 	}
 	merged.editorLineHeight = clampEditorLineHeight(merged.editorLineHeight);
+	merged.wikiEmbedFontSize = clampWikiEmbedFontSize(merged.wikiEmbedFontSize);
+	merged.markdownMaxWidth = clampMarkdownMaxWidth(merged.markdownMaxWidth);
 	if (
 		merged.agentPermissionMode !== "restricted" &&
 		merged.agentPermissionMode !== "ask" &&
@@ -480,15 +521,49 @@ function normalizePartial(
 	) {
 		merged.aiResponseLanguage = DEFAULT_SETTINGS.aiResponseLanguage;
 	}
-	merged.pdfAsk = normalizePdfAskSettings(
+	merged.pdfAsk = normalizeAgentSeatSettings(
 		(parsed as { pdfAsk?: Partial<PdfAskSettings> }).pdfAsk,
+		DEFAULT_PDF_ASK_SETTINGS,
+	);
+	merged.paperReader = normalizeAgentSeatSettings(
+		(parsed as { paperReader?: Partial<PaperReaderSettings> }).paperReader,
+		DEFAULT_PAPER_READER_SETTINGS,
 	);
 	merged.embedding = normalizeEmbeddingSettings(
 		(parsed as { embedding?: Partial<EmbeddingSettings> }).embedding,
 	);
 	merged.translate = normalizeTranslateSettings(parsed.translate);
 	merged.layout = normalizeLayoutSettings(parsed.layout);
+	// Legacy key `jev` → `decision` (pre-provider-selection storage).
+	merged.decision = normalizeDecisionSettings(
+		(parsed as { decision?: Partial<DecisionSettings> }).decision ??
+			(parsed as { jev?: Partial<DecisionSettings> }).jev,
+	);
 	return merged;
+}
+
+function normalizeDecisionSettings(raw: unknown): DecisionSettings {
+	const base = { ...DEFAULT_DECISION_SETTINGS };
+	if (!raw || typeof raw !== "object") return base;
+	const partial = raw as Partial<DecisionSettings>;
+	if (isDecisionProviderId(partial.provider)) {
+		base.provider = partial.provider;
+	}
+	if (typeof partial.apiKey === "string") {
+		base.apiKey = partial.apiKey.trim();
+	}
+	if (typeof partial.smartHighlight === "boolean") {
+		base.smartHighlight = partial.smartHighlight;
+	}
+	const preset = DECISION_PROVIDER_PRESETS[base.provider];
+	const baseUrl =
+		typeof partial.baseUrl === "string"
+			? partial.baseUrl.trim().replace(/\/+$/, "")
+			: "";
+	base.baseUrl = baseUrl || preset.baseUrl;
+	const model = typeof partial.model === "string" ? partial.model.trim() : "";
+	base.model = model || preset.model;
+	return base;
 }
 
 function isTranslateTargetLang(v: unknown): v is TranslateTargetLang {
@@ -515,7 +590,8 @@ function normalizeLibraryColumns(raw: unknown): LibraryColumnPref[] {
 			const rawKey = (item as { key?: unknown }).key;
 			if (typeof rawKey !== "string") continue;
 			const key = rawKey === "year" ? "date" : rawKey;
-			if (!known.has(key)) continue;
+			const isCustomProp = key.startsWith("prop:");
+			if (!known.has(key) && !isCustomProp) continue;
 			const k = key as LibraryColumnKey;
 			if (seen.has(k)) continue;
 			seen.add(k);
@@ -548,6 +624,14 @@ function normalizeLibraryColumns(raw: unknown): LibraryColumnPref[] {
 			const pref = saved.find((c) => c.key === fallback.key);
 			out.push(pref ?? { ...fallback });
 		}
+		for (const pref of saved) {
+			if (
+				pref.key.startsWith("prop:") &&
+				!out.some((c) => c.key === pref.key)
+			) {
+				out.push(pref);
+			}
+		}
 	} else {
 		out.push(...saved);
 		for (const fallback of DEFAULT_LIBRARY_COLUMNS) {
@@ -561,18 +645,18 @@ function normalizeLibraryColumns(raw: unknown): LibraryColumnPref[] {
 	return out;
 }
 
-function normalizePdfAskSettings(
-	raw: Partial<PdfAskSettings> | undefined,
-): PdfAskSettings {
-	const base = { ...DEFAULT_PDF_ASK_SETTINGS };
-	if (!raw || typeof raw !== "object") return base;
+function normalizeAgentSeatSettings<
+	T extends { agentId: string; modelId: string },
+>(raw: Partial<T> | undefined, base: T): T {
+	const seat = { ...base };
+	if (!raw || typeof raw !== "object") return seat;
 	if (typeof raw.agentId === "string") {
-		base.agentId = raw.agentId.trim();
+		seat.agentId = raw.agentId.trim();
 	}
 	if (typeof raw.modelId === "string") {
-		base.modelId = raw.modelId.trim();
+		seat.modelId = raw.modelId.trim();
 	}
-	return base;
+	return seat;
 }
 
 function normalizeEmbeddingSettings(
@@ -630,8 +714,26 @@ function normalizeTranslateSettings(
 	if (typeof raw.autoTranslateSelection === "boolean") {
 		base.autoTranslateSelection = raw.autoTranslateSelection;
 	}
-	if (typeof raw.dualPaneTranslate === "boolean") {
-		base.dualPaneTranslate = raw.dualPaneTranslate;
+	// Migrate legacy dualPaneTranslate boolean to the new displayMode pair.
+	const legacyDualPane = (raw as { dualPaneTranslate?: boolean })
+		.dualPaneTranslate;
+	if (typeof legacyDualPane === "boolean") {
+		base.displayMode = legacyDualPane ? "dualPane" : "overlay";
+		base.dualPaneSource = "pdf";
+	}
+	if (
+		raw.displayMode &&
+		TRANSLATION_DISPLAY_MODES.includes(
+			raw.displayMode as TranslationDisplayMode,
+		)
+	) {
+		base.displayMode = raw.displayMode as TranslationDisplayMode;
+	}
+	if (
+		raw.dualPaneSource &&
+		DUAL_PANE_SOURCES.includes(raw.dualPaneSource as DualPaneSource)
+	) {
+		base.dualPaneSource = raw.dualPaneSource as DualPaneSource;
 	}
 	if (typeof raw.agentId === "string") {
 		base.agentId = raw.agentId.trim();
@@ -640,10 +742,37 @@ function normalizeTranslateSettings(
 		base.modelId = raw.modelId.trim();
 	}
 	if (typeof raw.customPrompt === "string") {
-		// Cap extreme values from hand-edited storage (the UI slices to 8000).
-		base.customPrompt = raw.customPrompt.slice(0, 8000);
+		base.customPrompt = normalizeTranslateTemplate(raw.customPrompt);
+	}
+	if (typeof raw.customSystem === "string") {
+		base.customSystem = normalizeTranslateTemplate(raw.customSystem);
+	}
+	if (typeof raw.customUser === "string") {
+		base.customUser = normalizeTranslateTemplate(raw.customUser);
+	}
+	if (typeof raw.cacheReflowIr === "boolean") {
+		base.cacheReflowIr = raw.cacheReflowIr;
+	}
+	if (typeof raw.cacheReflowFinal === "boolean") {
+		base.cacheReflowFinal = raw.cacheReflowFinal;
+	}
+	if (typeof raw.autoTranslateImport === "boolean") {
+		base.autoTranslateImport = raw.autoTranslateImport;
+	}
+	if (
+		typeof raw.autoTranslateImportConcurrency === "number" &&
+		Number.isInteger(raw.autoTranslateImportConcurrency) &&
+		raw.autoTranslateImportConcurrency >= 1 &&
+		raw.autoTranslateImportConcurrency <= 5
+	) {
+		base.autoTranslateImportConcurrency = raw.autoTranslateImportConcurrency;
 	}
 	return base;
+}
+
+/** Cap a template and drop placeholders other than the three known ones. */
+function normalizeTranslateTemplate(value: string): string {
+	return stripUnknownTranslatePlaceholders(value).slice(0, 8000);
 }
 
 function normalizeTranslateProviderConfigs(
@@ -659,6 +788,7 @@ function normalizeTranslateProviderConfigs(
 			baseUrl?: unknown;
 			region?: unknown;
 			model?: unknown;
+			extraRequestBody?: unknown;
 		};
 		out[id] = {
 			apiKey: typeof cfg.apiKey === "string" ? cfg.apiKey.trim() : "",
@@ -668,6 +798,10 @@ function normalizeTranslateProviderConfigs(
 			baseUrl: typeof cfg.baseUrl === "string" ? cfg.baseUrl.trim() : "",
 			region: typeof cfg.region === "string" ? cfg.region.trim() : "",
 			model: typeof cfg.model === "string" ? cfg.model.trim() : "",
+			extraRequestBody:
+				typeof cfg.extraRequestBody === "string"
+					? cfg.extraRequestBody.trim()
+					: "",
 		};
 	}
 	return out;
@@ -708,6 +842,7 @@ function normalizeLayoutProviderConfigs(
 			prompt?: unknown;
 			language?: unknown;
 			isOcr?: unknown;
+			selfHosted?: unknown;
 		};
 		const language =
 			typeof cfg.language === "string" ? cfg.language.trim() : "";
@@ -718,6 +853,7 @@ function normalizeLayoutProviderConfigs(
 			prompt: typeof cfg.prompt === "string" ? cfg.prompt.trim() : "",
 			language: isMineruLanguage(language) ? language : DEFAULT_MINERU_LANGUAGE,
 			isOcr: cfg.isOcr === true,
+			selfHosted: cfg.selfHosted === true,
 		};
 	}
 	return out;

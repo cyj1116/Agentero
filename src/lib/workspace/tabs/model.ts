@@ -5,6 +5,7 @@ import {
 	TRASH_VIRTUAL_PATH,
 } from "@/lib/paper/api";
 import { isPlazaVirtualPath, plazaTitleForPath } from "@/lib/plaza";
+import { isResearchTablePath, TABLE_SUFFIX } from "@/lib/research-table/model";
 import { basenameOf, normalizePathKey } from "@/lib/vault/path";
 import type { DocTab, TabResources } from "@/lib/workspace/tabs/types";
 import type { CenterViewMode } from "@/lib/workspace/viewer";
@@ -12,6 +13,14 @@ import type { CenterViewMode } from "@/lib/workspace/viewer";
 export { basenameOf, normalizePathKey as normalizeTabPath };
 
 export const SPLIT_PANE_ID_MARKER = "::pane-";
+
+/** Tab label for a file path. Research tables hide the `.table.json` suffix. */
+export function tabTitleForPath(path: string): string {
+	const base = basenameOf(path);
+	if (!isResearchTablePath(base)) return base;
+	const stem = base.slice(0, -TABLE_SUFFIX.length);
+	return stem || base;
+}
 
 export function tabIdForPath(path: string): string {
 	if (isLibraryVirtualPath(path)) return LIBRARY_VIRTUAL_PATH;
@@ -86,6 +95,9 @@ export function remapTabsUnderPath(
 		const imageUrl = tab.imageUrl
 			? remapPathUnder(tab.imageUrl, from, to)
 			: null;
+		const writingRoot = tab.writingRoot
+			? remapPathUnder(tab.writingRoot, from, to)
+			: undefined;
 		const paperMeta = tab.paperMeta;
 		let nextPaperMeta = paperMeta;
 		if (paperMeta) {
@@ -99,6 +111,7 @@ export function remapTabsUnderPath(
 			notesPath === tab.notesPath &&
 			pdfUrl === tab.pdfUrl &&
 			imageUrl === tab.imageUrl &&
+			writingRoot === tab.writingRoot &&
 			nextPaperMeta === paperMeta
 		) {
 			return tab;
@@ -110,6 +123,7 @@ export function remapTabsUnderPath(
 			notesPath,
 			pdfUrl,
 			imageUrl,
+			writingRoot,
 			paperMeta: nextPaperMeta,
 		};
 	});
@@ -143,7 +157,7 @@ export function createPlaceholderTab(
 				? "Recycle Bin"
 				: isPlaza
 					? plazaTitleForPath(path)
-					: basenameOf(path),
+					: tabTitleForPath(path),
 		mode: preferMode,
 		paperMeta: null,
 		pdfUrl: null,
@@ -163,6 +177,7 @@ export function createPlaceholderTab(
 		notesKey: 0,
 		excalidrawKey: 0,
 		textKey: 0,
+		htmlKey: 0,
 		loaded: false,
 	};
 }
@@ -243,7 +258,23 @@ export function patchTab(
 	id: string,
 	patch: Partial<DocTab>,
 ): DocTab[] {
-	return prev.map((t) => (t.id === id ? { ...t, ...patch } : t));
+	const idx = prev.findIndex((t) => t.id === id);
+	if (idx < 0) return prev;
+	const current = prev[idx];
+	// No-op patches (e.g. notesDirty: true → true) must keep the array and the
+	// tab identity: DocView's memo compares `tab` by reference, so minting a
+	// fresh object per patch re-rendered every pane's editor.
+	let changed = false;
+	for (const key of Object.keys(patch) as (keyof DocTab)[]) {
+		if (current[key] !== patch[key]) {
+			changed = true;
+			break;
+		}
+	}
+	if (!changed) return prev;
+	const next = prev.slice();
+	next[idx] = { ...current, ...patch };
+	return next;
 }
 
 /**

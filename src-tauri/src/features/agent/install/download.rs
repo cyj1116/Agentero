@@ -211,11 +211,14 @@ fn extract_zip_member(bytes: &[u8], member_name: &str, dest: &Path) -> Result<()
         let file = archive
             .by_index(i)
             .map_err(|e| AppError::message(format!("zip entry error: {e}")))?;
-        let name = file.name();
-        let base = Path::new(name)
+        let name = file
+            .name()
+            .map_err(|e| AppError::message(format!("zip entry name error: {e}")))?
+            .into_owned();
+        let base = Path::new(&name)
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or(name);
+            .unwrap_or(&name);
         if base == member_name || name == member_name {
             index = Some(i);
             break;
@@ -362,9 +365,10 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("agentero");
+        let name = archive_inner_name();
+        let dest = dir.join(name);
 
-        // Build a minimal tar.gz with a single `agentero` member.
+        // Build a minimal tar.gz whose member name matches this platform.
         let mut tar_buf = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut tar_buf);
@@ -374,7 +378,7 @@ mod tests {
             header.set_mode(0o755);
             header.set_cksum();
             builder
-                .append_data(&mut header, "agentero", data.as_slice())
+                .append_data(&mut header, name, data.as_slice())
                 .unwrap();
             builder.finish().unwrap();
         }

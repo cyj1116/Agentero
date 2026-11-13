@@ -49,6 +49,7 @@ pub enum JobKind {
     LibraryIo,
     MetadataRefresh,
     LatexCompile,
+    JevSmartHighlights,
 }
 
 impl JobKind {
@@ -74,6 +75,7 @@ impl JobKind {
             JobKind::LibraryIo => "libraryIo",
             JobKind::MetadataRefresh => "metadataRefresh",
             JobKind::LatexCompile => "latexCompile",
+            JobKind::JevSmartHighlights => "jevSmartHighlights",
         };
         // ParseRefs always runs with online lookup enabled; the segment is
         // kept for fingerprint compatibility with pre-refactor jobs.
@@ -97,13 +99,14 @@ impl JobKind {
         }
     }
 
-    /// Execution host of the kind's business logic: `LayoutAnalyze`, `Import`,
-    /// `ConnectorSync`, `CitingScan`, `LibraryIo` and `MetadataRefresh` are
-    /// offered to the renderer (`job:offer`); every other kind runs a Rust
-    /// runner.
+    /// Execution host of the kind's business logic: `LayoutAnalyze`,
+    /// `LayoutTranslate`, `Import`, `ConnectorSync`, `CitingScan`, `LibraryIo`
+    /// and `MetadataRefresh` are offered to the renderer (`job:offer`); every
+    /// other kind runs a Rust runner.
     pub fn exec_host(self) -> ExecHost {
         match self {
             JobKind::LayoutAnalyze
+            | JobKind::LayoutTranslate
             | JobKind::Import
             | JobKind::ConnectorSync
             | JobKind::CitingScan
@@ -160,6 +163,14 @@ pub struct JobSnapshot {
     pub kind: JobKind,
     pub lane: JobLane,
     pub state: JobState,
+    /// Vault root as passed by the enqueuing caller, verbatim (lossy string).
+    /// Frontend-initiated jobs carry the exact frontend `getVaultPath()`
+    /// string, so consumers can filter by active vault; host-internal jobs
+    /// (watcher / recognize helpers) carry the Host's own form, usually
+    /// canonical (Windows: `\\?\` prefix). `vault_path` below stays the
+    /// canonical path used for filesystem access and the dedupe key.
+    pub vault_id: String,
+    /// Canonical vault root: filesystem operations + dedupe identity.
     pub vault_path: String,
     pub paper_path: Option<String>,
     pub fingerprint: String,
@@ -187,6 +198,9 @@ impl JobSnapshot {
             kind,
             lane,
             state: JobState::Skipped,
+            // Skipped snapshots never register or touch the filesystem, so no
+            // canonicalization happens: both fields carry the caller's string.
+            vault_id: vault_path.clone(),
             vault_path,
             paper_path,
             fingerprint: kind.fingerprint(false, None),
@@ -280,7 +294,10 @@ struct Job {
     id: JobId,
     kind: JobKind,
     lane: JobLane,
+    /// Canonical vault root: filesystem operations + dedupe key.
     vault_path: PathBuf,
+    /// Vault root as passed by the enqueuing caller (see `JobSnapshot.vault_id`).
+    vault_id: String,
     paper_path: Option<String>,
     fingerprint: String,
     depends_on: Vec<JobId>,
@@ -303,6 +320,7 @@ impl Job {
             kind: self.kind,
             lane: self.lane,
             state: self.state,
+            vault_id: self.vault_id.clone(),
             vault_path: self.vault_path.to_string_lossy().to_string(),
             paper_path: self.paper_path.clone(),
             fingerprint: self.fingerprint.clone(),
@@ -352,6 +370,33 @@ impl LaneQueues {
         }
     }
 
+    /// Rewrite the relative order of the given queued ids inside `lane`.
+    /// Ids that already started (or never queued here) are ignored, and every
+    /// other job keeps the position it already had. Returns whether the lane
+    /// order actually changed.
+    fn reorder(&mut self, lane: JobLane, ordered: &[JobId]) -> bool {
+        let queue = self.queue_mut(lane);
+        let present: Vec<JobId> = ordered
+            .iter()
+            .filter(|id| queue.contains(id))
+            .cloned()
+            .collect();
+        if present.len() < 2 {
+            return false;
+        }
+        let positions: Vec<usize> = queue
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| present.contains(id))
+            .map(|(index, _)| index)
+            .collect();
+        let before: Vec<JobId> = queue.iter().cloned().collect();
+        for (position, id) in positions.into_iter().zip(present) {
+            queue[position] = id;
+        }
+        before != queue.iter().cloned().collect::<Vec<_>>()
+    }
+
     #[cfg(test)]
     fn next_eligible(&self) -> Option<JobId> {
         self.focus
@@ -383,10 +428,14 @@ struct JobCenterInner {
     /// removed on every other terminal transition — cancel state therefore
     /// cannot leak from a crashed job or poison a later job.
     cancel_tokens: HashMap<JobId, CancellationToken>,
+    renderer_owners: HashMap<JobId, String>,
     /// `LayoutAnalyze` cap: 1 for local ONNX, unlimited for the remote API.
     layout_analyze_cap: LayoutAnalyzeCap,
     /// `Import` cap: seeded from the `batch_import_concurrency` setting.
     import_cap: ImportCap,
+    /// `LayoutTranslate` cap: seeded from the
+    /// `translate.autoTranslateImportConcurrency` setting (default 1).
+    layout_translate_cap: LayoutTranslateCap,
     /// Per-kind runners registered by business domains at app startup.
     runners: HashMap<JobKind, JobRunner>,
     /// Registered by the app assembly; re-read by `refresh_layout_backend`.
@@ -408,6 +457,7 @@ impl std::fmt::Debug for JobCenterInner {
             )
             .field("layout_analyze_cap", &self.layout_analyze_cap)
             .field("import_cap", &self.import_cap)
+            .field("layout_translate_cap", &self.layout_translate_cap)
             .field("runners", &self.runners.keys().collect::<Vec<_>>())
             .field(
                 "layout_backend_source",
@@ -443,6 +493,18 @@ impl Default for ImportCap {
     }
 }
 
+/// Default background import-translation cap when unseeded (headless / tests);
+/// the app seeds it from the `translate.autoTranslateImportConcurrency`
+/// setting. `Default` on `usize` would stall the queue at 0.
+#[derive(Debug, Clone, Copy)]
+struct LayoutTranslateCap(usize);
+
+impl Default for LayoutTranslateCap {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
 /// Per-kind concurrency cap (§7.3). `usize::MAX` = uncapped at the JobCenter
 /// level (the kind is either not yet scheduled here or throttled elsewhere).
 fn kind_concurrency(inner: &JobCenterInner, kind: JobKind) -> usize {
@@ -451,7 +513,10 @@ fn kind_concurrency(inner: &JobCenterInner, kind: JobKind) -> usize {
         JobKind::LayoutAnalyze => inner.layout_analyze_cap.0,
         JobKind::ParseRefs => 2,
         JobKind::DownloadAssets => 3,
-        JobKind::LayoutTranslate => 2,
+        // Seeded from `translate.autoTranslateImportConcurrency` (1–5): the
+        // number of papers the import-triggered background translation runs
+        // at once. Inside one paper the batch pool still applies.
+        JobKind::LayoutTranslate => inner.layout_translate_cap.0,
         // The liteparse probe subprocess is additionally globally capped at 2
         // (pdf_parse::MAX_CONCURRENT_PDF_PARSE); the kind cap keeps queue
         // order fair when many PDFs are imported at once.
@@ -471,6 +536,10 @@ fn kind_concurrency(inner: &JobCenterInner, kind: JobKind) -> usize {
         // One latexmk build at a time: TeX runs are CPU-heavy and the compile
         // button is interactive, so a second file waits instead of competing.
         JobKind::LatexCompile => 1,
+        // jEV smart highlights issue one network request per batch; keep one
+        // paper at a time to avoid hammering the API and to keep progress
+        // meaningful.
+        JobKind::JevSmartHighlights => 1,
         JobKind::PageCount | JobKind::WikiReindex => usize::MAX,
     }
 }
@@ -590,6 +659,7 @@ impl JobCenter {
         // protocol (no business feature involved), so this runner is built in
         // instead of registered by a domain.
         center.register_runner(JobKind::LayoutAnalyze, Arc::new(renderer_offer_runner));
+        center.register_runner(JobKind::LayoutTranslate, Arc::new(renderer_offer_runner));
         center.register_runner(JobKind::Import, Arc::new(renderer_offer_runner));
         center.register_runner(JobKind::ConnectorSync, Arc::new(renderer_offer_runner));
         center.register_runner(JobKind::CitingScan, Arc::new(renderer_offer_runner));
@@ -620,12 +690,26 @@ impl JobCenter {
         self
     }
 
+    /// Seed the `LayoutTranslate` background-translation cap (chainable).
+    pub fn with_layout_translate_concurrency(self, cap: usize) -> Self {
+        if let Ok(mut inner) = self.inner.try_lock() {
+            inner.layout_translate_cap = LayoutTranslateCap(cap.max(1));
+        }
+        self
+    }
+
     pub async fn set_layout_analyze_cap(&self, cap: usize) {
         self.inner.lock().await.layout_analyze_cap = LayoutAnalyzeCap(cap.max(1));
     }
 
     pub async fn apply_import_concurrency(&self, cap: usize) {
         self.inner.lock().await.import_cap = ImportCap(cap.max(1));
+    }
+
+    /// Update the `LayoutTranslate` cap after the setting changes. Callers
+    /// follow with `drain_and_spawn` so a raised cap starts queued papers.
+    pub async fn apply_layout_translate_concurrency(&self, cap: usize) {
+        self.inner.lock().await.layout_translate_cap = LayoutTranslateCap(cap.max(1));
     }
 
     pub async fn apply_layout_backend(&self, backend: &str) {
@@ -716,6 +800,70 @@ impl JobCenter {
     ) -> JobSnapshot {
         self.enqueue_core(JobKind::LayoutAnalyze, vault, path, lane, force, None, None)
             .await
+    }
+
+    /// Enqueue a background `LayoutTranslate` job that only starts after
+    /// `dependency` succeeded: layout analysis is its input, so a failed or
+    /// cancelled analysis settles it as `Skipped` instead of spending
+    /// translation requests on a missing sidecar.
+    pub async fn enqueue_layout_translate_after(
+        &self,
+        vault: impl Into<PathBuf>,
+        path: impl Into<String>,
+        lane: JobLane,
+        force: bool,
+        dependency: JobId,
+    ) -> JobSnapshot {
+        self.enqueue_core_with_deps(
+            JobKind::LayoutTranslate,
+            vault,
+            path,
+            lane,
+            force,
+            None,
+            None,
+            vec![dependency],
+            DepPolicy::AllSucceeded,
+        )
+        .await
+    }
+
+    /// Import / download pipeline: queue layout analysis and, when
+    /// `auto_translate` is set, the dependent background translation. Shared
+    /// by the `job_layout_analyze_enqueue` command and the import runners so
+    /// every import entry point queues the same pair.
+    ///
+    /// A dedupe hit returns the already-active layout job and does not retarget
+    /// an existing translation job's dependency; the translation stays queued
+    /// behind the job it was created for.
+    pub async fn enqueue_layout_analysis_with_translate(
+        &self,
+        vault: impl Into<PathBuf>,
+        path: impl Into<String>,
+        lane: JobLane,
+        force: bool,
+        auto_translate: bool,
+    ) -> (JobSnapshot, Option<JobSnapshot>) {
+        let vault = vault.into();
+        let path = path.into();
+        let layout = self
+            .enqueue_layout_analyze(vault.clone(), path.clone(), lane, force)
+            .await;
+        let translate = if auto_translate {
+            Some(
+                self.enqueue_layout_translate_after(
+                    vault,
+                    path,
+                    lane,
+                    force,
+                    JobId(layout.id.clone()),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        (layout, translate)
     }
 
     pub async fn enqueue_download_assets(
@@ -875,6 +1023,26 @@ impl JobCenter {
         .await
     }
 
+    /// Enqueue a jEV smart-highlight pass for one paper.
+    pub async fn enqueue_jev_smart_highlights(
+        &self,
+        vault: impl Into<PathBuf>,
+        path: impl Into<String>,
+        lane: JobLane,
+        force: bool,
+    ) -> JobSnapshot {
+        self.enqueue_core(
+            JobKind::JevSmartHighlights,
+            vault,
+            path,
+            lane,
+            force,
+            None,
+            None,
+        )
+        .await
+    }
+
     /// Shared enqueue path for every kind: normalize, dedupe on
     /// (kind, vault, paper, fingerprint), then register on the lane.
     /// Adding a new kind only needs a `JobKind` variant (with fingerprint +
@@ -890,6 +1058,35 @@ impl JobCenter {
         task_id: Option<String>,
         params: Option<serde_json::Value>,
     ) -> JobSnapshot {
+        self.enqueue_core_with_deps(
+            kind,
+            vault,
+            path,
+            lane,
+            force,
+            task_id,
+            params,
+            Vec::new(),
+            DepPolicy::AllSucceeded,
+        )
+        .await
+    }
+
+    /// [`JobCenter::enqueue_core`] with scheduler dependencies. A dedupe hit
+    /// returns the existing active job unchanged, including its dependencies.
+    #[allow(clippy::too_many_arguments)]
+    async fn enqueue_core_with_deps(
+        &self,
+        kind: JobKind,
+        vault: impl Into<PathBuf>,
+        path: impl Into<String>,
+        lane: JobLane,
+        force: bool,
+        task_id: Option<String>,
+        params: Option<serde_json::Value>,
+        depends_on: Vec<JobId>,
+        dep_policy: DepPolicy,
+    ) -> JobSnapshot {
         // `canonicalize_best_effort` does a synchronous `fs::canonicalize`; run
         // it on the blocking pool so a slow filesystem never stalls a tokio
         // worker. This happens before the center lock is taken, so no lock is
@@ -897,6 +1094,11 @@ impl JobCenter {
         // error fall back to the raw path, mirroring `canonicalize_best_effort`'s
         // own `unwrap_or` fallback.
         let raw_vault = vault.into();
+        // `vault_id` keeps the caller's string verbatim: the frontend's own
+        // `getVaultPath()` string for frontend-initiated jobs, the Host's form
+        // for internal enqueues. Only `vault_path` below is canonicalized
+        // (filesystem operations + the `JobKey` dedupe identity).
+        let vault_id = raw_vault.to_string_lossy().to_string();
         let vault_for_blocking = raw_vault.clone();
         let vault_path = match tokio::task::spawn_blocking(move || {
             canonicalize_best_effort(&vault_for_blocking)
@@ -916,6 +1118,17 @@ impl JobCenter {
         };
 
         let mut inner = self.inner.lock().await;
+        // A paper has one active document translation across all entrypoints.
+        if kind == JobKind::LayoutTranslate {
+            if let Some(existing) = inner.jobs.values().find(|job| {
+                job.kind == kind
+                    && job.vault_path == vault_path
+                    && job.paper_path.as_deref() == Some(paper_path.as_str())
+                    && matches!(job.state, JobState::Queued | JobState::Running)
+            }) {
+                return existing.snapshot();
+            }
+        }
         if let Some(existing_id) = inner.active_keys.get(&key) {
             if let Some(existing) = inner.jobs.get(existing_id) {
                 return existing.snapshot();
@@ -928,10 +1141,11 @@ impl JobCenter {
             kind,
             lane,
             vault_path,
+            vault_id,
             paper_path: Some(paper_path),
             fingerprint,
-            depends_on: Vec::new(),
-            dep_policy: DepPolicy::AllSucceeded,
+            depends_on,
+            dep_policy,
             attempts: 0,
             state: JobState::Queued,
             progress: Some(0.0),
@@ -947,6 +1161,53 @@ impl JobCenter {
         inner.lanes.push(lane, id.clone());
         inner.jobs.insert(id, job);
         snapshot
+    }
+
+    /// Promote a translation and its queued prerequisites without interrupting
+    /// work that already owns a slot.
+    pub async fn focus_layout_translate(&self, job_id: &str) -> Vec<JobSnapshot> {
+        let mut inner = self.inner.lock().await;
+        let mut pending = vec![JobId(job_id.to_string())];
+        let mut seen = std::collections::HashSet::new();
+        let mut snapshots = Vec::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some(job) = inner.jobs.get_mut(&id) else {
+                continue;
+            };
+            if job.state != JobState::Queued {
+                continue;
+            }
+            pending.extend(job.depends_on.clone());
+            job.lane = JobLane::Focus;
+            snapshots.push(job.snapshot());
+            // Opening another paper also promotes its background jobs. An
+            // explicit translate action takes the next available slot.
+            inner.lanes.remove(&id);
+            inner.lanes.focus.push_front(id);
+        }
+        snapshots
+    }
+
+    /// Broadcast translation offers execute in one window. A WebView reload
+    /// may reclaim its own work; other windows subscribe to the same job.
+    pub async fn claim_layout_translate(&self, job_id: &str, window: &str) -> bool {
+        let mut inner = self.inner.lock().await;
+        let id = JobId(job_id.to_string());
+        if !inner.jobs.get(&id).is_some_and(|job| {
+            job.kind == JobKind::LayoutTranslate && job.state == JobState::Running
+        }) {
+            return false;
+        }
+        match inner.renderer_owners.get(&id) {
+            Some(owner) => owner == window,
+            None => {
+                inner.renderer_owners.insert(id, window.to_string());
+                true
+            }
+        }
     }
 
     pub async fn promote_paper(&self, vault: &Path, path: &str) -> Vec<JobSnapshot> {
@@ -972,6 +1233,38 @@ impl JobCenter {
             inner.lanes.promote_to_focus(&id);
         }
         snapshots
+    }
+
+    /// Reorder the queued jobs in `job_ids` to the given relative order.
+    /// Running / unknown ids are ignored; each lane is rewritten independently
+    /// and unlisted jobs keep their positions. Returns whether any lane moved.
+    pub async fn reorder_queued(&self, job_ids: &[String]) -> bool {
+        let mut inner = self.inner.lock().await;
+        let mut seen = std::collections::HashSet::new();
+        let mut requested: Vec<(JobId, JobLane)> = Vec::new();
+        for raw in job_ids {
+            let id = JobId(raw.clone());
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some(job) = inner.jobs.get(&id) else {
+                continue;
+            };
+            if job.state != JobState::Queued {
+                continue;
+            }
+            requested.push((id, job.lane));
+        }
+        let mut changed = false;
+        for lane in [JobLane::Focus, JobLane::Normal, JobLane::Idle] {
+            let ordered: Vec<JobId> = requested
+                .iter()
+                .filter(|(_, job_lane)| *job_lane == lane)
+                .map(|(id, _)| id.clone())
+                .collect();
+            changed |= inner.lanes.reorder(lane, &ordered);
+        }
+        changed
     }
 
     pub async fn cancel(&self, job_id: &str) -> bool {
@@ -1138,6 +1431,23 @@ impl JobCenter {
                 let Some(kind) = inner.jobs.get(&id).map(|job| job.kind) else {
                     return StartOutcome::Waiting;
                 };
+                // Dependency wakeups and direct enqueue tails also enter here.
+                // They must honor a user-focused translation already waiting.
+                if kind == JobKind::LayoutTranslate {
+                    let first = [&inner.lanes.focus, &inner.lanes.normal, &inner.lanes.idle]
+                        .into_iter()
+                        .flat_map(|queue| queue.iter())
+                        .find(|candidate| {
+                            inner.jobs.get(*candidate).is_some_and(|job| {
+                                job.kind == kind
+                                    && job.state == JobState::Queued
+                                    && deps_readiness(&inner, job) == DepsReadiness::Ready
+                            })
+                        });
+                    if first.is_some_and(|first| first != &id) {
+                        return StartOutcome::Waiting;
+                    }
+                }
                 let running = inner.running_by_kind.get(&kind).copied().unwrap_or(0);
                 if running >= kind_concurrency(&inner, kind) {
                     // Kind is at its concurrency cap; stay queued until a slot
@@ -1307,6 +1617,12 @@ impl JobCenter {
     /// Start any `Queued` job whose dependencies are ready and whose kind has
     /// a free concurrency slot, spawning its runner. Runs after every finish so
     /// a freed slot progresses the queue (lane order: focus, normal, idle).
+    ///
+    /// Jobs whose dependencies can never be satisfied (a failed / cancelled
+    /// dependency under `AllSucceeded`, including a job cancelled without the
+    /// finish path) are settled as `Skipped` here, so a dependent
+    /// `LayoutTranslate` never stays queued forever after its layout analysis
+    /// is cancelled.
     pub async fn drain_and_spawn(&self, app: &tauri::AppHandle) {
         loop {
             let candidate = {
@@ -1320,12 +1636,19 @@ impl JobCenter {
                         if job.state != JobState::Queued {
                             continue;
                         }
+                        let readiness = deps_readiness(&inner, job);
+                        if readiness == DepsReadiness::Unreachable {
+                            // `try_start` turns this into `Skipped` + emit; it
+                            // needs no slot, so do not wait on the kind's cap.
+                            found = Some(id.clone());
+                            break 'outer;
+                        }
+                        if readiness != DepsReadiness::Ready {
+                            continue;
+                        }
                         let kind = job.kind;
                         let running = inner.running_by_kind.get(&kind).copied().unwrap_or(0);
                         if running >= kind_concurrency(&inner, kind) {
-                            continue;
-                        }
-                        if deps_readiness(&inner, job) != DepsReadiness::Ready {
                             continue;
                         }
                         found = Some(id.clone());
@@ -1521,6 +1844,7 @@ impl JobCenter {
             kind,
             lane: JobLane::Normal,
             vault_path: canonicalize_best_effort(&vault),
+            vault_id: vault.to_string_lossy().to_string(),
             paper_path: Some(path.to_string()),
             fingerprint: format!("test:{}", id.0),
             depends_on,
@@ -1640,6 +1964,60 @@ pub fn validate_job_paper(vault_path: &str, path_raw: &str) -> Result<(PathBuf, 
     Ok((vault, path))
 }
 
+/// Start an already-enqueued job right away. No-op while its dependencies are
+/// pending; `Skipped` snapshots are re-emitted. Dependent jobs are normally
+/// woken by their dependency's finish, but that finish can land between the two
+/// enqueues, so import pipelines call this once after registering the pair.
+pub async fn start_enqueued_job(
+    app: &tauri::AppHandle,
+    center: &JobCenter,
+    snapshot: &JobSnapshot,
+) {
+    match center.try_start(&snapshot.id).await {
+        StartOutcome::Started(started) => center.spawn_runner(app, started),
+        StartOutcome::Skipped(skipped) => emit_job_changed(app, skipped),
+        StartOutcome::Waiting => {}
+    }
+}
+
+/// Import follow-up for entry points that write the PDF outside the
+/// `DownloadAssets` runner (plaza, Connector attachments): enqueue and start
+/// layout analysis and, when Settings → Translate → auto-translate-after-import
+/// is on, its dependent background translation. No-op without an app handle
+/// (headless / CLI).
+pub fn spawn_layout_after_import(app: Option<&tauri::AppHandle>, vault: &Path, path_rel: &str) {
+    let Some(app) = app else {
+        return;
+    };
+    let app = app.clone();
+    let vault = vault.to_path_buf();
+    let path_rel = path_rel.to_string();
+    tauri::async_runtime::spawn(async move {
+        let center = app.state::<JobCenter>().handle();
+        let settings = app.state::<crate::features::system::settings::AppSettingsStore>();
+        let backend = settings.layout_backend();
+        let auto_translate = settings.auto_translate_import();
+        center.apply_layout_backend(&backend).await;
+        let (layout, translate) = center
+            .enqueue_layout_analysis_with_translate(
+                &vault,
+                &path_rel,
+                JobLane::Normal,
+                false,
+                auto_translate,
+            )
+            .await;
+        emit_job_changed(&app, layout.clone());
+        if let Some(translate) = translate {
+            emit_job_changed(&app, translate.clone());
+            // The layout job may already have settled (dedupe hit); wake the
+            // dependent here instead of relying on a finish event.
+            start_enqueued_job(&app, &center, &translate).await;
+        }
+        start_enqueued_job(&app, &center, &layout).await;
+    });
+}
+
 pub fn spawn_parse_body_after_assets(
     app: Option<&tauri::AppHandle>,
     vault: &Path,
@@ -1745,6 +2123,7 @@ impl Drop for TaskCancelRegistration {
 }
 
 fn release_active_key(inner: &mut JobCenterInner, job_id: &JobId) {
+    inner.renderer_owners.remove(job_id);
     inner.active_keys.retain(|_, id| id != job_id);
 }
 
@@ -1768,6 +2147,106 @@ mod tests {
 
         assert_eq!(first.id, duplicate.id);
         assert_eq!(center.list(None, None).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reorder_queued_rewrites_the_lane_order() {
+        let center = JobCenter::new();
+        let vault = vault("reorder");
+        let mut ids = Vec::new();
+        for path in ["papers/a", "papers/b", "papers/c"] {
+            ids.push(
+                center
+                    .enqueue_for_test(
+                        JobKind::Import,
+                        vault.clone(),
+                        path,
+                        Vec::new(),
+                        DepPolicy::AllSettled,
+                    )
+                    .await,
+            );
+        }
+        let requested: Vec<String> = ids.iter().rev().map(|id| id.0.clone()).collect();
+
+        assert!(center.reorder_queued(&requested).await);
+
+        let inner = center.inner.lock().await;
+        let order: Vec<String> = inner.lanes.normal.iter().map(|id| id.0.clone()).collect();
+        assert_eq!(order, requested);
+    }
+
+    #[tokio::test]
+    async fn reorder_queued_ignores_running_jobs() {
+        let center = JobCenter::new();
+        let vault = vault("reorder-running");
+        let first = center
+            .enqueue_for_test(
+                JobKind::Import,
+                vault.clone(),
+                "papers/a",
+                Vec::new(),
+                DepPolicy::AllSettled,
+            )
+            .await;
+        let second = center
+            .enqueue_for_test(
+                JobKind::Import,
+                vault.clone(),
+                "papers/b",
+                Vec::new(),
+                DepPolicy::AllSettled,
+            )
+            .await;
+        let third = center
+            .enqueue_for_test(
+                JobKind::Import,
+                vault,
+                "papers/c",
+                Vec::new(),
+                DepPolicy::AllSettled,
+            )
+            .await;
+        assert!(matches!(
+            center.try_start(&first.0).await,
+            StartOutcome::Started(_)
+        ));
+
+        // The running job is not in the lane; only the queued tail can move.
+        assert!(
+            center
+                .reorder_queued(&[third.0.clone(), second.0.clone()])
+                .await
+        );
+        let inner = center.inner.lock().await;
+        let order: Vec<String> = inner.lanes.normal.iter().map(|id| id.0.clone()).collect();
+        assert_eq!(order, vec![third.0, second.0]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_keeps_the_raw_caller_vault_as_vault_id() {
+        // A real directory so canonicalization actually rewrites the input
+        // (drops the trailing separator; macOS resolves the temp symlink, and
+        // Windows additionally adds the `\\?\` prefix). `vault_id` must keep
+        // the caller's string verbatim — frontend filtering compares it with
+        // `getVaultPath()`.
+        let dir = std::env::temp_dir().join("agentero-job-vault-id-test");
+        std::fs::create_dir_all(&dir).expect("create temp vault dir");
+        let raw = format!("{}{}", dir.display(), std::path::MAIN_SEPARATOR);
+        let center = JobCenter::new();
+        let first = center
+            .enqueue_parse_refs(PathBuf::from(&raw), "papers/a", JobLane::Normal, false)
+            .await;
+        assert_eq!(first.vault_id, raw);
+        assert_ne!(first.vault_path, raw);
+
+        // Dedupe still keys on the canonical path: re-enqueueing with the
+        // other spelling returns the same job.
+        let second = center
+            .enqueue_parse_refs(dir.clone(), "papers/a", JobLane::Normal, false)
+            .await;
+        assert_eq!(first.id, second.id);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -2970,5 +3449,303 @@ mod tests {
                 .has_active_job_of_kind(&vault, path, JobKind::RecognizeMetadata)
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn layout_pipeline_queues_translate_behind_analysis() {
+        let center = JobCenter::new();
+        let (layout, translate) = center
+            .enqueue_layout_analysis_with_translate(
+                vault("pipeline"),
+                "papers/a",
+                JobLane::Normal,
+                false,
+                true,
+            )
+            .await;
+        let translate = translate.expect("dependent translate job");
+        assert_eq!(layout.kind, JobKind::LayoutAnalyze);
+        assert_eq!(translate.kind, JobKind::LayoutTranslate);
+        assert_eq!(translate.depends_on, vec![layout.id.clone()]);
+        assert_eq!(translate.dep_policy, DepPolicy::AllSucceeded);
+        // Both execute in the renderer; the dependent job only starts once the
+        // layout sidecar exists.
+        assert_eq!(layout.host, ExecHost::Renderer);
+        assert_eq!(translate.host, ExecHost::Renderer);
+        assert_eq!(
+            center.state_for_test(&translate.id).await,
+            Some(JobState::Queued)
+        );
+        match center.try_start(&translate.id).await {
+            StartOutcome::Waiting => {}
+            other => panic!("expected Waiting, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn layout_pipeline_without_auto_translate_enqueues_only_analysis() {
+        let center = JobCenter::new();
+        let (layout, translate) = center
+            .enqueue_layout_analysis_with_translate(
+                vault("pipeline-off"),
+                "papers/a",
+                JobLane::Normal,
+                false,
+                false,
+            )
+            .await;
+        assert!(translate.is_none());
+        assert_eq!(
+            center.list(None, None).await.len(),
+            1,
+            "only the layout job is registered"
+        );
+        assert_eq!(layout.kind, JobKind::LayoutAnalyze);
+    }
+
+    #[tokio::test]
+    async fn finishing_analysis_starts_dependent_translate() {
+        let center = JobCenter::new();
+        let (layout, translate) = center
+            .enqueue_layout_analysis_with_translate(
+                vault("pipeline-wake"),
+                "papers/a",
+                JobLane::Normal,
+                false,
+                true,
+            )
+            .await;
+        let translate = translate.expect("dependent translate job");
+        center.mark_succeeded_for_test(&layout.id).await;
+        let woken = center.wake_dependents(&layout.id).await;
+        assert_eq!(woken.len(), 1);
+        match &woken[0] {
+            StartOutcome::Started(started) => {
+                assert_eq!(started.snapshot.id, translate.id);
+                assert_eq!(started.snapshot.kind, JobKind::LayoutTranslate);
+            }
+            other => panic!("expected Started, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_analysis_skips_dependent_translate() {
+        let center = JobCenter::new();
+        let (layout, translate) = center
+            .enqueue_layout_analysis_with_translate(
+                vault("pipeline-cancel"),
+                "papers/a",
+                JobLane::Normal,
+                false,
+                true,
+            )
+            .await;
+        let translate = translate.expect("dependent translate job");
+        assert!(center.cancel(&layout.id).await);
+        match center.try_start(&translate.id).await {
+            StartOutcome::Skipped(snapshot) => {
+                assert_eq!(snapshot.state, JobState::Skipped);
+                assert_eq!(snapshot.phase.as_deref(), Some("dependency failed"));
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn layout_translate_focus_reuses_job_and_waits_without_preemption() {
+        let center = JobCenter::new();
+        let v = vault("translate-focus");
+        let a = center
+            .enqueue_core(
+                JobKind::LayoutTranslate,
+                v.clone(),
+                "papers/a",
+                JobLane::Normal,
+                false,
+                None,
+                None,
+            )
+            .await;
+        let started = match center.try_start(&a.id).await {
+            StartOutcome::Started(job) => job,
+            other => panic!("{other:?}"),
+        };
+        let b = center
+            .enqueue_core(
+                JobKind::LayoutTranslate,
+                v.clone(),
+                "papers/b",
+                JobLane::Focus,
+                false,
+                None,
+                None,
+            )
+            .await;
+        let c = center
+            .enqueue_core(
+                JobKind::LayoutTranslate,
+                v.clone(),
+                "papers/c",
+                JobLane::Normal,
+                false,
+                None,
+                None,
+            )
+            .await;
+        let again = center
+            .enqueue_core(
+                JobKind::LayoutTranslate,
+                v,
+                "papers/c",
+                JobLane::Focus,
+                true,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(again.id, c.id);
+        center.focus_layout_translate(&c.id).await;
+        assert!(!started.cancel_token.is_cancelled());
+        assert!(matches!(
+            center.try_start(&c.id).await,
+            StartOutcome::Waiting
+        ));
+        assert_eq!(center.state_for_test(&a.id).await, Some(JobState::Running));
+        center
+            .job_report(&a.id, Some(100.0), None, None, Some(JobState::Succeeded))
+            .await
+            .unwrap();
+        assert!(matches!(
+            center.try_start(&b.id).await,
+            StartOutcome::Waiting
+        ));
+        assert!(matches!(
+            center.try_start(&c.id).await,
+            StartOutcome::Started(..)
+        ));
+    }
+
+    #[tokio::test]
+    async fn layout_translate_focus_promotes_queued_layout_prerequisites() {
+        let center = JobCenter::new();
+        let (layout, translate) = center
+            .enqueue_layout_analysis_with_translate(
+                vault("translate-deps-focus"),
+                "papers/a",
+                JobLane::Normal,
+                false,
+                true,
+            )
+            .await;
+        let translate = translate.unwrap();
+        let promoted = center.focus_layout_translate(&translate.id).await;
+        assert_eq!(promoted.len(), 2);
+        assert_eq!(
+            center.snapshot(&layout.id).await.unwrap().lane,
+            JobLane::Focus
+        );
+        assert_eq!(
+            center.snapshot(&translate.id).await.unwrap().lane,
+            JobLane::Focus
+        );
+        assert!(matches!(
+            center.try_start(&translate.id).await,
+            StartOutcome::Waiting
+        ));
+    }
+
+    #[tokio::test]
+    async fn layout_translate_executes_in_one_window_and_keeps_terminal_snapshot() {
+        let center = JobCenter::new();
+        let job = center
+            .enqueue_core(
+                JobKind::LayoutTranslate,
+                vault("translate-owner"),
+                "papers/a",
+                JobLane::Normal,
+                false,
+                None,
+                None,
+            )
+            .await;
+        assert!(!center.claim_layout_translate(&job.id, "a").await);
+        assert!(matches!(
+            center.try_start(&job.id).await,
+            StartOutcome::Started(..)
+        ));
+        assert!(center.claim_layout_translate(&job.id, "a").await);
+        assert!(!center.claim_layout_translate(&job.id, "b").await);
+        assert!(center.claim_layout_translate(&job.id, "a").await);
+        center.merge_running_job_params(&job.id, serde_json::json!({"layoutTranslate": {"items": [{"id": "block", "translated": "result"}]}})).await;
+        let result = center
+            .job_report(&job.id, Some(100.0), None, None, Some(JobState::Succeeded))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.params.unwrap()["layoutTranslate"]["items"][0]["translated"],
+            "result"
+        );
+        assert!(!center.claim_layout_translate(&job.id, "a").await);
+    }
+
+    #[tokio::test]
+    async fn layout_translate_cap_default_is_one_paper() {
+        let center = JobCenter::new();
+        let first = center
+            .enqueue_for_test(
+                JobKind::LayoutTranslate,
+                vault("translate-cap-default"),
+                "papers/a",
+                Vec::new(),
+                DepPolicy::AllSucceeded,
+            )
+            .await;
+        let second = center
+            .enqueue_for_test(
+                JobKind::LayoutTranslate,
+                vault("translate-cap-default"),
+                "papers/b",
+                Vec::new(),
+                DepPolicy::AllSucceeded,
+            )
+            .await;
+        match center.try_start(&first.0).await {
+            StartOutcome::Started(..) => {}
+            other => panic!("expected Started, got {other:?}"),
+        }
+        match center.try_start(&second.0).await {
+            StartOutcome::Waiting => {}
+            other => panic!("expected Waiting under cap 1, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn layout_translate_cap_limits_concurrent_papers() {
+        let center = JobCenter::new();
+        center.apply_layout_translate_concurrency(2).await;
+        let mut ids = Vec::new();
+        for name in ["a", "b", "c"] {
+            ids.push(
+                center
+                    .enqueue_for_test(
+                        JobKind::LayoutTranslate,
+                        vault("translate-cap-two"),
+                        &format!("papers/{name}"),
+                        Vec::new(),
+                        DepPolicy::AllSucceeded,
+                    )
+                    .await,
+            );
+        }
+        for id in &ids[..2] {
+            match center.try_start(&id.0).await {
+                StartOutcome::Started(..) => {}
+                other => panic!("expected Started, got {other:?}"),
+            }
+        }
+        match center.try_start(&ids[2].0).await {
+            StartOutcome::Waiting => {}
+            other => panic!("expected Waiting under cap 2, got {other:?}"),
+        }
     }
 }

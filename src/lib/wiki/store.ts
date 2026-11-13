@@ -6,6 +6,13 @@
  */
 
 import { createStore } from "zustand/vanilla";
+import { perfOp, perfWait } from "@/lib/core/perf";
+import {
+	clearRefreshWave,
+	noteWikiPath,
+	registerWikiRevisionBump,
+} from "@/lib/lifecycle/refresh-wave";
+import { isResearchTablePath } from "@/lib/research-table/model";
 import type { VaultFileChangedPayload } from "@/lib/vault/fs-watch";
 import { watchRefreshDelayMs } from "@/lib/vault/shell-activity";
 import { getVaultPath } from "@/lib/vault/store";
@@ -69,79 +76,100 @@ export function setExternalRenameFailure(
 /** Rebuild wiki index and notify Backlinks/Graph panels to re-fetch. */
 export async function rebuildWikiAndNotify(path: string): Promise<void> {
 	try {
-		await rebuildWikiIndex(path);
+		await perfOp("graph_rebuild", () => rebuildWikiIndex(path));
 		bumpWikiIndexRevision();
 	} catch {
 		// Index rebuild is best-effort; panels re-fetch on next path change.
 	}
 }
 
-/** Debounced wiki/backlinks/graph rebuild after on-disk changes. */
+/** Debounced embed refresh for autosave echoes. External paths join the refresh wave. */
 let wikiRebuildTimer: ReturnType<typeof setTimeout> | null = null;
-/** Watcher paths collected for the current debounced Wiki rebuild. */
-const wikiRebuildPaths = new Set<string>();
-/** Self-write echoes that only refresh mounted embeds, skipping the rebuild. */
+/** Self-write echoes that only refresh mounted embeds, skipping the index update. */
 const wikiEchoEmbedPaths = new Set<string>();
+
+function queueEmbedRefresh(absPath: string): void {
+	wikiEchoEmbedPaths.add(absPath);
+	if (wikiRebuildTimer) clearTimeout(wikiRebuildTimer);
+	const scheduledAt = performance.now();
+	const delay = watchRefreshDelayMs("wiki");
+	wikiRebuildTimer = setTimeout(() => {
+		wikiRebuildTimer = null;
+		perfWait("watch_wait.wiki", performance.now() - scheduledAt);
+		const echoPaths = [...wikiEchoEmbedPaths];
+		wikiEchoEmbedPaths.clear();
+		if (!getVaultPath() || echoPaths.length === 0) return;
+		notifyWikiEmbedTargets(echoPaths);
+	}, delay);
+}
 
 /**
  * Markdown files carry references; images and PDFs are canonical targets
  * whose create/remove/modify events also invalidate link resolution and
- * embedded attachment projections.
+ * embedded attachment projections. Research tables are embed targets only:
+ * a file change refreshes mounted previews and does not rebuild the link index.
  */
 export function scheduleWikiRebuild(absPath: string): void {
+	if (isResearchTablePath(absPath)) {
+		if (!getVaultPath()) return;
+		queueEmbedRefresh(absPath);
+		return;
+	}
 	if (!isWikiTargetPath(absPath)) return;
-	// Autosave/⌘S echo: the app already knows about this write, so a full
-	// rebuild would just re-index content it wrote itself (#270).
-	if (isSelfWrittenPath(absPath)) wikiEchoEmbedPaths.add(absPath);
-	else wikiRebuildPaths.add(absPath);
-	if (wikiRebuildTimer) clearTimeout(wikiRebuildTimer);
-	wikiRebuildTimer = setTimeout(() => {
-		wikiRebuildTimer = null;
-		const changedPaths = [...wikiRebuildPaths];
-		wikiRebuildPaths.clear();
-		const echoPaths = [...wikiEchoEmbedPaths];
-		wikiEchoEmbedPaths.clear();
-		const vault = getVaultPath();
-		if (!vault) return;
-		if (changedPaths.length === 0) {
-			notifyWikiEmbedTargets(echoPaths);
-			return;
-		}
-		void rebuildWikiAndNotify(vault).finally(() =>
-			notifyWikiEmbedTargets([...changedPaths, ...echoPaths]),
-		);
-	}, watchRefreshDelayMs("wiki"));
+	// Autosave/⌘S echo: the save path already folded this file into the index,
+	// so the watcher only refreshes mounted embeds (#270).
+	if (isSelfWrittenPath(absPath)) {
+		queueEmbedRefresh(absPath);
+		return;
+	}
+	if (!getVaultPath()) return;
+	noteWikiPath(absPath);
 }
 
 /** Paths this app just wrote to disk; their watcher echoes skip the rebuild. */
-const selfWrittenPaths = new Map<string, number>();
+const selfWrittenPaths = new Map<
+	string,
+	{ expiresAt: number; content?: string }
+>();
 
 /** Watcher echoes of an app write settle well within this window. */
 const SELF_WRITE_ECHO_TTL_MS = 4000;
 
 /**
  * Remember a path this app wrote to disk so its watcher echo does not
- * re-trigger a full Wiki rebuild on every autosave. Only gates the rebuild
- * trigger; every other watcher consumer still sees the event.
+ * re-trigger a full Wiki rebuild on every autosave. `content`, when passed,
+ * lets editor reload ignore that same body even if the tab seed is still stale.
  */
-export function trackSelfWrittenPath(path: string): void {
-	selfWrittenPaths.set(
-		normalizeTabPath(path),
-		Date.now() + SELF_WRITE_ECHO_TTL_MS,
-	);
+export function trackSelfWrittenPath(path: string, content?: string): void {
+	selfWrittenPaths.set(normalizeTabPath(path), {
+		expiresAt: Date.now() + SELF_WRITE_ECHO_TTL_MS,
+		...(content !== undefined ? { content } : {}),
+	});
 }
 
-function isSelfWrittenPath(absPath: string): boolean {
+function selfWriteEcho(
+	absPath: string,
+): { expiresAt: number; content?: string } | null {
 	const now = Date.now();
 	const normalized = normalizeTabPath(absPath);
-	for (const [path, expiresAt] of selfWrittenPaths) {
-		if (expiresAt <= now) {
+	let matched: { expiresAt: number; content?: string } | null = null;
+	for (const [path, entry] of selfWrittenPaths) {
+		if (entry.expiresAt <= now) {
 			selfWrittenPaths.delete(path);
 			continue;
 		}
-		if (normalized === path) return true;
+		if (path === normalized) matched = entry;
 	}
-	return false;
+	return matched;
+}
+
+function isSelfWrittenPath(absPath: string): boolean {
+	return selfWriteEcho(absPath) !== null;
+}
+
+/** True when `content` is the body just written to `path` by this app. */
+export function isSelfWrittenContent(path: string, content: string): boolean {
+	return selfWriteEcho(path)?.content === content;
 }
 
 /** Host watcher paths caused by a committed rename transaction. */
@@ -194,8 +222,8 @@ export function clearWikiVaultState(): void {
 		clearTimeout(wikiRebuildTimer);
 		wikiRebuildTimer = null;
 	}
-	wikiRebuildPaths.clear();
 	wikiEchoEmbedPaths.clear();
+	clearRefreshWave();
 	selfWrittenPaths.clear();
 	internalRenamePaths.clear();
 	wikiStore.setState({
@@ -205,3 +233,5 @@ export function clearWikiVaultState(): void {
 		externalRenameFailure: null,
 	});
 }
+
+registerWikiRevisionBump(bumpWikiIndexRevision);

@@ -1,8 +1,14 @@
 {
+	"sources": {
+		"count_one": "{{count}} source",
+		"count_other": "{{count}} sources",
+		"link": "Link"
+	},
 	"context": {
 		"iconLabel": "Model context usage"
 	},
 	"tool": {
+		"exitCode": "Exit {{code}}",
 		"status": {
 			"awaitingApproval": "Awaiting Approval",
 			"responded": "Responded",
@@ -21,6 +27,8 @@
 		"thought": "Thought process"
 	},
 	"conversation": {
+		"messages": "Messages",
+		"scrollToEnd": "Scroll to latest message",
 		"empty": {
 			"title": "No messages yet",
 			"description": "Start a conversation to see messages here"
@@ -48,11 +56,25 @@
 		"download": "Download table",
 		"downloadAsCsv": "Download as CSV",
 		"downloadAsMarkdown": "Download as Markdown",
-		"viewFullscreen": "View fullscreen"
+		"viewFullscreen": "View fullscreen",
+		"exitFullscreen": "Exit fullscreen"
 	},
 	"code": {
 		"copy": "Copy code",
 		"download": "Download code"
+	},
+	"mermaid": {
+		"label": "Mermaid diagram",
+		"viewSource": "View source",
+		"viewDiagram": "View diagram",
+		"copySource": "Copy Mermaid source",
+		"zoomIn": "Zoom in",
+		"zoomOut": "Zoom out",
+		"resetZoom": "Reset to 100%",
+		"fitToView": "Fit diagram",
+		"viewFullscreen": "View fullscreen",
+		"exitFullscreen": "Exit fullscreen",
+		"error": "This Mermaid diagram could not be rendered."
 	},
 	"promptInput": {
 		"placeholder": "What would you like to know?",

@@ -85,10 +85,11 @@ export async function runSelectionTranslate({
 	sessionRef,
 	activeSessionRef,
 }: RunSelectionTranslateOptions): Promise<void> {
-	const { providerId, targetLangName, customPrompt } = prepareTranslateTask({
-		text,
-		context,
-	});
+	const { providerId, targetLangName, customPrompt, customSystem, customUser } =
+		prepareTranslateTask({
+			text,
+			context,
+		});
 
 	if (providerId === "agent") {
 		const prompt = buildTranslatePrompt({
@@ -97,9 +98,12 @@ export async function runSelectionTranslate({
 			page: context.page,
 			surface: context.surface,
 			customPrompt,
+			customSystem,
+			customUser,
 		});
 		try {
 			const resolved = await resolveConfiguredTranslateAgent();
+			if (disposedRef.current) return;
 			if (!resolved.agentId) {
 				const msg = noAgentText();
 				notifyError(msg);
@@ -142,6 +146,7 @@ export async function runSelectionTranslate({
 					}
 				},
 				onFailed: (ev) => {
+					if (disposedRef.current) return;
 					evictAgentTranslateSessionId(paperKey, agentId, modelId);
 					const msg = ev.error || agentFailedText();
 					notifyError(msg);
@@ -150,6 +155,7 @@ export async function runSelectionTranslate({
 				onSettled: () => stopStreaming(),
 			});
 		} catch (e) {
+			if (disposedRef.current) return;
 			const message = errorText(e);
 			notifyError(message);
 			markFailed(message);
@@ -160,8 +166,10 @@ export async function runSelectionTranslate({
 
 	try {
 		const result = await runTranslate({ text, context }, { providerId });
+		if (disposedRef.current) return;
 		commitProviderResult(result.trim());
 	} catch (e) {
+		if (disposedRef.current) return;
 		const message = displayTranslateError(errorText(e));
 		notifyError(message);
 		markFailed(message);

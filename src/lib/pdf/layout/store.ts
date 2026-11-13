@@ -147,6 +147,42 @@ export function getLayoutDocumentResult(
 	);
 }
 
+/**
+ * Source document key for a dual-pane translation pane id (`base::translation`).
+ * Returns null when `documentId` is not a translation companion.
+ */
+export function translationSourceKey(documentId: string): string | null {
+	const key = layoutDocumentKey(documentId);
+	const suffix = "::translation";
+	return key.endsWith(suffix) ? key.slice(0, -suffix.length) : null;
+}
+
+/**
+ * Keep a translation pane's layout result mirrored from its source document.
+ *
+ * `openTranslationTab` seeds a one-shot snapshot when the pane opens; if layout
+ * analysis was still running then, the source result lands later under the
+ * source key and never reaches the pane. Subscribe so the pane's auto-start can
+ * still fire once regions are ready (and re-mirror when the source re-analyzes).
+ *
+ * Returns an unsubscribe function.
+ */
+export function mirrorLayoutResultToTranslation(
+	translationDocId: string,
+	sourceKey: string,
+): () => void {
+	const translationKey = layoutDocumentKey(translationDocId);
+	let seededFrom: PdfLayoutDocumentResult | null = null;
+	const sync = () => {
+		const source = getLayoutDocumentResult(sourceKey);
+		if (!source || source === seededFrom) return;
+		seededFrom = source;
+		setLayoutDocumentResult({ ...source, documentId: translationKey });
+	};
+	sync();
+	return layoutAnalysisStore.subscribe(sync);
+}
+
 export function clearLayoutDocumentResult(documentId: string): void {
 	const key = layoutDocumentKey(documentId);
 	layoutAnalysisStore.setState((state) => {
@@ -190,10 +226,6 @@ export function toggleLayoutOverlayVisible(documentId: string): boolean {
 	return next;
 }
 
-export function isLayoutOverlayVisible(documentId: string): boolean {
-	return layoutAnalysisStore.getState().overlayVisible[documentId] ?? false;
-}
-
 function sameFocusedBbox(
 	a: PdfAskNormalizedRect | undefined,
 	b: PdfAskNormalizedRect | undefined,
@@ -203,34 +235,10 @@ function sameFocusedBbox(
 	return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
 }
 
-/**
- * Section headers from layout OCR are often a ~1% tall title strip. Expand to
- * a readable preview block (title + following body) so citation jumps are visible.
- */
-export function expandFocusBboxForOverlay(
-	bbox: PdfAskNormalizedRect,
-	kind: PdfLayoutKind,
-): PdfAskNormalizedRect {
-	if (kind !== "header" || bbox.h >= 0.05) return bbox;
-	const top = Math.max(0, bbox.y - 0.008);
-	const left = Math.min(Math.max(0, bbox.x - 0.02), 0.12);
-	const right = 0.92;
-	const previewH = 0.28;
-	const h = Math.min(previewH, Math.max(0.08, 1 - top));
-	const w = Math.max(bbox.w, right - left);
-	return {
-		x: left,
-		y: top,
-		w: Math.min(w, 1 - left),
-		h,
-	};
-}
-
 function regionFromSnapshot(
 	regionId: string,
 	snapshot: FocusedLayoutSnapshot,
 ): PdfLayoutRegion {
-	const bbox = expandFocusBboxForOverlay(snapshot.bbox, snapshot.kind);
 	return {
 		id: regionId,
 		pageIndex: snapshot.pageIndex,
@@ -239,7 +247,7 @@ function regionFromSnapshot(
 		score: 1,
 		readingOrder: 0,
 		rect: { x: 0, y: 0, w: 0, h: 0 },
-		bbox,
+		bbox: snapshot.bbox,
 	};
 }
 
@@ -302,16 +310,11 @@ export function setFocusedLayoutRegion(
 	}
 }
 
-export function getFocusedLayoutRegion(documentId: string): string | null {
-	const focused = layoutAnalysisStore.getState().focused;
-	if (!focused || focused.documentId !== documentId) return null;
-	return focused.regionId;
-}
-
 /** Infer a layout kind for citation / synthetic region ids. */
 export function layoutKindFromCitationFragment(
 	fragment: string,
 ): PdfLayoutKind {
+	if (/^\d+(?:\.\d+)*#p[1-9]\d*$/.test(fragment)) return "text";
 	const key = (fragment.split("=")[0] ?? "").toLowerCase();
 	switch (key) {
 		case "figure":

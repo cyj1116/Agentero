@@ -6,8 +6,8 @@
  * Split out because nothing else in the viewer reads the find state — the
  * search plugin is the only consumer — while the ⌘F listener and the debounce
  * timer are easy to break when they sit next to unrelated effects. The
- * `useSearch` capability itself stays in `PdfViewerInner` (plugin context) and
- * is injected here.
+ * `useSearch` capability itself stays in each viewer inner (plugin context)
+ * and is injected here.
  */
 
 import type { ScrollScope } from "@embedpdf/plugin-scroll/react";
@@ -24,6 +24,7 @@ import {
 	useState,
 } from "react";
 import { useDebouncedCallback } from "@/hooks/use-debounce";
+import { isFindShortcut } from "@/lib/shell/shortcuts";
 
 /** How long the query rests before a full-document search is issued. */
 const FIND_DEBOUNCE_MS = 250;
@@ -76,12 +77,20 @@ export function usePdfFind({
 		return () => scheduleSearch.cancel();
 	}, [findQuery, search, scheduleSearch]);
 
+	// Switching between the source and translated PDF replaces the search
+	// scope. Stop the previous scope so its stale result state cannot reappear
+	// when the reader switches back.
+	useEffect(() => {
+		if (!search) return;
+		return () => search.stopSearch();
+	}, [search]);
+
 	// Cmd/Ctrl+F opens the in-document find bar when the PDF host is focused.
 	useEffect(() => {
 		const host = hostRef.current;
 		if (!host) return;
 		const onKey = (e: KeyboardEvent) => {
-			if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "f") return;
+			if (!isFindShortcut(e)) return;
 			if (!host.matches(":hover") && !host.contains(document.activeElement))
 				return;
 			e.preventDefault();

@@ -1,4 +1,4 @@
-import { FileText, FolderPlus } from "lucide-react";
+import { FileText, FlaskConical, FolderPlus, Table } from "lucide-react";
 import {
 	type ReactNode,
 	useCallback,
@@ -7,34 +7,33 @@ import {
 	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useImeGuard } from "@/hooks/use-ime-guard";
 import { cn } from "@/lib/core/utils";
-import { isPapersParent, isValidVaultEntryName } from "@/lib/vault";
+import { hasVaultFileExtension, isValidVaultEntryName } from "@/lib/vault";
 import type { TreeCreateKind } from "./types";
 
-/** Inline name input — VS Code / Cursor style create. */
-export function TreeCreateInput({
-	kind,
-	onConfirm,
-	onCancel,
-	parentPath,
-	vaultRoot,
-}: {
-	kind: TreeCreateKind;
+type NameInputProps = {
+	initialName: string;
+	icon: ReactNode;
+	label: string;
+	selectBasename?: boolean;
+	unchangedName?: string;
 	onConfirm: (name: string) => void;
 	onCancel: () => void;
-	/** Absolute path of the parent directory. */
-	parentPath?: string;
-	/** Vault root absolute path. */
-	vaultRoot?: string;
-}) {
+};
+
+function TreeNameInput({
+	initialName,
+	icon,
+	label,
+	selectBasename = false,
+	unchangedName,
+	onConfirm,
+	onCancel,
+}: NameInputProps) {
 	const { t } = useTranslation("sidebar");
-	// Papers/ (or parentPath not provided): default .md suffix + IDE-like selection.
-	// Outside papers/ + file: no suffix, full selection so user types the full name.
-	const insidePapers =
-		parentPath && vaultRoot ? isPapersParent(parentPath, vaultRoot) : true;
-	const defaultName =
-		kind === "file" ? (insidePapers ? "Untitled.md" : "") : "New Folder";
-	const [value, setValue] = useState(defaultName);
+	const { isBlockedByIme, compositionProps } = useImeGuard();
+	const [value, setValue] = useState(initialName);
 	const [error, setError] = useState<string | null>(null);
 	const inputRef = useRef<HTMLInputElement>(null);
 	const committedRef = useRef(false);
@@ -43,38 +42,10 @@ export function TreeCreateInput({
 		const el = inputRef.current;
 		if (!el) return;
 		el.focus();
-		if (kind === "file") {
-			if (insidePapers) {
-				// IDE-like: select basename, leave extension selected.
-				const dot = defaultName.lastIndexOf(".");
-				if (dot > 0) el.setSelectionRange(0, dot);
-				else el.select();
-			} else {
-				// Outside papers: full selection so user types the complete filename.
-				el.select();
-			}
-		} else {
-			el.select();
-		}
-	}, [kind, defaultName, insidePapers]);
-
-	const commit = useCallback(() => {
-		if (committedRef.current) return;
-		const name = value.trim();
-		if (!name) {
-			committedRef.current = true;
-			onCancel();
-			return;
-		}
-		if (!isValidVaultEntryName(name)) {
-			setError(t("fileTree.invalidName"));
-			// Keep editing; re-focus next tick.
-			requestAnimationFrame(() => inputRef.current?.focus());
-			return;
-		}
-		committedRef.current = true;
-		onConfirm(name);
-	}, [value, onCancel, onConfirm, t]);
+		const dot = initialName.lastIndexOf(".");
+		if (selectBasename && dot > 0) el.setSelectionRange(0, dot);
+		else el.select();
+	}, [initialName, selectBasename]);
 
 	const cancel = useCallback(() => {
 		if (committedRef.current) return;
@@ -82,28 +53,43 @@ export function TreeCreateInput({
 		onCancel();
 	}, [onCancel]);
 
-	const Icon = kind === "file" ? FileText : FolderPlus;
+	const commit = useCallback(() => {
+		if (committedRef.current) return;
+		// Read the final DOM value, including composition updates before a blur.
+		const name = (inputRef.current?.value ?? value).trim();
+		if (!name) {
+			cancel();
+			return;
+		}
+		if (!isValidVaultEntryName(name)) {
+			setError(t("fileTree.invalidName"));
+			requestAnimationFrame(() => inputRef.current?.focus());
+			return;
+		}
+		if (name === unchangedName) {
+			cancel();
+			return;
+		}
+		committedRef.current = true;
+		onConfirm(name);
+	}, [value, unchangedName, cancel, onConfirm, t]);
 
-	// Match virtualized row height (estimateSize ≈ 28px / h-7). Extra outer
-	// padding or an in-flow error line used to measure taller than siblings;
-	// after draft removal the virtualizer kept that size by index and left a gap.
+	// Keep the row height fixed so virtualized drafts leave no gap when removed.
 	return (
 		<div className="relative">
 			<div
 				className={cn(
-					"flex h-7 items-center gap-1 rounded px-4",
+					"flex h-7 items-center gap-1 rounded pl-2.5 pr-4",
 					error ? "bg-destructive/10" : "bg-muted/60",
 				)}
 			>
-				<Icon className="size-4 shrink-0 text-muted-foreground" />
+				{icon}
 				<input
 					ref={inputRef}
 					type="text"
 					value={value}
 					title={error ?? undefined}
-					aria-label={
-						kind === "file" ? t("fileTree.newFile") : t("fileTree.newFolder")
-					}
+					aria-label={label}
 					aria-invalid={Boolean(error)}
 					className={cn(
 						"h-5 min-w-0 flex-1 rounded-sm border border-ring bg-background px-1 text-sm outline-none",
@@ -115,6 +101,7 @@ export function TreeCreateInput({
 					}}
 					onKeyDown={(e) => {
 						e.stopPropagation();
+						if (isBlockedByIme(e)) return;
 						if (e.key === "Enter") {
 							e.preventDefault();
 							commit();
@@ -124,19 +111,75 @@ export function TreeCreateInput({
 						}
 					}}
 					onBlur={() => {
-						// Defer so Enter/click handlers run first.
-						requestAnimationFrame(() => {
-							if (!committedRef.current) commit();
-						});
+						// Let composition updates and Enter/click handlers finish first.
+						requestAnimationFrame(commit);
 					}}
+					{...compositionProps}
 				/>
 			</div>
 			{error ? (
-				<p className="pointer-events-none absolute top-full right-0 left-8 z-10 mt-0.5 rounded bg-background/95 px-1 text-destructive text-caption leading-tight shadow-sm">
+				<p className="pointer-events-none absolute top-full right-0 left-8 z-10 mt-0.5 rounded bg-background/95 px-1 text-destructive text-caption leading-tight shadow-raised">
 					{error}
 				</p>
 			) : null}
 		</div>
+	);
+}
+
+/** Inline name input — VS Code / Cursor style create. */
+export function TreeCreateInput({
+	kind,
+	onConfirm,
+	onCancel,
+}: {
+	kind: TreeCreateKind;
+	onConfirm: (name: string) => void;
+	onCancel: () => void;
+}) {
+	const { t } = useTranslation("sidebar");
+	const Icon =
+		kind === "folder"
+			? FolderPlus
+			: kind === "table"
+				? Table
+				: kind === "experiment"
+					? FlaskConical
+					: FileText;
+	return (
+		<TreeNameInput
+			initialName={
+				kind === "table"
+					? t("fileTree.untitledTable")
+					: kind === "experiment"
+						? t("fileTree.untitledExperiment")
+						: kind === "file"
+							? `${t("fileTree.untitledNote")}.md`
+							: "New Folder"
+			}
+			icon={<Icon className="size-4 shrink-0 text-muted-foreground" />}
+			label={
+				kind === "table"
+					? t("newTableLabel")
+					: kind === "experiment"
+						? t("newExperimentLabel")
+						: kind === "file"
+							? t("fileTree.newFile")
+							: t("fileTree.newFolder")
+			}
+			selectBasename={kind !== "folder"}
+			onConfirm={(name) =>
+				onConfirm(
+					kind === "table"
+						? name.toLowerCase().endsWith(".table.json")
+							? name
+							: `${name.replace(/\.json$/i, "")}.table.json`
+						: kind === "file" && !hasVaultFileExtension(name)
+							? `${name}.md`
+							: name,
+				)
+			}
+			onCancel={onCancel}
+		/>
 	);
 }
 
@@ -153,92 +196,14 @@ export function TreeRenameInput({
 	onCancel: () => void;
 }) {
 	const { t } = useTranslation("sidebar");
-	const [value, setValue] = useState(initialName);
-	const [error, setError] = useState<string | null>(null);
-	const inputRef = useRef<HTMLInputElement>(null);
-	const committedRef = useRef(false);
-
-	useEffect(() => {
-		const el = inputRef.current;
-		if (!el) return;
-		el.focus();
-		el.select();
-	}, []);
-
-	const commit = useCallback(() => {
-		if (committedRef.current) return;
-		const name = value.trim();
-		if (!name) {
-			committedRef.current = true;
-			onCancel();
-			return;
-		}
-		if (!isValidVaultEntryName(name)) {
-			setError(t("fileTree.invalidName"));
-			requestAnimationFrame(() => inputRef.current?.focus());
-			return;
-		}
-		if (name === initialName) {
-			committedRef.current = true;
-			onCancel();
-			return;
-		}
-		committedRef.current = true;
-		onConfirm(name);
-	}, [value, initialName, onCancel, onConfirm, t]);
-
-	const cancel = useCallback(() => {
-		if (committedRef.current) return;
-		committedRef.current = true;
-		onCancel();
-	}, [onCancel]);
-
 	return (
-		<div className="relative">
-			<div
-				className={cn(
-					"flex h-7 items-center gap-1 rounded px-4",
-					error ? "bg-destructive/10" : "bg-muted/60",
-				)}
-			>
-				{icon}
-				<input
-					ref={inputRef}
-					type="text"
-					value={value}
-					title={error ?? undefined}
-					aria-label={t("fileTree.rename")}
-					aria-invalid={Boolean(error)}
-					className={cn(
-						"h-5 min-w-0 flex-1 rounded-sm border border-ring bg-background px-1 text-sm outline-none",
-						error && "border-destructive",
-					)}
-					onChange={(e) => {
-						setValue(e.target.value);
-						if (error) setError(null);
-					}}
-					onKeyDown={(e) => {
-						e.stopPropagation();
-						if (e.key === "Enter") {
-							e.preventDefault();
-							commit();
-						} else if (e.key === "Escape") {
-							e.preventDefault();
-							cancel();
-						}
-					}}
-					onBlur={() => {
-						requestAnimationFrame(() => {
-							if (!committedRef.current) commit();
-						});
-					}}
-				/>
-			</div>
-			{error ? (
-				<p className="pointer-events-none absolute top-full right-0 left-8 z-10 mt-0.5 rounded bg-background/95 px-1 text-destructive text-caption leading-tight shadow-sm">
-					{error}
-				</p>
-			) : null}
-		</div>
+		<TreeNameInput
+			initialName={initialName}
+			icon={icon}
+			label={t("fileTree.rename")}
+			unchangedName={initialName}
+			onConfirm={onConfirm}
+			onCancel={onCancel}
+		/>
 	);
 }

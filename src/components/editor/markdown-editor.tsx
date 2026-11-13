@@ -1,14 +1,16 @@
 "use client";
 
-import { MarkdownPlugin } from "@platejs/markdown";
 import { ImagePlugin } from "@platejs/media/react";
 import { BlockSelectionPlugin } from "@platejs/selection/react";
 import { TocPlugin } from "@platejs/toc/react";
+import { CodeXml, Eye } from "lucide-react";
+import type { SlateEditor } from "platejs";
 import { Plate, usePlateEditor, usePluginOption } from "platejs/react";
 import {
 	type CSSProperties,
 	type KeyboardEvent,
 	lazy,
+	memo,
 	useCallback,
 	useEffect,
 	useMemo,
@@ -21,16 +23,22 @@ import { WikiEmbedProjectionProvider } from "@/components/editor/embeds/projecti
 import { useCompletionDrafts } from "@/components/editor/hooks/use-completion-drafts";
 import { useEditorContextMenu } from "@/components/editor/hooks/use-editor-context-menu";
 import { useMarkdownPersistence } from "@/components/editor/hooks/use-markdown-persistence";
+import { useMarkdownSource } from "@/components/editor/hooks/use-markdown-source";
 import { useSelectionContextPublish } from "@/components/editor/hooks/use-selection-context-publish";
 import { useWikilinkEditing } from "@/components/editor/hooks/use-wikilink-editing";
 import { MarkdownExportDialog } from "@/components/editor/markdown-export-dialog";
 import { MarkdownExportSurface } from "@/components/editor/markdown-export-surface";
+import { markdownSourceSurfaceStyle } from "@/components/editor/markdown-source-layout";
 import { BlockDragStateBridge } from "@/components/editor/nodes/block/block-draggable";
 import { ImageElement } from "@/components/editor/nodes/block/image-node";
 import { EditorStatusBar } from "@/components/editor/overlays/editor-status-bar";
 import { FindReplaceBar } from "@/components/editor/overlays/find-replace-bar";
 import { FrontmatterPanel } from "@/components/editor/overlays/frontmatter-panel";
 import { HeadingRenameDialog } from "@/components/editor/overlays/heading-rename-dialog";
+import {
+	HtmlPreviewPanel,
+	type HtmlPreviewState,
+} from "@/components/editor/overlays/html-preview-panel";
 import { SlashCommandMenu } from "@/components/editor/overlays/slash-command-menu";
 import {
 	MINIMUM_TOC_HEADINGS,
@@ -42,7 +50,13 @@ import { BlockSelectionKit } from "@/components/editor/plugins/block-selection-k
 import { convertBlockquoteMarkerToCallout } from "@/components/editor/plugins/callout-plugin";
 import { DndKit } from "@/components/editor/plugins/dnd-kit";
 import { MarkdownEditorKit } from "@/components/editor/plugins/markdown-editor-kit";
+import { MarkdownSourceToolbar } from "@/components/editor/toolbar/markdown-source-toolbar";
 import { MarkdownEditorToolbar } from "@/components/editor/toolbar/markdown-toolbar";
+import {
+	selectionSurfaceProps,
+	useSelectionSource,
+} from "@/components/selection/selection-surface";
+import { Button } from "@/components/ui/button";
 import {
 	ContextMenu,
 	ContextMenuContent,
@@ -51,14 +65,25 @@ import {
 	ContextMenuShortcut,
 	ContextMenuTrigger,
 } from "@/components/ui/context-menu";
-import { useLibraryStore } from "@/hooks/use-app-stores";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+	Tooltip,
+	TooltipContent,
+	TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useLibraryStore, useSettings } from "@/hooks/use-app-stores";
+import { useShortcutLabel } from "@/hooks/use-shortcut-label";
 import i18n from "@/i18n";
 import { scrollBehavior } from "@/lib/core/motion";
 import { errorMessage, notifyError, notifySuccess } from "@/lib/core/notify";
 import { isTauri } from "@/lib/core/tauri";
 import { cn } from "@/lib/core/utils";
-import { insertBreakAfterSelectedVoidBlocks } from "@/lib/markdown/block-selection";
-import { prepareMarkdownForDeserialize } from "@/lib/markdown/deserialize";
+import {
+	insertBreakAfterSelectedVoidBlocks,
+	selectCurrentBlockThenAll,
+	selectTopLevelBlockThenAll,
+} from "@/lib/markdown/block-selection";
+import { deserializeMarkdownBody } from "@/lib/markdown/deserialize-md";
 import { editorContextMenuCapabilities } from "@/lib/markdown/editor-context-menu";
 import {
 	exportDefaultName,
@@ -69,10 +94,20 @@ import type {
 	MarkdownExportOptions,
 	MarkdownExportPaperHeader,
 } from "@/lib/markdown/export/types";
-import { splitFrontmatter } from "@/lib/markdown/frontmatter";
+import { splitFrontmatter, wrapFrontmatter } from "@/lib/markdown/frontmatter";
 import { saveImageToMarkdownAssets } from "@/lib/markdown/image";
-import { loadSettings, useUiScale } from "@/lib/settings";
-import { formatModShortcut } from "@/lib/shell/shortcuts";
+import { convertInlineMathAtCaret } from "@/lib/markdown/inline-math-auto-close";
+import { registerMarkdownSelectionLinesProvider } from "@/lib/markdown/markdown-selection-lines-registry";
+import {
+	flushMarkdownScrollMemory,
+	getMarkdownScrollAnchor,
+	markdownScrollTopToRestore,
+	setMarkdownScrollTop,
+} from "@/lib/markdown/scroll-memory";
+import { resolveSelectionSourceLines } from "@/lib/markdown/selection-source-lines";
+import { useUiScale } from "@/lib/settings";
+import { formatModShortcut, isFindShortcut } from "@/lib/shell/shortcuts";
+import { readVaultFile } from "@/lib/vault";
 import type { LinkFragment, WikiRenameHeadingRequest } from "@/lib/wiki";
 import { useWikiNav } from "@/lib/wiki/nav-context";
 import {
@@ -80,7 +115,13 @@ import {
 	hasWikiBlockAnchor,
 } from "@/lib/wiki/navigation";
 
+import { registerMarkdownEditor } from "@/lib/workspace/viewer/markdown-editor-registry";
+
+const MarkdownPlateContent = memo(Editor);
+
 export type MarkdownEditorProps = {
+	tabId?: string;
+	active?: boolean;
 	/** Initial Markdown content for the open file. Reloaded in place when `reloadKey` bumps. */
 	initialMarkdown: string;
 	/**
@@ -117,6 +158,17 @@ export type MarkdownEditorProps = {
 		lastSaved: string,
 	) => Promise<boolean>;
 	onDirtyChange?: (dirty: boolean) => void;
+	/**
+	 * This panel still has a draft, and another panel already saved a newer
+	 * version. The editor will not autosave until the user keeps the draft or
+	 * loads the disk version.
+	 */
+	saveConflict?: boolean;
+	onResolveSaveConflict?: (
+		tabId: string,
+		action: "keep" | "load" | "hold",
+		disk: string,
+	) => void;
 	/** After writing an image under `./assets/` (refresh file tree). */
 	onAssetsChanged?: () => void;
 	/** Explicitly rename one saved heading and repair its inbound fragments. */
@@ -160,8 +212,52 @@ function hasEnoughHeadings(children: readonly unknown[]): boolean {
 	return false;
 }
 
-export function MarkdownEditor({
+/** Cmd+A inside a non-editable island (Mermaid preview, embed card) selects that block. */
+function selectEnclosingTopBlock(
+	editor: SlateEditor,
+	target: HTMLElement,
+): boolean {
+	const host = target.closest("[data-slate-node='element']");
+	if (!host) return false;
+	const node = editor.api.toSlateNode(host);
+	if (!node) return false;
+	const path = editor.api.findPath(node);
+	if (!path) return false;
+	return selectTopLevelBlockThenAll(editor, path);
+}
+
+/**
+ * Shallow-compares every prop except `initialMarkdown`, which only counts
+ * when `reloadKey` changes too: the seed is consumed solely at mount and by
+ * the reload effect (which early-outs while `reloadKey` is unchanged). The
+ * tab layer rewrites the seed after each save sync (`syncTabSeedsForPath`),
+ * and without this comparator those seed-only patches would reconcile the
+ * whole editor chrome on every autosave.
+ */
+function markdownEditorPropsEqual(
+	prev: MarkdownEditorProps,
+	next: MarkdownEditorProps,
+): boolean {
+	for (const key of Object.keys(next) as (keyof MarkdownEditorProps)[]) {
+		if (key === "initialMarkdown") continue;
+		if (prev[key] !== next[key]) return false;
+	}
+	if (prev.initialMarkdown !== next.initialMarkdown) {
+		// A new seed matters only when it comes with a reload signal.
+		return prev.reloadKey === next.reloadKey;
+	}
+	return true;
+}
+
+/**
+ * Memoized on its props: the workspace re-renders every pane's DocView on
+ * tab patches (active tab, dirty flags, PDF compile state), and an
+ * unmemoized editor paid a full Plate reconcile each time.
+ */
+export const MarkdownEditor = memo(function MarkdownEditor({
 	initialMarkdown,
+	tabId,
+	active = true,
 	reloadKey,
 	filePath,
 	readOnly,
@@ -173,18 +269,31 @@ export function MarkdownEditor({
 	showToolbar,
 	onPersist,
 	onDirtyChange,
+	saveConflict = false,
+	onResolveSaveConflict,
 	onAssetsChanged,
 	onRenameHeading,
 	navigationIntent,
 }: MarkdownEditorProps) {
 	const filePathRef = useRef(filePath ?? null);
+	useSelectionSource(filePath);
 	filePathRef.current = filePath ?? null;
 	const onAssetsChangedRef = useRef(onAssetsChanged);
 	onAssetsChangedRef.current = onAssetsChanged;
 	const editorContainerRef = useRef<HTMLDivElement | null>(null);
+	// Reading position survives keep-alive eviction and app restart (see scroll-memory).
+	const scrollKey = filePath ?? null;
+	const scrollTopRef = useRef(0);
+	/** False until the saved offset has been applied, so a mount scroll cannot wipe it. */
+	const scrollReadyRef = useRef(false);
+	/** User scrolled before restore ran; do not yank the view back. */
+	const scrolledBeforeRestoreRef = useRef(false);
+	/** True while applying a saved offset, so that write does not replace it. */
+	const restoringScrollRef = useRef(false);
 	// Body text keeps its own px font size (editorFontSize setting) so it must
 	// follow the UI zoom (uiScale) explicitly — rem-based chrome scales for free.
 	const uiScale = useUiScale();
+	const markdownMaxWidth = useSettings((s) => s.markdownMaxWidth);
 
 	/**
 	 * Body typography on the editor root. When a custom font stack is set, also
@@ -206,17 +315,21 @@ export function MarkdownEditor({
 			(style as Record<string, string>)["--font-sans"] = fontFamily;
 			(style as Record<string, string>)["--font-heading"] = fontFamily;
 		}
+		if (markdownMaxWidth > 0) {
+			style.maxWidth = markdownMaxWidth;
+		}
 		return Object.keys(style).length > 0 ? style : undefined;
-	}, [fontSize, fontFamily, lineHeight, uiScale]);
+	}, [fontSize, fontFamily, lineHeight, uiScale, markdownMaxWidth]);
 	/** Swallow the `beforeinput` insertParagraph that follows slash Enter confirm. */
 	const suppressNextEditorBreakRef = useRef(false);
 	const [findOpen, setFindOpen] = useState(false);
 	const [findFocusTick, setFindFocusTick] = useState(0);
+	const [htmlPreview, setHtmlPreview] = useState<HtmlPreviewState | null>(null);
+	const closeHtmlPreview = useCallback(() => setHtmlPreview(null), []);
 	const [exportOpen, setExportOpen] = useState(false);
 	const [exportBusy, setExportBusy] = useState(false);
 	const [exportPaperHeader, setExportPaperHeader] =
 		useState<MarkdownExportPaperHeader | null>(null);
-	const [exportDefaultWatermark, setExportDefaultWatermark] = useState(false);
 	/** Bumped on unmount so in-flight export does not setState after leave. */
 	const exportGenerationRef = useRef(0);
 	const exportInFlightRef = useRef(false);
@@ -229,6 +342,14 @@ export function MarkdownEditor({
 		},
 		[],
 	);
+
+	/**
+	 * Set while a navigation jump owns the scroll position. The scroll-memory
+	 * restore below runs one frame later, and its synchronous `scrollTop` write
+	 * cancels the in-flight smooth scroll — which used to yank the view back
+	 * to the remembered offset right after a `[[note#heading]]` jump.
+	 */
+	const navigationJumpRef = useRef(false);
 
 	useEffect(() => {
 		if (!navigationIntent) return;
@@ -256,12 +377,17 @@ export function MarkdownEditor({
 							hasWikiBlockAnchor(element.textContent ?? "", fragment.id),
 					);
 		if (!target) return;
+		navigationJumpRef.current = true;
 		target.dataset.navTarget = "true";
 		target.scrollIntoView({ behavior: scrollBehavior(), block: "center" });
 		const timeout = window.setTimeout(() => {
 			delete target.dataset.navTarget;
+			navigationJumpRef.current = false;
 		}, 1600);
-		return () => window.clearTimeout(timeout);
+		return () => {
+			navigationJumpRef.current = false;
+			window.clearTimeout(timeout);
+		};
 	}, [navigationIntent]);
 
 	/**
@@ -306,50 +432,95 @@ export function MarkdownEditor({
 		plugins,
 		value: (ed) => {
 			const { body } = splitFrontmatter(initialMarkdown);
-			return ed
-				.getApi(MarkdownPlugin)
-				.markdown.deserialize(prepareMarkdownForDeserialize(body || " "));
+			return deserializeMarkdownBody(ed, body);
 		},
 	});
 
-	const {
-		frontmatterYaml,
-		onFrontmatterChange: handleFrontmatterChange,
-		serialize,
-		noteDocumentChanged,
-		saveNow,
-		applyExternalMarkdown,
-		savedRef,
-		dirtyRef,
-	} = useMarkdownPersistence({
+	const persistence = useMarkdownPersistence({
 		editor,
 		initialMarkdown,
 		filePath,
 		readOnly,
 		onPersist,
 		onDirtyChange,
+		saveBlocked: saveConflict,
 		filePathRef,
 		onAssetsChangedRef,
 	});
+	const {
+		frontmatterYaml,
+		onFrontmatterChange: persistFrontmatterChange,
+		serialize,
+		noteDocumentChanged,
+		saveNow,
+		applyExternalMarkdown,
+		adoptDiskBaseline,
+		savedRef,
+		dirtyRef,
+		hasSourceSnapshot,
+	} = persistence;
+	const frontmatterYamlRef = useRef(frontmatterYaml);
+	frontmatterYamlRef.current = frontmatterYaml;
+	const bodyReadOnly = Boolean(readOnly);
+	/** Bumps when body or frontmatter changes — keys Plate source-line cache. */
+	const docVersionRef = useRef(0);
+	const handleFrontmatterChange = useCallback(
+		(interior: string) => {
+			docVersionRef.current += 1;
+			persistFrontmatterChange(interior);
+		},
+		[persistFrontmatterChange],
+	);
 
-	/**
-	 * External disk change accepted by the tab layer (applyDiskChange / Agent
-	 * write): the parent bumps `reloadKey` alongside `initialMarkdown`. Reload
-	 * in place — a keyed remount would re-init every plugin, re-deserialize the
-	 * whole document and drop scroll/caret on each streamed Agent write.
-	 */
-	const reloadKeyRef = useRef(reloadKey);
+	// Restore the last reading position when a note mounts (keep-alive eviction
+	// or a restarted app). Retry while the document has no scroll range yet.
+	// The scroll handler records the position; unmount flushes it.
 	useEffect(() => {
-		if (reloadKey === undefined || reloadKey === reloadKeyRef.current) return;
-		reloadKeyRef.current = reloadKey;
-		const container = editorContainerRef.current;
-		const scrollTop = container?.scrollTop ?? 0;
-		if (!applyExternalMarkdown(initialMarkdown)) return;
-		window.requestAnimationFrame(() => {
+		if (!scrollKey) return;
+		scrollReadyRef.current = false;
+		scrolledBeforeRestoreRef.current = false;
+		let cancelled = false;
+		let frames = 0;
+		let frame = 0;
+		const tick = () => {
+			if (cancelled) return;
 			const el = editorContainerRef.current;
-			if (el) el.scrollTop = scrollTop;
-		});
-	}, [reloadKey, initialMarkdown, applyExternalMarkdown]);
+			if (!el) return;
+			// A navigation jump owns the position; restoring would cancel its scroll.
+			// Later scroll events (scrollReady) record where the jump landed.
+			if (navigationJumpRef.current || scrolledBeforeRestoreRef.current) {
+				scrollTopRef.current = el.scrollTop;
+				scrollReadyRef.current = true;
+				return;
+			}
+			const saved = getMarkdownScrollAnchor(scrollKey);
+			const viewportMax = Math.max(0, el.scrollHeight - el.clientHeight);
+			if (saved && saved.top > 0 && viewportMax <= 0 && frames < 8) {
+				frames += 1;
+				frame = window.requestAnimationFrame(tick);
+				return;
+			}
+			if (saved && saved.top > 0 && viewportMax > 0) {
+				// Hold through the next frame so an async scroll echo cannot
+				// replace the saved offset with a shorter layout's fraction.
+				restoringScrollRef.current = true;
+				el.scrollTop = markdownScrollTopToRestore(saved, viewportMax);
+			}
+			scrollTopRef.current = el.scrollTop;
+			scrollReadyRef.current = true;
+			frame = window.requestAnimationFrame(() => {
+				if (!cancelled) restoringScrollRef.current = false;
+			});
+		};
+		frame = window.requestAnimationFrame(tick);
+		return () => {
+			cancelled = true;
+			scrollReadyRef.current = false;
+			restoringScrollRef.current = false;
+			window.cancelAnimationFrame(frame);
+			flushMarkdownScrollMemory();
+		};
+	}, [scrollKey]);
 
 	const {
 		wikiCompletionDraft,
@@ -367,7 +538,6 @@ export function MarkdownEditor({
 	const refreshTocMounted = useCallback(() => {
 		setTocMounted(hasEnoughHeadings(editor.children));
 	}, [editor]);
-	useEffect(refreshTocMounted, [refreshTocMounted]);
 
 	const handleChange = useCallback(() => {
 		scheduleCompletionProbe();
@@ -388,15 +558,76 @@ export function MarkdownEditor({
 		finalizeWikiLinkDrafts,
 	} = useWikilinkEditing({ editor, suppressNextEditorBreakRef });
 
+	const onEnterSource = useCallback(() => {
+		closeMenus();
+		setFindOpen(false);
+		setHtmlPreview(null);
+	}, [closeMenus]);
+	const {
+		source,
+		switching,
+		sourceHostRef,
+		sourceViewRef,
+		toggle,
+		replaceSource,
+	} = useMarkdownSource({
+		editor,
+		editorContainerRef,
+		persistence,
+		onEnter: onEnterSource,
+		active,
+	});
+	useEffect(() => {
+		if (!source) refreshTocMounted();
+	}, [refreshTocMounted, source]);
+	const shortcut = useShortcutLabel("toggleMarkdownSource");
+	const canToggleSource = !bodyReadOnly && Boolean(filePath && onPersist);
+	const hasPendingSource = useCallback(
+		() => hasSourceSnapshot() && dirtyRef.current,
+		[hasSourceSnapshot, dirtyRef],
+	);
+	useEffect(() => {
+		if (!tabId || !canToggleSource) return;
+		return registerMarkdownEditor(tabId, {
+			toggleSource: toggle,
+			hasPendingSource,
+			flushSource: saveNow,
+		});
+	}, [canToggleSource, hasPendingSource, saveNow, tabId, toggle]);
+	useEffect(() => {
+		if (!active && hasPendingSource()) void saveNow();
+	}, [active, hasPendingSource, saveNow]);
+	/**
+	 * External disk change accepted by the tab layer (applyDiskChange / Agent
+	 * write): the parent bumps `reloadKey` alongside `initialMarkdown`. Reload
+	 * in place — a keyed remount would re-init every plugin, re-deserialize the
+	 * whole document and drop scroll/caret on each streamed Agent write.
+	 */
+	const reloadKeyRef = useRef(reloadKey);
+	useEffect(() => {
+		if (reloadKey === undefined || reloadKey === reloadKeyRef.current) return;
+		reloadKeyRef.current = reloadKey;
+		const container = editorContainerRef.current;
+		const scrollTop = container?.scrollTop ?? 0;
+		if (!applyExternalMarkdown(initialMarkdown)) return;
+		if (replaceSource(initialMarkdown)) return;
+		docVersionRef.current += 1;
+		scrollTopRef.current = scrollTop;
+		window.requestAnimationFrame(() => {
+			const el = editorContainerRef.current;
+			if (el) el.scrollTop = scrollTop;
+		});
+	}, [reloadKey, initialMarkdown, applyExternalMarkdown, replaceSource]);
+
 	const handleKeyDown = useCallback(
 		(event: KeyboardEvent<HTMLDivElement>) => {
 			const target = event.target;
-			const isEditorTarget =
-				target instanceof HTMLElement &&
-				target.closest("[data-slate-editor]") !== null &&
-				target.closest("input, textarea, select, [contenteditable='false']") ===
-					null;
-			if (!isEditorTarget) return;
+			if (!(target instanceof HTMLElement)) return;
+			if (target.closest("[data-slate-editor]") === null) return;
+			// Find bar, callout title, equation source: native select-all.
+			if (target.closest("input, textarea, select") !== null) return;
+			const inNonEditable =
+				target.closest("[contenteditable='false']") !== null;
 
 			if (!event.nativeEvent.isComposing) {
 				if (
@@ -405,18 +636,22 @@ export function MarkdownEditor({
 					!event.altKey &&
 					event.key.toLowerCase() === "a"
 				) {
-					// Handle Select All before browser/Slate default handling so
-					// the editor selection and the native DOM selection stay in sync.
-					// BlockSelectionPlugin two-steps: current block, then all blocks.
+					// Current top-level block first (code / Mermaid preview / callout),
+					// then every block. Plate's selectAll treats a caret in a nested
+					// code_line as "already selected" and jumps to the whole note.
 					event.preventDefault();
 					event.stopPropagation();
 					const scrollRoot = editorContainerRef.current;
 					const scrollTop = scrollRoot?.scrollTop ?? 0;
 					const scrollLeft = scrollRoot?.scrollLeft ?? 0;
-					editor.tf.selectAll();
+					const selected = inNonEditable
+						? selectEnclosingTopBlock(editor, target) ||
+							selectCurrentBlockThenAll(editor)
+						: selectCurrentBlockThenAll(editor);
+					if (!selected) editor.tf.selectAll();
 					if (scrollRoot) {
-						// The selection focus is the document end, so Plate may
-						// scroll there while synchronizing the native selection.
+						// Selecting through the document end can scroll the note there
+						// while Plate synchronizes the native selection.
 						const restoreScroll = () => {
 							scrollRoot.scrollTop = scrollTop;
 							scrollRoot.scrollLeft = scrollLeft;
@@ -429,6 +664,7 @@ export function MarkdownEditor({
 					}
 					return;
 				}
+				if (inNonEditable) return;
 				if (handleMenuKeyDown(event)) {
 					event.stopPropagation();
 					return;
@@ -445,6 +681,11 @@ export function MarkdownEditor({
 					event.stopPropagation();
 					return;
 				}
+				if (event.key === "Enter" && convertInlineMathAtCaret(editor)) {
+					event.preventDefault();
+					event.stopPropagation();
+					return;
+				}
 				if (event.key === "Enter" && convertBlockquoteMarkerToCallout(editor)) {
 					event.preventDefault();
 					event.stopPropagation();
@@ -455,12 +696,9 @@ export function MarkdownEditor({
 					setFindOpen(false);
 				}
 			}
-			if (
-				(event.metaKey || event.ctrlKey) &&
-				!event.shiftKey &&
-				!event.altKey &&
-				event.key.toLowerCase() === "f"
-			) {
+			// Mermaid preview and other non-editable islands stay out of find/save.
+			if (inNonEditable) return;
+			if (isFindShortcut(event)) {
 				event.preventDefault();
 				event.stopPropagation();
 				setFindOpen(true);
@@ -487,7 +725,7 @@ export function MarkdownEditor({
 	// key capture never sees its events; intercept plain Enter there and
 	// break out below block-selected voids (hr / image).
 	useEffect(() => {
-		if (readOnly) return;
+		if (bodyReadOnly) return;
 		const handleShadowInputEnter = (event: globalThis.KeyboardEvent) => {
 			if (
 				event.key !== "Enter" ||
@@ -509,7 +747,7 @@ export function MarkdownEditor({
 		document.addEventListener("keydown", handleShadowInputEnter, true);
 		return () =>
 			document.removeEventListener("keydown", handleShadowInputEnter, true);
-	}, [editor, readOnly]);
+	}, [editor, bodyReadOnly]);
 
 	const handleEditorBlur = useCallback(
 		(event: React.FocusEvent<HTMLDivElement>) => {
@@ -524,9 +762,10 @@ export function MarkdownEditor({
 				return;
 			}
 			closeMenus();
+			convertInlineMathAtCaret(editor);
 			finalizeWikiLinkDrafts();
 		},
-		[closeMenus, finalizeWikiLinkDrafts],
+		[closeMenus, editor, finalizeWikiLinkDrafts],
 	);
 
 	const {
@@ -534,6 +773,7 @@ export function MarkdownEditor({
 		onContextMenu: handleEditorContextMenu,
 		onOpenChange: handleContextMenuOpenChange,
 		copy: handleContextMenuCopy,
+		copyAsMarkdown: handleContextMenuCopyAsMarkdown,
 		cut: handleContextMenuCut,
 		paste: handleContextMenuPaste,
 		insertLink: insertContextMenuLink,
@@ -545,7 +785,7 @@ export function MarkdownEditor({
 	} = useEditorContextMenu({
 		editor,
 		editorContainerRef,
-		readOnly,
+		readOnly: bodyReadOnly,
 		savedRef,
 		dirtyRef,
 		filePathRef,
@@ -557,6 +797,11 @@ export function MarkdownEditor({
 		() => ({
 			filePath: filePath ?? null,
 			onAssetsChanged,
+			openHtmlPreview: (html: string) =>
+				setHtmlPreview((previous) => ({
+					html,
+					key: (previous?.key ?? 0) + 1,
+				})),
 		}),
 		[filePath, onAssetsChanged],
 	);
@@ -564,7 +809,22 @@ export function MarkdownEditor({
 	const scheduleSelectionContextPublish = useSelectionContextPublish({
 		editor,
 		filePathRef,
+		frontmatterYamlRef,
+		docVersionRef,
 	});
+
+	useEffect(() => {
+		const path = filePath?.trim();
+		if (!path) return;
+		return registerMarkdownSelectionLinesProvider(path, {
+			resolve: () =>
+				resolveSelectionSourceLines({
+					editor,
+					frontmatter: wrapFrontmatter(frontmatterYamlRef.current),
+					docVersion: docVersionRef.current,
+				}),
+		});
+	}, [editor, filePath]);
 
 	const handleEditorValueChange = useCallback(() => {
 		// Presentation-only projection batch (wikilink source/display swap):
@@ -575,11 +835,15 @@ export function MarkdownEditor({
 			scheduleWikiLinkPresentationSync();
 			return;
 		}
-		handleChange();
-		scheduleWikiLinkPresentationSync();
+		docVersionRef.current += 1;
+		if (!source) {
+			handleChange();
+			scheduleWikiLinkPresentationSync();
+		}
 	}, [
 		consumePresentationChange,
 		handleChange,
+		source,
 		scheduleCompletionProbe,
 		scheduleWikiLinkPresentationSync,
 	]);
@@ -594,7 +858,6 @@ export function MarkdownEditor({
 			paperMetaByRelPath,
 		});
 		setExportPaperHeader(header);
-		setExportDefaultWatermark(loadSettings().exportWatermarkEnabled);
 		setExportOpen(true);
 	}, [filePath, paperMetaByRelPath, wikiNav?.vaultPath]);
 
@@ -645,9 +908,79 @@ export function MarkdownEditor({
 	const contextMenuCapabilities = editorContextMenuCapabilities({
 		exportAvailable: isTauri(),
 		headingRenameAvailable: Boolean(headingContext),
-		readOnly: Boolean(readOnly),
+		readOnly: bodyReadOnly,
 		selectionExpanded: contextMenuSelectionExpanded,
 	});
+
+	const [resolvingConflict, setResolvingConflict] = useState(false);
+	const resolveSaveConflict = useCallback(
+		async (action: "keep" | "load") => {
+			if (!filePath || resolvingConflict) return;
+			setResolvingConflict(true);
+			try {
+				const disk = await readVaultFile(filePath);
+				if (!tabId) return;
+				if (action === "load") {
+					onResolveSaveConflict?.(tabId, "load", disk);
+					return;
+				}
+				adoptDiskBaseline(disk);
+				onResolveSaveConflict?.(tabId, "keep", disk);
+				// One forced write past the hold that the prop still shows. The
+				// permission dies with this call; a failed write falls back to "hold".
+				const wrote = await saveNow(true);
+				if (!wrote) onResolveSaveConflict?.(tabId, "hold", disk);
+			} catch (error) {
+				notifyError(errorMessage(error));
+			} finally {
+				setResolvingConflict(false);
+			}
+		},
+		[
+			adoptDiskBaseline,
+			filePath,
+			onResolveSaveConflict,
+			tabId,
+			resolvingConflict,
+			saveNow,
+		],
+	);
+
+	const sourceLabel = i18n.t(
+		source ? "editor:source.showRendered" : "editor:source.showSource",
+	);
+	const sourceToggle = canToggleSource ? (
+		<Tooltip>
+			<TooltipTrigger asChild>
+				<Button
+					type="button"
+					variant="ghost"
+					size="icon-xs"
+					aria-label={sourceLabel}
+					aria-pressed={source}
+					data-markdown-source-toggle=""
+					disabled={switching}
+					className="text-muted-foreground hover:text-foreground aria-pressed:bg-muted aria-pressed:text-foreground"
+					onMouseDown={(event) => event.preventDefault()}
+					onClick={toggle}
+				>
+					{source ? (
+						<Eye className="size-3.5" />
+					) : (
+						<CodeXml className="size-3.5" />
+					)}
+				</Button>
+			</TooltipTrigger>
+			<TooltipContent>
+				{shortcut ? `${sourceLabel} (${shortcut})` : sourceLabel}
+			</TooltipContent>
+		</Tooltip>
+	) : null;
+	const sourceTypography = {
+		fontSize: editorTypographyStyle?.fontSize,
+		"--cm-content-font": fontFamily || "var(--font-sans)",
+		"--cm-content-leading": lineHeight ?? 1.65,
+	} as CSSProperties;
 
 	return (
 		<WikiEmbedProjectionProvider component={EmbeddedMarkdownProjection}>
@@ -655,6 +988,7 @@ export function MarkdownEditor({
 				<Plate
 					editor={editor}
 					onSelectionChange={() => {
+						if (source) return;
 						syncWikiLinkPresentation(editor.selection);
 						// Re-anchor or dismiss completion from caret moves (not only
 						// document edits) so arrow navigation cannot leave a stale menu.
@@ -673,33 +1007,117 @@ export function MarkdownEditor({
 							className,
 						)}
 					>
-						{showToolbar && !readOnly ? (
-							<MarkdownEditorToolbar
-								onOpenFind={() => {
-									setFindOpen(true);
-									setFindFocusTick((tick) => tick + 1);
-								}}
-								onExport={isTauri() ? openExportDialog : undefined}
-								propertiesPanel={
-									<FrontmatterPanel
-										value={frontmatterYaml}
-										readOnly={readOnly}
-										onChange={readOnly ? undefined : handleFrontmatterChange}
+						{showToolbar && !bodyReadOnly ? (
+							<div data-hint-ignore>
+								{source ? (
+									<MarkdownSourceToolbar
+										viewRef={sourceViewRef}
+										onExport={isTauri() ? openExportDialog : undefined}
 									/>
-								}
-							/>
+								) : (
+									<MarkdownEditorToolbar
+										onOpenFind={() => {
+											setFindOpen(true);
+											setFindFocusTick((tick) => tick + 1);
+										}}
+										onExport={isTauri() ? openExportDialog : undefined}
+										propertiesPanel={
+											<FrontmatterPanel
+												value={frontmatterYaml}
+												readOnly={bodyReadOnly}
+												onChange={
+													bodyReadOnly ? undefined : handleFrontmatterChange
+												}
+											/>
+										}
+									/>
+								)}
+							</div>
 						) : null}
-						<div className="@container/editor relative flex min-h-0 min-w-0 flex-1 flex-col">
-							<div className="relative min-h-0 min-w-0 flex-1">
+						<div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+							{saveConflict ? (
+								<div
+									className="flex shrink-0 items-center gap-2 border-b bg-amber-500/10 px-3 py-1.5 text-xs"
+									role="status"
+								>
+									<p className="min-w-0 flex-1">
+										<span className="font-medium">
+											{i18n.t("app:diskConflict.splitTitle")}
+										</span>
+										<span className="text-muted-foreground">
+											{" "}
+											{i18n.t("app:diskConflict.splitDetail")}
+										</span>
+									</p>
+									<Button
+										size="sm"
+										variant="outline"
+										disabled={resolvingConflict}
+										onClick={() => void resolveSaveConflict("keep")}
+									>
+										{i18n.t("app:diskConflict.keepDraft")}
+									</Button>
+									<Button
+										size="sm"
+										variant="outline"
+										disabled={resolvingConflict}
+										onClick={() => void resolveSaveConflict("load")}
+									>
+										{i18n.t("app:diskConflict.reload")}
+									</Button>
+								</div>
+							) : null}
+							{/*
+							 * `@container/editor` deliberately sits on this child rather than
+							 * on the pane above. A query container that resizes re-runs style
+							 * for its whole subtree on every frame of a drag — measured at 24
+							 * of the 25ms a pane resize costs on WebKit. One level in, the
+							 * width is still the pane's, and `markdown-resize-freeze` can pin
+							 * it for the gesture so neither the query nor the text re-wraps.
+							 */}
+							<div
+								className={cn(
+									"@container/editor relative min-h-0 min-w-0 flex-1",
+									source && "invisible",
+								)}
+								data-editor-query-container=""
+								inert={source}
+							>
 								<ContextMenu onOpenChange={handleContextMenuOpenChange}>
 									<ContextMenuTrigger asChild>
 										<EditorContainer
 											ref={editorContainerRef}
 											className="agentero-scroll h-full min-w-0 overflow-y-auto"
 											onScrollCapture={() => {
+												const el = editorContainerRef.current;
+												if (el) {
+													scrollTopRef.current = el.scrollTop;
+													if (!scrollReadyRef.current) {
+														if (el.scrollTop > 1) {
+															scrolledBeforeRestoreRef.current = true;
+														}
+													} else if (
+														scrollKey &&
+														el.isConnected &&
+														!restoringScrollRef.current
+													) {
+														// Ignore the restore write and a detach reset.
+														// Both would replace the saved offset.
+														setMarkdownScrollTop(
+															scrollKey,
+															el.scrollTop,
+															el.scrollHeight - el.clientHeight,
+														);
+													}
+												}
 												// Reposition instead of hard-dismiss: arrow-key list
 												// updates can reflow and fire scroll without leaving [[.
-												scheduleCompletionProbe();
+												// Only probe while a menu is open — the probe reads the
+												// DOM and walks the editor tree, which per scroll event
+												// makes scrollbar dragging janky on large notes.
+												if (wikiCompletionDraft || slashCommandDraft) {
+													scheduleCompletionProbe();
+												}
 											}}
 											onMouseDownCapture={(event) => {
 												if (
@@ -712,16 +1130,22 @@ export function MarkdownEditor({
 													event.preventDefault();
 											}}
 											onContextMenuCapture={handleEditorContextMenu}
-											onKeyDownCapture={readOnly ? undefined : handleKeyDown}
-											onBeforeInputCapture={
-												readOnly ? undefined : handleWikiLinkBoundaryBeforeInput
+											onKeyDownCapture={
+												bodyReadOnly ? undefined : handleKeyDown
 											}
-											onBlur={readOnly ? undefined : handleEditorBlur}
+											onBeforeInputCapture={
+												bodyReadOnly
+													? undefined
+													: handleWikiLinkBoundaryBeforeInput
+											}
+											onBlur={bodyReadOnly ? undefined : handleEditorBlur}
 											onCompositionStartCapture={
-												readOnly ? undefined : handleWikiLinkCompositionStart
+												bodyReadOnly
+													? undefined
+													: handleWikiLinkCompositionStart
 											}
 											onCompositionEndCapture={
-												readOnly ? undefined : handleWikiLinkCompositionEnd
+												bodyReadOnly ? undefined : handleWikiLinkCompositionEnd
 											}
 										>
 											{/*
@@ -729,20 +1153,28 @@ export function MarkdownEditor({
 											 * to click and Enter can always create a new block below it
 											 * (matches Plate default variant pb-72).
 											 */}
-											<Editor
-												data-selection-chat-source={filePath || undefined}
-												data-selection-chat-origin="markdown"
+											<MarkdownPlateContent
+												{...(filePath
+													? selectionSurfaceProps({
+															sourcePath: filePath,
+															origin: "markdown",
+															surface: "markdown",
+														})
+													: {})}
 												placeholder={placeholder}
-												readOnly={readOnly}
+												readOnly={bodyReadOnly}
 												// `pl-10` leaves room for the block drag handle
 												// (`-translate-x-full` in the left gutter).
 												// `pr-14` reserves a right gutter for the collapsed
 												// TOC strip (`right-2 w-10`) so it never covers text.
 												// Narrow panes hide that strip, so the gutter goes too.
-												className="min-h-full pl-10 pr-14 pt-4 pb-48 @max-2xs/editor:pr-6 [&>*:first-child]:mt-0"
+												className={cn(
+													"min-h-full pl-10 pr-14 pt-4 pb-48 @max-2xs/editor:pr-6 [&>*:first-child]:mt-0",
+													markdownMaxWidth > 0 && "mx-auto w-full",
+												)}
 												style={editorTypographyStyle}
 											/>
-											{!readOnly ? (
+											{!bodyReadOnly ? (
 												<WikiLinkSuggestion
 													draft={wikiCompletionDraft}
 													onClose={() => setWikiCompletionDraft(null)}
@@ -754,7 +1186,7 @@ export function MarkdownEditor({
 													controllerRef={completionControllerRef}
 												/>
 											) : null}
-											{!readOnly ? (
+											{!bodyReadOnly ? (
 												<SlashCommandMenu
 													draft={slashCommandDraft}
 													onClose={() => setSlashCommandDraft(null)}
@@ -792,6 +1224,14 @@ export function MarkdownEditor({
 											<ContextMenuShortcut>
 												{formatModShortcut("c")}
 											</ContextMenuShortcut>
+										</ContextMenuItem>
+										<ContextMenuItem
+											disabled={!contextMenuCapabilities.copy}
+											onSelect={() => {
+												void handleContextMenuCopyAsMarkdown();
+											}}
+										>
+											{i18n.t("editor:contextMenu.copyMarkdown")}
 										</ContextMenuItem>
 										<ContextMenuItem
 											disabled={!contextMenuCapabilities.paste}
@@ -839,7 +1279,7 @@ export function MarkdownEditor({
 										</ContextMenuItem>
 									</ContextMenuContent>
 								</ContextMenu>
-								{findOpen && !readOnly ? (
+								{findOpen && !bodyReadOnly ? (
 									<FindReplaceBar
 										focusTick={findFocusTick}
 										onClose={() => {
@@ -848,14 +1288,47 @@ export function MarkdownEditor({
 										}}
 									/>
 								) : null}
-								{tocMounted ? (
+								{!source && tocMounted ? (
 									<TocSidebar rootMargin="-8px 0px -80% 0px" topOffset={16} />
 								) : null}
+								<HtmlPreviewPanel
+									preview={htmlPreview}
+									onClose={closeHtmlPreview}
+								/>
 							</div>
+							{canToggleSource ? (
+								<div
+									data-markdown-source=""
+									className={cn(
+										"absolute inset-0 flex justify-center",
+										!source && "hidden",
+									)}
+								>
+									<div
+										ref={sourceHostRef}
+										className="h-full w-full min-w-0"
+										style={{
+											...sourceTypography,
+											...markdownSourceSurfaceStyle(markdownMaxWidth),
+										}}
+									/>
+								</div>
+							) : null}
+							{switching ? (
+								<div
+									aria-hidden="true"
+									className="pointer-events-none absolute inset-0 space-y-4 bg-background px-10 pt-6"
+								>
+									<Skeleton className="h-5 w-2/5" />
+									<Skeleton className="h-3 w-4/5" />
+									<Skeleton className="h-3 w-3/5" />
+								</div>
+							) : null}
 						</div>
 						<EditorStatusBar
 							filePath={filePath}
 							vaultPath={wikiNav?.vaultPath ?? null}
+							leading={sourceToggle}
 						/>
 						<HeadingRenameDialog
 							open={headingRenameOpen}
@@ -868,7 +1341,6 @@ export function MarkdownEditor({
 							open={exportOpen}
 							busy={exportBusy}
 							paperHeader={exportPaperHeader}
-							defaultWatermark={exportDefaultWatermark}
 							onCancel={() => {
 								if (!exportBusy) setExportOpen(false);
 							}}
@@ -881,4 +1353,4 @@ export function MarkdownEditor({
 			</MarkdownDocProvider>
 		</WikiEmbedProjectionProvider>
 	);
-}
+}, markdownEditorPropsEqual);

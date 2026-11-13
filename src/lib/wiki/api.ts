@@ -8,6 +8,7 @@ import {
 import { callApiResult } from "@/lib/core/ipc";
 import { normalizeRelPath, toVaultRelative } from "@/lib/core/path";
 import { isTauri } from "@/lib/core/tauri";
+import { prepareWritingPathMove } from "@/lib/writing/project-manifest";
 
 export { normalizeRelPath as normalizeVaultRel, toVaultRelative };
 
@@ -170,6 +171,11 @@ export type WikiSearchCandidate = {
 	/** Display alias chosen by the user; `insertText` stays canonical. */
 	alias?: string;
 	fragment?: LinkFragment;
+	/**
+	 * Local PDF section hit. Tab leaves a trailing `#` so paragraph
+	 * candidates (`section#pN`) can follow. Host search never sets this.
+	 */
+	pdfSection?: boolean;
 };
 
 export type RebuildResult = {
@@ -226,29 +232,6 @@ export function externalRenameRepairNeeded(
 ): boolean {
 	return preview.affectedSources.length > 0;
 }
-
-export type GraphNodeType = "paper" | "note" | "index" | "stub";
-
-export type GraphNode = {
-	id: string;
-	label: string;
-	type: GraphNodeType;
-	path?: string;
-};
-
-export type GraphEdge = {
-	id: string;
-	source: string;
-	target: string;
-	targetRaw?: string;
-};
-
-export type GraphResponse = {
-	nodes: GraphNode[];
-	edges: GraphEdge[];
-	center?: string | null;
-	depth: number;
-};
 
 export type WikiRenameFailure = {
 	code: string;
@@ -347,10 +330,16 @@ export async function moveVaultPath(
 	toRel: string,
 	dirtyPaths: string[],
 ): Promise<WikiRenameResult> {
-	return callApiResult(
-		() => commands.wikiMove({ vaultPath, fromRel, toRel, dirtyPaths }),
-		WIKI_CALL_OPTS,
-	);
+	const rollback = await prepareWritingPathMove(vaultPath, fromRel, toRel);
+	try {
+		return await callApiResult(
+			() => commands.wikiMove({ vaultPath, fromRel, toRel, dirtyPaths }),
+			WIKI_CALL_OPTS,
+		);
+	} catch (error) {
+		await rollback?.();
+		throw error;
+	}
 }
 
 /** Explicitly rename one saved heading and repair resolved heading fragments. */
@@ -1079,4 +1068,15 @@ export async function rebuildWikiIndex(
 	vaultPath: string,
 ): Promise<RebuildResult> {
 	return callApiResult(() => commands.graphRebuild(vaultPath), WIKI_CALL_OPTS);
+}
+
+/** Fold known files or one paper folder into the warm index. */
+export async function applyWikiPaths(
+	vaultPath: string,
+	paths: string[],
+): Promise<RebuildResult> {
+	return callApiResult(
+		() => commands.graphApplyPaths({ vaultPath, paths }),
+		WIKI_CALL_OPTS,
+	);
 }

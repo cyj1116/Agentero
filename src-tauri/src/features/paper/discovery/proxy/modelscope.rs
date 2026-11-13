@@ -25,10 +25,14 @@ const USER_AGENT: &str = "agentero/0.6 (+https://github.com/poco-ai/agentero)";
 /// site's Emotion classes (`acss-*`) are content-hashed per release and must
 /// never be matched on.
 ///
-/// The site pins its paper pages at a 1280px desktop width, so the panel browses
-/// it as a narrow desktop window: the frame keeps that layout and its own
-/// document is the horizontal scrollport, which is what lets a trackpad pan the
-/// page. Clamping the pages to the panel instead would leave no overflow to pan.
+/// The site pins its paper pages at a 1280px desktop width, so the frame keeps
+/// that virtual viewport and the host scales it to the panel. Manual zoom can
+/// make the scaled page wider than the panel; that overflow lives in the host's
+/// scrollport, so the bridge forwards wheel deltas the frame cannot consume as
+/// `panX` messages. Ctrl/Cmd+wheel and trackpad pinches become `zoomRatio`
+/// messages for the same reason: wheel events do not cross the frame boundary.
+/// Clamping the pages to the panel instead makes the text unreadable at narrow
+/// widths.
 const NAV_BRIDGE: &str = r##"<style>
 /* The panel is a paper feed, not a browser: the global nav only offers ways out. */
 header.antd5-layout-header { display: none !important; }
@@ -42,17 +46,28 @@ html body { overflow-y: visible !important; }
 /* The site smooth-scrolls its layout root while centring a page action; the
    bridge re-pins that root, and a running smooth animation would win. */
 .ms-page-container { scroll-behavior: auto !important; }
+/* Matches the Papers with Code panel: a quiet pill in the page's own colour,
+   no mark, no borrowed site classes. */
 .agentero-import {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  margin-left: 8px;
+  padding: 2px 9px;
+  border: 1px solid color-mix(in oklab, currentColor 26%, transparent);
+  border-radius: 999px;
+  background: color-mix(in oklab, currentColor 7%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
   cursor: pointer;
   user-select: none;
+  vertical-align: middle;
 }
+.agentero-import:hover { background: color-mix(in oklab, currentColor 15%, transparent); }
 .agentero-import[data-state] { cursor: default; opacity: 0.55; }
-.agentero-import-logo {
-  width: 14px;
-  height: 14px;
-  flex: none;
-  margin-right: 3px;
-}
 .agentero-import-titlerow {
   display: flex;
   /* The title is a fixed two-line-tall box holding one line at the top, so
@@ -63,23 +78,7 @@ html body { overflow-y: visible !important; }
 }
 /* The title keeps its own width clamp and ellipsis; the button never shrinks. */
 .agentero-import-titlerow > :first-child { flex: 0 1 auto; min-width: 0; }
-.agentero-import-card {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  /* Replaced with the title's own line-height, which centres it on the text. */
-  height: 20px;
-  padding: 0 8px;
-  border: 1px solid rgba(128, 128, 128, 0.35);
-  border-radius: 6px;
-  background: rgba(128, 128, 128, 0.12);
-  color: inherit;
-  font-size: 12px;
-  line-height: 1;
-  white-space: nowrap;
-}
-.agentero-import-card:hover { background: rgba(128, 128, 128, 0.22); }
+.agentero-import-card { margin-left: 0; }
 </style>
 <script>
 (function () {
@@ -102,6 +101,119 @@ html body { overflow-y: visible !important; }
     var send = function () {
       post({ path: location.pathname + location.search });
     };
+    var currentScrollPath = function () {
+      return location.pathname + location.search;
+    };
+    var scrollKey = function (path) {
+      return "agentero-plaza:modelscope:scroll:" + path;
+    };
+    var getScrollPosition = function () {
+      var scroller = document.scrollingElement || document.documentElement;
+      var container = document.querySelector(".ms-page-container");
+      return {
+        x: scroller ? scroller.scrollLeft : window.scrollX,
+        y: scroller ? scroller.scrollTop : window.scrollY,
+        containerX: container ? container.scrollLeft : 0,
+        containerY: container ? container.scrollTop : 0
+      };
+    };
+    var writeScroll = function (snapshot) {
+      try {
+        localStorage.setItem(snapshot.key, JSON.stringify(snapshot.position));
+      } catch (e) {}
+    };
+    var pendingScroll = null;
+    var scrollSaveTimer = 0;
+    var flushPendingScroll = function () {
+      if (scrollSaveTimer) window.clearTimeout(scrollSaveTimer);
+      scrollSaveTimer = 0;
+      if (!pendingScroll) return;
+      writeScroll(pendingScroll);
+      pendingScroll = null;
+    };
+    var flushScroll = function () {
+      var hadPending = !!pendingScroll;
+      flushPendingScroll();
+      if (!hadPending) {
+        writeScroll({
+          key: scrollKey(currentScrollPath()),
+          position: getScrollPosition()
+        });
+      }
+    };
+    var saveScroll = function () {
+      pendingScroll = {
+        key: scrollKey(currentScrollPath()),
+        position: getScrollPosition()
+      };
+      if (scrollSaveTimer) return;
+      scrollSaveTimer = window.setTimeout(flushPendingScroll, 250);
+    };
+    document.addEventListener("scroll", saveScroll, { capture: true, passive: true });
+    window.addEventListener("pagehide", flushScroll);
+
+    var restoreGeneration = 0;
+    var restoreObserver = null;
+    var restoreTimeout = 0;
+    var clearScrollRestore = function () {
+      if (restoreObserver) restoreObserver.disconnect();
+      restoreObserver = null;
+      if (restoreTimeout) window.clearTimeout(restoreTimeout);
+      restoreTimeout = 0;
+    };
+    var restoreScroll = function () {
+      var saved = null;
+      try {
+        saved = JSON.parse(
+          localStorage.getItem(scrollKey(currentScrollPath())) || "null"
+        );
+      } catch (e) {}
+      var generation = ++restoreGeneration;
+      clearScrollRestore();
+      if (
+        !saved ||
+        typeof saved.x !== "number" ||
+        typeof saved.y !== "number"
+      ) {
+        return;
+      }
+      var pending = false;
+      var stop = function () {
+        if (generation !== restoreGeneration) return;
+        clearScrollRestore();
+      };
+      var apply = function () {
+        if (pending || generation !== restoreGeneration) return;
+        pending = true;
+        window.requestAnimationFrame(function () {
+          pending = false;
+          if (generation !== restoreGeneration) return;
+          var container = document.querySelector(".ms-page-container");
+          var scroller = document.scrollingElement || document.documentElement;
+          window.scrollTo(saved.x, saved.y);
+          if (container) {
+            container.scrollLeft = saved.containerX || 0;
+            container.scrollTop = saved.containerY || 0;
+          }
+          if (scroller) scroller.scrollLeft = saved.x;
+          var documentReached =
+            Math.abs(window.scrollX - saved.x) <= 2 &&
+            Math.abs(window.scrollY - saved.y) <= 2;
+          var containerReached = container
+            ? Math.abs(container.scrollLeft - (saved.containerX || 0)) <= 2 &&
+              Math.abs(container.scrollTop - (saved.containerY || 0)) <= 2
+            : !(saved.containerX || saved.containerY);
+          if (documentReached && containerReached) stop();
+        });
+      };
+      var root = document.querySelector(".ms-page-container") || document.body;
+      if (root && window.MutationObserver) {
+        restoreObserver = new MutationObserver(apply);
+        restoreObserver.observe(root, { childList: true, subtree: true });
+      }
+      restoreTimeout = window.setTimeout(stop, 10000);
+      apply();
+    };
     // Same-origin URLs must be reopened upstream: the system browser cannot
     // resolve our private scheme.
     var handoff = function (url) {
@@ -112,14 +224,23 @@ html body { overflow-y: visible !important; }
       }
     };
     send();
-    window.addEventListener("pageshow", send);
-    window.addEventListener("popstate", send);
+    window.addEventListener("pageshow", function () {
+      send();
+      restoreScroll();
+    });
+    window.addEventListener("popstate", function () {
+      flushPendingScroll();
+      send();
+      restoreScroll();
+    });
 
     // umi routes through pushState, so clicking a card fires no navigation event
     // at all. Installed from <head>, before umi captures its history reference.
     ["pushState", "replaceState"].forEach(function (name) {
       var original = history[name];
       history[name] = function (state, title, url) {
+        var previousPath = currentScrollPath();
+        var routeChanged = false;
         if (url != null) {
           var target = null;
           try {
@@ -129,9 +250,14 @@ html body { overflow-y: visible !important; }
             handoff(target);
             return;
           }
+          routeChanged =
+            !!target &&
+            target.pathname + target.search !== previousPath;
+          if (routeChanged) flushScroll();
         }
         var result = original.apply(history, arguments);
         send();
+        if (routeChanged) restoreScroll();
         return result;
       };
     });
@@ -149,30 +275,45 @@ html body { overflow-y: visible !important; }
       return ID.test(id) ? id : null;
     };
     var LABELS = { idle: "入库", pending: "入库中", done: "已入库" };
-    // The Agentero mark reduced to its copper spectacles: the full illustrated
-    // face is unreadable mush at the 14px the site's button icons use.
-    var LOGO =
-      '<svg class="agentero-import-logo" viewBox="0 0 16 16" aria-hidden="true">' +
-      '<g fill="none" stroke="#B96442" stroke-width="1.35" stroke-linecap="round">' +
-      '<circle cx="4.3" cy="8.4" r="4.1"/>' +
-      '<circle cx="11.7" cy="8.4" r="4.1"/>' +
-      '<path d="M7.6 7.2c.3-.35.8-.35 1.1 0"/>' +
-      "</g></svg>";
     var setLabel = function (el, text) {
       var label = el.querySelector(".agentero-import-label");
       if (label) label.textContent = text;
     };
-    var button = function (id, variant, borrowedClass) {
+    // The label is not part of the page. Remember which ids the library already
+    // has, and ask again after a reload — React rebuilds every button as idle.
+    var knownImported = {};
+    var askedImported = {};
+    var markDone = function (el) {
+      el.dataset.state = "done";
+      setLabel(el, LABELS.done);
+    };
+    var applyKnown = function () {
+      var buttons = document.querySelectorAll(".agentero-import");
+      for (var i = 0; i < buttons.length; i++) {
+        if (knownImported[buttons[i].dataset.paperId]) markDone(buttons[i]);
+      }
+    };
+    var requestKnown = function () {
+      var ids = [];
+      var seen = {};
+      var buttons = document.querySelectorAll(".agentero-import");
+      for (var i = 0; i < buttons.length; i++) {
+        var id = buttons[i].dataset.paperId;
+        if (!id || knownImported[id] || askedImported[id] || seen[id]) continue;
+        seen[id] = true;
+        askedImported[id] = true;
+        ids.push(id);
+      }
+      if (ids.length) post({ queryImported: ids });
+    };
+    var button = function (id, variant) {
       var el = document.createElement(variant === "action" ? "div" : "span");
-      el.className =
-        "agentero-import agentero-import-" +
-        variant +
-        (borrowedClass ? " " + borrowedClass : "");
+      el.className = "agentero-import agentero-import-" + variant;
       el.title = "导入到我的论文库";
       el.setAttribute("role", "button");
       el.dataset.paperId = id;
       el.innerHTML =
-        LOGO + '<span class="agentero-import-label">' + LABELS.idle + "</span>";
+        '<span class="agentero-import-label">' + LABELS.idle + "</span>";
       return el;
     };
     // The card title is the first text-bearing leaf block inside it — the site's
@@ -209,25 +350,19 @@ html body { overflow-y: visible !important; }
         title.parentNode.insertBefore(titleRow, title);
         titleRow.appendChild(title);
         var cardButton = button(id, "card");
-        // Match the title's line box so the button centres on the text. A
-        // `normal` line-height is not a length, so the CSS fallback stands.
-        var lineHeight = getComputedStyle(title).lineHeight;
-        if (/^[\d.]+px$/.test(lineHeight)) cardButton.style.height = lineHeight;
         titleRow.appendChild(cardButton);
       }
       var current = paperId(location.pathname);
       if (!current) return;
-      // Sit beside the detail page's own 「arXiv 原文 / PDF / Git」 actions, wearing
-      // their classes. The row is found through the arXiv favicon: its classes are
-      // content-hashed and its label is localized, but the icon's src is neither.
+      // Sit beside the detail page's own 「arXiv 原文 / PDF / Git」 actions as a
+      // standalone pill, the same affordance the Papers with Code panel uses. The
+      // row is found through the arXiv favicon: its classes are content-hashed and
+      // its label is localized, but the icon's src is neither.
       var icon = document.querySelector('img[src*="arxiv.org"]');
       var arxivAction = icon && icon.parentElement;
       var row = arxivAction && arxivAction.parentNode;
       if (!row || row.querySelector(".agentero-import-action")) return;
-      row.insertBefore(
-        button(current, "action", arxivAction.className),
-        arxivAction
-      );
+      row.insertBefore(button(current, "action"), arxivAction);
     };
     // React re-renders wipe injected nodes, and the feed also paginates in place.
     var scheduled = false;
@@ -237,10 +372,15 @@ html body { overflow-y: visible !important; }
       setTimeout(function () {
         scheduled = false;
         decorate();
+        applyKnown();
+        requestKnown();
       }, 100);
     };
     var start = function () {
       decorate();
+      applyKnown();
+      requestKnown();
+      restoreScroll();
       if (window.MutationObserver) {
         new MutationObserver(schedule).observe(document.body, {
           childList: true,
@@ -271,12 +411,14 @@ html body { overflow-y: visible !important; }
         var id = target.dataset.paperId;
         target.dataset.state = "pending";
         setLabel(target, LABELS.pending);
+        var box = target.getBoundingClientRect();
         post({
           importPaper: {
             id: id,
             branch: "arxiv",
             url: "https://arxiv.org/abs/" + id,
-            title: null
+            title: null,
+            anchor: { x: box.left, y: box.bottom }
           }
         });
       },
@@ -310,11 +452,11 @@ html body { overflow-y: visible !important; }
     );
 
     // ModelScope centres a page action with
-    // `scrollIntoView({ block: "center", inline: "center" })`. The frame is
-    // narrower than the site's 1280px desktop layout, so that call drags the
-    // whole document sideways and the feed loads scrolled past its left edge
-    // (#550). The panel is panned by the user, not by the site: undo the
-    // horizontal part of every such call, leaving vertical scrolling alone.
+    // `scrollIntoView({ block: "center", inline: "center" })`. When the site's
+    // own content overflows, that call can drag the whole document sideways and
+    // hide the left edge (#550). The panel is panned by the user, not by the
+    // site: undo the horizontal part of every such call, leaving vertical
+    // scrolling alone.
     var scrollIntoView = Element.prototype.scrollIntoView;
     Element.prototype.scrollIntoView = function () {
       var chain = [];
@@ -333,13 +475,14 @@ html body { overflow-y: visible !important; }
       return result;
     };
 
-    // The frame owns horizontal panning: nothing outside an iframe reliably
-    // receives its wheel deltas, and the frame is narrower than the site's
-    // desktop layout. Trackpad swipes, and Shift+wheel (a keyboard reports that
-    // as deltaY), pan the document — but the event is never cancelled, so a
-    // diagonal gesture keeps scrolling vertically too. An engine that pans
-    // horizontally on its own is left to it: the delta is only added when the
-    // document did not move. An in-page horizontal scroller (a carousel) wins.
+    // The frame keeps the site's desktop layout; the host scales it to the
+    // panel. Manual zoom can make that scaled page wider than the panel, and
+    // that overflow lives in the host's wrapper — not in this document. Wheel
+    // deltas never leave an iframe reliably, so pan horizontally here while
+    // this document has room, then hand the remainder to the host. Trackpad
+    // swipes and Shift+wheel (a keyboard reports that as deltaY) both work;
+    // the event is never cancelled, so a diagonal gesture keeps scrolling
+    // vertically too. An in-page horizontal scroller (a carousel) wins.
     var scrollsHorizontally = function (node) {
       while (node && node.nodeType === 1 && node !== document.documentElement) {
         var overflow = getComputedStyle(node).overflowX;
@@ -356,25 +499,90 @@ html body { overflow-y: visible !important; }
     var panFrame = 0;
     var panPending = 0;
     var panStart = null;
+    var zoomPending = 1;
+    var zoomFrame = 0;
+    var queueZoom = function (ratio) {
+      if (!isFinite(ratio) || ratio <= 0) return;
+      zoomPending *= ratio;
+      if (zoomFrame) return;
+      zoomFrame = requestAnimationFrame(function () {
+        zoomFrame = 0;
+        var ratio = zoomPending;
+        zoomPending = 1;
+        if (isFinite(ratio) && ratio > 0) post({ zoomRatio: ratio });
+      });
+    };
+
+    // WebKit reports a trackpad pinch as gesture events, not ctrl+wheel.
+    // `gestureUntil` also keeps a simultaneous ctrl+wheel from zooming twice
+    // when an engine sends both; it self-heals if a `gestureend` is dropped.
+    var gestureUntil = 0;
+    var gestureScale = 1;
+    window.addEventListener("gesturestart", function (event) {
+      gestureUntil = Date.now() + 1200;
+      gestureScale = event.scale || 1;
+      if (event.cancelable) event.preventDefault();
+    }, { passive: false });
+    window.addEventListener("gesturechange", function (event) {
+      var next = event.scale;
+      if (!next || !isFinite(next)) return;
+      gestureUntil = Date.now() + 1200;
+      var ratio = next / gestureScale;
+      gestureScale = next;
+      if (event.cancelable) event.preventDefault();
+      queueZoom(ratio);
+    }, { passive: false });
+    window.addEventListener("gestureend", function (event) {
+      gestureUntil = 0;
+      gestureScale = 1;
+      if (event.cancelable) event.preventDefault();
+    }, { passive: false });
+
+    // Ctrl/Cmd+wheel is a zoom gesture on every desktop engine. Keep it out of
+    // the pan handler below and suppress the webview's native page zoom.
+    document.addEventListener(
+      "wheel",
+      function (event) {
+        if (!(event.ctrlKey || event.metaKey)) return;
+        if (event.cancelable) event.preventDefault();
+        if (gestureUntil > Date.now()) return;
+        var dy = event.deltaY;
+        if (event.deltaMode === 1) dy *= 16;
+        else if (event.deltaMode === 2) dy *= window.innerHeight;
+        if (dy) queueZoom(Math.exp(-dy / (event.agenteroPinch ? 100 : 1000)));
+      },
+      { capture: true, passive: false }
+    );
+
     document.addEventListener("wheel", function (event) {
-      if (event.ctrlKey || event.deltaMode === 2) return;
-      var scroller = document.scrollingElement || document.documentElement;
-      if (!scroller || scroller.scrollWidth <= scroller.clientWidth + 1) return;
+      if (event.ctrlKey || event.metaKey || event.deltaMode === 2) return;
       if (scrollsHorizontally(event.target)) return;
       var dx = event.deltaX;
       if (!dx && event.shiftKey) dx = event.deltaY;
       if (!dx) return;
       if (event.deltaMode === 1) dx *= 16;
+      var scroller = document.scrollingElement || document.documentElement;
+      if (!scroller) return;
       if (panStart === null) panStart = scroller.scrollLeft;
       panPending += dx;
       if (panFrame) return;
       panFrame = requestAnimationFrame(function () {
         panFrame = 0;
-        var moved = scroller.scrollLeft - panStart;
+        var scroller = document.scrollingElement || document.documentElement;
+        var start = panStart;
         var delta = panPending;
         panStart = null;
         panPending = 0;
-        if (!moved) scroller.scrollLeft += delta;
+        if (!scroller || start === null) return;
+        var moved = scroller.scrollLeft - start;
+        if (!moved) {
+          scroller.scrollLeft += delta;
+          moved = scroller.scrollLeft - start;
+        }
+        // The frame is at its horizontal edge; the rest belongs to the host's
+        // manual-zoom scrollport. Keep sub-pixel noise from posting.
+        var remaining = delta - moved;
+        if (Math.abs(remaining) > 0.5) post({ panX: remaining });
       });
     });
 
@@ -417,6 +625,14 @@ html body { overflow-y: visible !important; }
     window.addEventListener("message", function (event) {
       var data = event.data;
       if (!data || data.source !== "agentero-plaza-host") return;
+      if (Array.isArray(data.importedIds)) {
+        for (var n = 0; n < data.importedIds.length; n++) {
+          if (typeof data.importedIds[n] === "string") {
+            knownImported[data.importedIds[n]] = true;
+          }
+        }
+        applyKnown();
+      }
       if (typeof data.importedId !== "string") return;
       // arXiv ids contain dots, so id-based DOM lookups are out.
       var buttons = document.querySelectorAll(".agentero-import");
@@ -424,6 +640,7 @@ html body { overflow-y: visible !important; }
         var el = buttons[i];
         if (el.dataset.paperId !== data.importedId) continue;
         if (data.ok) {
+          knownImported[data.importedId] = true;
           el.dataset.state = "done";
           setLabel(el, LABELS.done);
         } else {
@@ -443,6 +660,8 @@ html body { overflow-y: visible !important; }
 /// resolve to `agentero-modelscope://g.alicdn.com/…` under our scheme and the
 /// application never boots.
 fn rewrite_html(html: &str) -> String {
+    let html = crate::features::web::proxy::inject_selection_bridge(html);
+    let html = html.as_str();
     let absolute = html
         .replace("=\"//", "=\"https://")
         .replace("='//", "='https://")
@@ -502,6 +721,8 @@ mod tests {
     #[test]
     fn injects_the_bridge_before_head_close() {
         let out = rewrite_html("<html><head><title>t</title></head><body></body></html>");
+        // Shared selection bridge: Escape and shortcuts must reach the app.
+        assert!(out.contains("type: \"escape\""));
         let script = out.find("agentero-plaza").expect("bridge present");
         let head_end = out.find("</head>").expect("head close present");
         assert!(script < head_end);
@@ -531,10 +752,9 @@ mod tests {
         assert!(NAV_BRIDGE.contains("html body { overflow-y: visible !important; }"));
     }
 
-    /// The panel browses the site as a narrow desktop window: the frame keeps
-    /// the 1280px layout and its own document is the horizontal scrollport, so a
-    /// trackpad pans it. Clamping the pages to the panel would leave no
-    /// horizontal overflow — and nothing to pan.
+    /// The panel browses the site as a desktop window: the frame keeps the
+    /// 1280px layout and the host scales it. Clamping the pages to the panel
+    /// would make the text unreadable at narrow widths.
     #[test]
     fn keeps_the_desktop_layout_pannable() {
         assert!(!NAV_BRIDGE.contains("min-width: 0 !important"));
@@ -558,7 +778,27 @@ mod tests {
     #[test]
     fn pans_horizontally_without_cancelling_the_wheel() {
         assert!(NAV_BRIDGE.contains("scrollsHorizontally(event.target)"));
-        assert!(NAV_BRIDGE.contains("if (!moved) scroller.scrollLeft += delta;"));
+        assert!(NAV_BRIDGE.contains("scroller.scrollLeft += delta;"));
+    }
+
+    /// Manual zoom puts the widened page's overflow in the host's scrollport,
+    /// outside this document. Once the frame cannot pan any further, the bridge
+    /// must hand the residual delta to the host instead of dropping it.
+    #[test]
+    fn forwards_outer_overflow_to_the_host() {
+        assert!(NAV_BRIDGE.contains("var remaining = delta - moved;"));
+        assert!(NAV_BRIDGE.contains("post({ panX: remaining })"));
+    }
+
+    /// Ctrl/Cmd+wheel and WebKit's trackpad pinch must reach the host as a
+    /// scale ratio; plain wheel events must keep scrolling the page. Windows
+    /// tags a synthetic pinch on the wheel event so it gets the pinch gain.
+    #[test]
+    fn forwards_zoom_gestures_to_the_host() {
+        assert!(NAV_BRIDGE.contains("event.ctrlKey || event.metaKey"));
+        assert!(NAV_BRIDGE.contains("post({ zoomRatio: ratio })"));
+        assert!(NAV_BRIDGE.contains("\"gesturechange\""));
+        assert!(NAV_BRIDGE.contains("agenteroPinch"));
     }
 
     /// The site's own layout root is scrollable in script and gets parked 10px to
@@ -600,6 +840,12 @@ mod tests {
         assert!(NAV_BRIDGE.contains("https://arxiv.org/abs/"));
         // Settled from the app so a row can show 已入库 / stay retryable.
         assert!(NAV_BRIDGE.contains("agentero-plaza-host"));
+        // A reload rebuilds every button as idle, so the frame asks which ids
+        // are already in the library.
+        assert!(NAV_BRIDGE.contains("queryImported"));
+        assert!(NAV_BRIDGE.contains("importedIds"));
+        // The import click carries its anchor point for the folder menu.
+        assert!(NAV_BRIDGE.contains("anchor: { x: box.left, y: box.bottom }"));
     }
 
     /// Absolute positioning against the card's own anchor is ill-defined: the
@@ -618,7 +864,6 @@ mod tests {
     #[test]
     fn centres_the_card_button_on_the_title_text() {
         assert!(NAV_BRIDGE.contains("align-items: flex-start;"));
-        assert!(NAV_BRIDGE.contains("cardButton.style.height = lineHeight;"));
     }
 
     /// The title is the only structural handle on a card, and requiring one is
@@ -629,23 +874,22 @@ mod tests {
         assert!(NAV_BRIDGE.contains("if (!title || !title.parentNode) continue;"));
     }
 
-    /// Both affordances are buttons carrying the Agentero mark, so they read as
-    /// ours rather than as one of the site's own actions.
+    /// The affordance mirrors the Papers with Code panel: a quiet pill in the
+    /// page's own colour, with no brand mark and no borrowed site classes.
     #[test]
-    fn brands_both_buttons_with_the_agentero_mark() {
-        assert!(NAV_BRIDGE.contains("agentero-import-logo"));
-        // The mark's copper spectacles.
-        assert!(NAV_BRIDGE.contains("#B96442"));
-        assert!(NAV_BRIDGE.contains("border-radius: 6px;"));
+    fn matches_the_papers_with_code_pill_style() {
+        assert!(NAV_BRIDGE.contains("border-radius: 999px;"));
+        assert!(NAV_BRIDGE.contains("color-mix(in oklab, currentColor 7%, transparent)"));
+        assert!(!NAV_BRIDGE.contains("agentero-import-logo"));
+        assert!(!NAV_BRIDGE.contains("borrowedClass"));
     }
 
-    /// The detail affordance joins the site's own action row and borrows its
-    /// classes, so it cannot key off them: the row is reached through the arXiv
-    /// favicon, which is neither content-hashed nor localized.
+    /// The detail affordance joins the site's own action row without borrowing
+    /// its classes: the row is reached through the arXiv favicon, which is
+    /// neither content-hashed nor localized.
     #[test]
     fn matches_the_detail_action_row_buttons() {
         assert!(NAV_BRIDGE.contains("img[src*=\"arxiv.org\"]"));
-        assert!(NAV_BRIDGE.contains("arxivAction.className"));
         assert!(NAV_BRIDGE.contains("row.insertBefore("));
     }
 

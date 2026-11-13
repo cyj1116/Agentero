@@ -5,18 +5,35 @@
  */
 
 import i18n from "@/i18n";
+import {
+	backgroundTasksStore,
+	cancelBackgroundTask,
+} from "@/lib/core/background-tasks";
 import { commands } from "@/lib/core/bindings";
 import { errorText } from "@/lib/core/error";
 import { callApiResult } from "@/lib/core/ipc";
 import { logger } from "@/lib/core/logger";
+import { sameRelPaperPath } from "@/lib/core/path";
 import {
 	registerTaskExecutor,
 	type TaskExecutorContext,
 	type TaskReportArgs,
 } from "@/lib/core/tasks";
+import { findCanonicalPaperPdfPath } from "@/lib/paper/media";
 import { analyzePaperLayoutHeadless } from "@/lib/pdf/layout/headless-analyze";
-import { readLayoutSidecar } from "@/lib/pdf/layout/io";
+import {
+	layoutIndexPath,
+	layoutSidecarPath,
+	readLayoutSidecar,
+} from "@/lib/pdf/layout/io";
 import { layoutAnalysisStore } from "@/lib/pdf/layout/store";
+import {
+	isPathMissingError,
+	joinVaultPath,
+	removeVaultPath,
+	vaultPathExists,
+	vaultRelativePath,
+} from "@/lib/vault";
 import { getVaultPath } from "@/lib/vault/store";
 
 const queuedPapers = new Set<string>();
@@ -38,7 +55,7 @@ async function runLayoutAnalyzeExecutor(
 ): Promise<void> {
 	const { jobId, vaultPath, paperPath, signal } = ctx;
 	const paperAbsPath = paperPath
-		? `${vaultPath}/${paperPath}`.replace(/\\/g, "/")
+		? joinVaultPath(vaultPath, paperPath)
 		: vaultPath;
 	const paperLabel =
 		paperPath?.split("/").filter(Boolean).pop() || paperAbsPath;
@@ -69,6 +86,7 @@ async function runLayoutAnalyzeExecutor(
 			paperLabel,
 			documentId,
 			signal,
+			force: ctx.force,
 		});
 		await report({ progress: 100, phase: "completed", state: "succeeded" });
 	} catch (e) {
@@ -91,16 +109,32 @@ async function runLayoutAnalyzeExecutor(
 export function enqueuePaperLayoutAnalysis(opts: {
 	paperAbsPath: string;
 	paperLabel?: string;
+	/** Explicit reading action takes priority over background imports. */
+	focus?: boolean;
+	/**
+	 * Import / download origin. When Settings → Translate → "Auto-translate
+	 * after import" is on, the Host also queues a `layoutTranslate` job that
+	 * starts only after this layout analysis succeeds. Opening a paper or
+	 * re-parsing layout must leave this false.
+	 */
+	autoTranslate?: boolean;
+	onError?: (error: unknown) => void;
 }): void {
 	const paperAbsPath = normalizePaperKey(opts.paperAbsPath);
-	if (!paperAbsPath || queuedPapers.has(paperAbsPath)) return;
+	if (!paperAbsPath || (!opts.focus && queuedPapers.has(paperAbsPath))) return;
 
 	const vaultPath = getVaultPath();
-	if (!vaultPath) return;
-	const paperRelPath = paperAbsPath
-		.slice(vaultPath.length)
-		.replace(/^[/\\]+/, "");
-	if (!paperRelPath) return;
+	const paperRelPath = vaultPath
+		? vaultRelativePath(vaultPath, paperAbsPath)
+		: null;
+	if (!vaultPath || !paperRelPath) {
+		// The caller parks the UI synchronously, so report invalid scope on
+		// the next microtask rather than silently leaving it waiting forever.
+		queueMicrotask(() =>
+			opts.onError?.(new Error(i18n.t("viewer:pdf.layoutTranslate.failed"))),
+		);
+		return;
+	}
 
 	queuedPapers.add(paperAbsPath);
 
@@ -113,18 +147,126 @@ export function enqueuePaperLayoutAnalysis(opts: {
 					commands.jobLayoutAnalyzeEnqueue({
 						vaultPath,
 						path: paperRelPath,
-						lane: "normal",
+						lane: opts.focus ? "focus" : "normal",
 						force: false,
+						autoTranslate: opts.autoTranslate ?? false,
 					}),
 				{ fallback: "layout analysis enqueue failed" },
 			);
+			// Enqueue dedupes with an existing job without changing its lane.
+			if (opts.focus) {
+				await callApiResult(
+					() => commands.jobFocusPaper({ vaultPath, path: paperRelPath }),
+					{ fallback: "layout analysis priority failed" },
+				);
+			}
 		} catch (e) {
 			logger.warn("enqueue paper layout analysis failed", {
 				paperAbsPath,
 				error: errorText(e),
 			});
+			opts.onError?.(e);
 		} finally {
 			queuedPapers.delete(paperAbsPath);
 		}
 	})();
+}
+
+export class LayoutReanalyzeError extends Error {
+	readonly code: "missing-pdf" | "missing-paper";
+
+	constructor(code: "missing-pdf" | "missing-paper") {
+		super(code);
+		this.name = "LayoutReanalyzeError";
+		this.code = code;
+	}
+}
+
+async function removePaperLayoutSidecars(paperAbsPath: string): Promise<void> {
+	await Promise.all(
+		[layoutSidecarPath(paperAbsPath), layoutIndexPath(paperAbsPath)].map(
+			async (path) => {
+				try {
+					if (!(await vaultPathExists(path))) return;
+					await removeVaultPath(path);
+				} catch (error) {
+					if (isPathMissingError(error)) return;
+					logger.warn("layout sidecar remove failed", {
+						path,
+						error: errorText(error),
+					});
+				}
+			},
+		),
+	);
+}
+
+/**
+ * Enqueue a focus `layoutAnalyze` job with `force: true` for one paper.
+ * The executor forwards `force` into `analyzePaperLayoutHeadless`, which
+ * otherwise returns when `layout.json` already has regions. After the job
+ * is queued, the two sidecar files are removed so other readers do not
+ * keep the old parse. The root `{id}.pdf` must already be on disk; this
+ * does not fall through to `source/assets/`.
+ */
+export async function forcePaperLayoutAnalysis(opts: {
+	paperAbsPath: string;
+	paperRelPath?: string | null;
+}): Promise<void> {
+	const paperAbsPath = opts.paperAbsPath.trim().replace(/[/\\]+$/, "");
+	if (!paperAbsPath) throw new LayoutReanalyzeError("missing-paper");
+
+	const vaultPath = getVaultPath();
+	if (!vaultPath) throw new LayoutReanalyzeError("missing-paper");
+
+	const explicitRel = (opts.paperRelPath ?? "")
+		.replace(/\\/g, "/")
+		.replace(/^[/\\]+/, "");
+	const paperRelPath =
+		explicitRel ||
+		vaultRelativePath(vaultPath, paperAbsPath)?.replace(/^[/\\]+/, "") ||
+		"";
+	if (!paperRelPath) throw new LayoutReanalyzeError("missing-paper");
+
+	const pdfPath = await findCanonicalPaperPdfPath(paperAbsPath);
+	if (!pdfPath) throw new LayoutReanalyzeError("missing-pdf");
+
+	const inflight = backgroundTasksStore
+		.getState()
+		.tasks.filter(
+			(task) =>
+				task.kind === "layoutAnalyze" &&
+				(task.status === "queued" || task.status === "running") &&
+				sameRelPaperPath(task.paperPath, paperRelPath),
+		);
+	await Promise.all(
+		inflight.map(async (task) => {
+			try {
+				await callApiResult(() => commands.jobCancel(task.id), {
+					fallback: "layout job cancel failed",
+				});
+			} catch (error) {
+				logger.warn("cancel layout job before force reanalyze failed", {
+					jobId: task.id,
+					error: errorText(error),
+				});
+			}
+			cancelBackgroundTask(task.id);
+		}),
+	);
+
+	await callApiResult(
+		() =>
+			commands.jobLayoutAnalyzeEnqueue({
+				vaultPath,
+				path: paperRelPath,
+				lane: "focus",
+				force: true,
+			}),
+		{ fallback: "layout analysis enqueue failed" },
+	);
+	// Drop the old parse only after the force job is queued. A failed enqueue
+	// leaves the sidecar in place. `force` makes the new run ignore whatever
+	// is still on disk, then overwrite it.
+	await removePaperLayoutSidecars(paperAbsPath);
 }

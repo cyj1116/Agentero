@@ -14,6 +14,14 @@ export {
 	paperHasVisibleAttachments,
 } from "@/lib/paper/attachments";
 export {
+	isPaperChildDocName,
+	isPaperChildDocPath,
+	paperHasVisibleChildren,
+	paperRootDocChildren,
+	paperSurfacesChildPath,
+	paperVisibleChildren,
+} from "@/lib/paper/children";
+export {
 	collectPaperFoldersFromTree,
 	detectPaperDirectory,
 	directoryHasPaperMarkers,
@@ -29,6 +37,8 @@ export {
 } from "@/lib/paper/load-meta";
 export {
 	canAttemptPdfDownload,
+	canonicalPaperPdfPath,
+	findCanonicalPaperPdfPath,
 	findLocalPdfPath,
 	isPdfViewerSource,
 	localFileToArrayBuffer,
@@ -37,7 +47,6 @@ export {
 	revokePdfViewerSource,
 } from "@/lib/paper/media";
 export {
-	attachmentsPathForPaper,
 	isPaperAssetPath,
 	isPaperAttachmentsDirName,
 	isPaperInternalDirName,

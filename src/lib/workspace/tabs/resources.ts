@@ -1,6 +1,7 @@
 import i18n from "@/i18n";
 import { commands } from "@/lib/core/bindings";
 import { errorText } from "@/lib/core/error";
+import { scheduleIdle } from "@/lib/core/idle";
 import { callApiResult } from "@/lib/core/ipc";
 import { toVaultRelative } from "@/lib/core/path";
 import { enqueueTaskSettled } from "@/lib/core/tasks";
@@ -37,6 +38,8 @@ import {
 	readVaultFile,
 } from "@/lib/vault";
 import { basenameOf, normalizePathKey, treeFindNode } from "@/lib/vault/path";
+import { readSeedCached } from "@/lib/vault/seed-cache";
+import { tabTitleForPath } from "@/lib/workspace/tabs/model";
 import {
 	type DocTab,
 	NOTES_PLACEHOLDER,
@@ -44,12 +47,10 @@ import {
 } from "@/lib/workspace/tabs/types";
 import {
 	imageMimeFromPath,
-	isExcalidrawPath,
-	isHtmlPath,
-	isImagePath,
-	isPdfPath,
+	isViewerPath,
 	paperBodyMode,
 	preferredModeForPath,
+	viewerModeSpec,
 } from "@/lib/workspace/viewer";
 
 function findChildren(nodes: FileNode[], path: string): FileNode[] | undefined {
@@ -73,10 +74,13 @@ function reconcilePaperOnOpen(
 		.replace(/\\/g, "/")
 		.replace(/^\/+|\/+$/g, "");
 	if (!rel) return;
-	void callApiResult(
-		() => commands.jobReconcilePaper({ vaultPath, path: rel }),
-		{ fallback: "paper reconcile failed" },
-	).catch(() => undefined);
+	// Host ParseBody/ParseRefs jobs; keep them off the PDF-open critical path.
+	scheduleIdle(() => {
+		void callApiResult(
+			() => commands.jobReconcilePaper({ vaultPath, path: rel }),
+			{ fallback: "paper reconcile failed" },
+		).catch(() => undefined);
+	});
 }
 
 /**
@@ -258,10 +262,7 @@ export async function loadTabResources(
 	// Outside `papers/` any extension-bearing path is a plain-text fallback file;
 	// extension-less names stay directory-suspect for that restore race.
 	const looksLikeOpenableFile =
-		isPdfPath(path) ||
-		isImagePath(path) ||
-		isHtmlPath(path) ||
-		isExcalidrawPath(path) ||
+		isViewerPath(path) ||
 		isTextOpenable(path) ||
 		(!isUnderPapers(path) && /\.[^\\/]+$/.test(path));
 	if (
@@ -288,7 +289,7 @@ export async function loadTabResources(
 		const notesPath = notesPathForPaper(paperDir);
 		// Fallback seed read races with the probes below; resolved last so a
 		// bundle that only arrives on the retry wins over an early failed read.
-		const notesFallback = readVaultFile(notesPath).catch(
+		const notesFallback = readSeedCached(notesPath).catch(
 			() => NOTES_PLACEHOLDER,
 		);
 		const probeOpenState = async () => {
@@ -386,6 +387,7 @@ export async function loadTabResources(
 		}
 
 		// A file inside a paper folder (e.g. NOTES.md, a nested PDF, or figure).
+		// The resource strategy comes from the mode registry (viewer/index.ts).
 		const mode = preferredModeForPath(path);
 		let pdfUrl = paperPdf;
 		let pdfBytes = paperBytes;
@@ -393,52 +395,77 @@ export async function loadTabResources(
 		let markdownSeed = "";
 		let excalidrawSeed = "";
 
-		if (isPdfPath(path)) {
-			// Prefer the exact file the user clicked (may differ from canonical {id}.pdf).
-			const exact = await localFileToArrayBuffer(path);
-			if (exact) {
-				pdfBytes = exact;
-				pdfUrl = null;
+		switch (viewerModeSpec(mode).resource) {
+			case "pdf": {
+				// Prefer the exact file the user clicked (may differ from canonical {id}.pdf).
+				const exact = await localFileToArrayBuffer(path);
+				if (exact) {
+					pdfBytes = exact;
+					pdfUrl = null;
+				}
+				break;
 			}
-		} else if (isImagePath(path)) {
-			imageUrl = await localImageToViewerSource(path, imageMimeFromPath(path));
-			if (!imageUrl) {
-				return {
-					kind: "file",
-					title: basenameOf(path),
-					mode: "image",
-					paperMeta: meta,
-					pdfUrl: paperPdf,
-					pdfBytes: paperBytes,
-					htmlUrl,
-					imageUrl: null,
-					notesPath,
-					notesSeed,
-					markdownSeed: "",
-					loaded: true,
-					didDownloadAssets: didDownload,
-					error: "cannotPreview",
-				};
+			case "image": {
+				imageUrl = await localImageToViewerSource(
+					path,
+					imageMimeFromPath(path),
+				);
+				if (!imageUrl) {
+					return {
+						kind: "file",
+						title: basenameOf(path),
+						mode: "image",
+						paperMeta: meta,
+						pdfUrl: paperPdf,
+						pdfBytes: paperBytes,
+						htmlUrl,
+						imageUrl: null,
+						notesPath,
+						notesSeed,
+						markdownSeed: "",
+						loaded: true,
+						didDownloadAssets: didDownload,
+						error: "cannotPreview",
+					};
+				}
+				break;
 			}
-		}
-		if (isTextOpenable(path)) {
-			try {
-				markdownSeed = await readVaultFile(path);
-			} catch {
-				// Leave the editor empty when the file cannot be read.
+			case "excalidraw": {
+				try {
+					excalidrawSeed = await readVaultFile(path);
+				} catch {
+					// Leave the canvas empty when the file cannot be read.
+				}
+				// markdownSeed is consumed only by markdown mode; the old loader
+				// read it here too.
+				break;
 			}
-		}
-		if (isExcalidrawPath(path)) {
-			try {
-				excalidrawSeed = await readVaultFile(path);
-			} catch {
-				// Leave the canvas empty when the file cannot be read.
+			case "markdown": {
+				if (isTextOpenable(path)) {
+					try {
+						markdownSeed = await readVaultFile(path);
+					} catch {
+						// Leave the editor empty when the file cannot be read.
+					}
+				}
+				break;
+			}
+			case "html": {
+				// Local `.html` is served by the `agentero-html` scheme from
+				// `tab.path`. The paper's remote `htmlUrl` stays on the paper
+				// body tab and is not reused as this file's preview.
+				break;
+			}
+			case "text": {
+				// Unreachable inside papers/: the path fallback for this domain is
+				// markdown, never the CodeMirror text editor.
+				break;
 			}
 		}
 
 		return {
 			kind: "file",
-			title: basenameOf(path),
+			title: tabTitleForPath(path),
 			mode,
 			paperMeta: meta,
 			pdfUrl,
@@ -455,10 +482,11 @@ export async function loadTabResources(
 	}
 
 	// Plain file, not under a paper folder (vault root, notes/, etc.).
+	// The resource strategy comes from the mode registry (viewer/index.ts).
 	const mode = preferredModeForPath(path);
 	const base = {
 		kind: "file" as const,
-		title: basenameOf(path),
+		title: tabTitleForPath(path),
 		mode,
 		paperMeta: null,
 		pdfUrl: null as string | null,
@@ -471,63 +499,61 @@ export async function loadTabResources(
 		loaded: true as const,
 	};
 
-	if (isPdfPath(path)) {
-		const pdfBytes = await localFileToArrayBuffer(path);
-		if (!pdfBytes) {
-			return { ...base, mode: "pdf", error: "cannotPreview" };
+	switch (viewerModeSpec(mode).resource) {
+		case "pdf": {
+			const pdfBytes = await localFileToArrayBuffer(path);
+			if (!pdfBytes) {
+				return { ...base, error: "cannotPreview" };
+			}
+			return { ...base, pdfBytes };
 		}
-		return { ...base, mode: "pdf", pdfBytes };
-	}
-
-	if (isImagePath(path)) {
-		const imageUrl = await localImageToViewerSource(
-			path,
-			imageMimeFromPath(path),
-		);
-		if (!imageUrl) {
-			return { ...base, mode: "image", error: "cannotPreview" };
+		case "image": {
+			const imageUrl = await localImageToViewerSource(
+				path,
+				imageMimeFromPath(path),
+			);
+			if (!imageUrl) {
+				return { ...base, error: "cannotPreview" };
+			}
+			return { ...base, imageUrl };
 		}
-		return { ...base, mode: "image", imageUrl };
-	}
-
-	if (isExcalidrawPath(path)) {
-		try {
-			const excalidrawSeed = await readVaultFile(path);
-			return { ...base, mode: "excalidraw", excalidrawSeed };
-		} catch (e) {
-			return { ...base, mode: "excalidraw", error: errorText(e) };
+		case "excalidraw": {
+			try {
+				const excalidrawSeed = await readVaultFile(path);
+				return { ...base, excalidrawSeed };
+			} catch (e) {
+				return { ...base, error: errorText(e) };
+			}
 		}
-	}
-
-	// CodeMirror plain-text fallback (Papers 外未知/文本扩展名). Unlike the
-	// Markdown editor this accepts any extension — the text editor is the
-	// catch-all viewer, so no isTextOpenable gate here.
-	if (mode === "text") {
-		try {
-			const textSeed = await readVaultFile(path);
-			return { ...base, textSeed };
-		} catch (e) {
-			return { ...base, error: errorText(e) };
+		case "text": {
+			// CodeMirror plain-text fallback (Papers 外未知/文本扩展名). Unlike the
+			// Markdown editor this accepts any extension — the text editor is the
+			// catch-all viewer, so no isTextOpenable gate here.
+			try {
+				const textSeed = await readVaultFile(path);
+				return { ...base, textSeed };
+			} catch (e) {
+				return { ...base, error: errorText(e) };
+			}
 		}
-	}
-
-	if (isHtmlPath(path)) {
-		// Local HTML still has no sandboxed file:// preview (remote only for paper HTML).
-		return base;
-	}
-
-	if (!isTextOpenable(path)) {
-		return { ...base, error: "cannotPreview" };
-	}
-
-	try {
-		const markdownSeed = await readVaultFile(path);
-		return { ...base, markdownSeed };
-	} catch (e) {
-		return {
-			...base,
-			error: errorText(e),
-		};
+		case "html": {
+			// Local `.html` is previewed from `path` via `agentero-html`.
+			return base;
+		}
+		case "markdown": {
+			if (!isTextOpenable(path)) {
+				return { ...base, error: "cannotPreview" };
+			}
+			try {
+				const markdownSeed = await readSeedCached(path);
+				return { ...base, markdownSeed };
+			} catch (e) {
+				return {
+					...base,
+					error: errorText(e),
+				};
+			}
+		}
 	}
 }
 

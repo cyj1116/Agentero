@@ -26,6 +26,15 @@ pub const HOME_BIN_DIRS: &[&str] = &[
     ".grok/bin",
     // Kimi Code official installer (single binary, writes PATH into the shell rc).
     ".kimi-code/bin",
+    // Qoder CN official installer writes the `qodercn` dispatchers here and
+    // appends the dir to the shell rc, which GUI launches / a just-finished
+    // silent install may not see yet.
+    ".qoder-cn/entry",
+    // MiniMax Code's official installer keeps its isolated runtime and
+    // launchers outside npm's global bin. POSIX uses `bin/mcode`; Windows
+    // writes `mcode.cmd` directly under `%USERPROFILE%\\.minimax-code`.
+    ".minimax-code/bin",
+    ".minimax-code",
     // fnm default-alias bins (data dir varies by platform; session
     // multishell dirs are ephemeral, skip them).
     "Library/Application Support/fnm/aliases/default/bin",
@@ -42,7 +51,17 @@ pub const ABS_BIN_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
 /// inherited already; it is listed defensively for launches that do not get the
 /// user's full environment (service / scheduler task), like the npm and scoop
 /// dirs the GUI patch adds itself.
-pub const WIN_ABS_BIN_DIRS: &[&str] = &[r"C:\ProgramData\chocolatey\bin"];
+///
+/// The official Node.js installer (winget `OpenJS.NodeJS.LTS` / nodejs.org)
+/// drops `node` + `npm` in `C:\Program Files\nodejs` and appends that to the
+/// *machine* PATH. A GUI app already running when Node is installed keeps its
+/// stale inherited PATH, so the just-installed npm is invisible until restart;
+/// listing the dir here lets the one-click Node install work immediately.
+pub const WIN_ABS_BIN_DIRS: &[&str] = &[
+    r"C:\ProgramData\chocolatey\bin",
+    r"C:\Program Files\nodejs",
+    r"C:\Program Files (x86)\nodejs",
+];
 
 /// Linuxbrew install roots (common on servers).
 pub const LINUXBREW_ABS_BIN: &str = "/home/linuxbrew/.linuxbrew/bin";

@@ -68,6 +68,12 @@ pub async fn paper_coolpapers_import(
         note_mode: crate::features::paper::import::note_mode_from_app(&app),
     })
     .await;
+    if let Ok(commit) = &result {
+        crate::features::host_hooks::enqueue_preparation_plan(&app, &vault, &commit.preparation);
+        if crate::features::paper::import::commit_needs_layout_follow_up(commit) {
+            crate::features::jobs::spawn_layout_after_import(Some(&app), &vault, &commit.path);
+        }
+    }
     Ok(op.finish_result(result))
 }
 

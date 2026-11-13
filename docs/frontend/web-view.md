@@ -1,6 +1,6 @@
 # 网页论文阅读与划词
 
-「网页」类论文（paper `type === "html"`，有 `html_url` 无本地 PDF）由 `HtmlViewer`（`src/components/viewer/html-viewer.tsx`）以内嵌 iframe 阅读。跨域 iframe 受同源策略约束,父页面拿不到选区——划词工具栏、翻译、Quick chat 全部失效。解法是把页面经内置通用代理加载,并注入一段"桥"脚本进页面上下文(近似浏览器扩展的 content script)。
+「网页」类论文（paper `type === "html"`，有 `html_url` 无本地 PDF）由 `HtmlViewer`（`src/components/viewer/html-viewer.tsx`）以内嵌 iframe 阅读。从 PDF 标签打开的 arXiv HTML 不走下面这条代理，见 [pdf.md](pdf.md)。跨域 iframe 受同源策略约束,父页面拿不到选区——划词工具栏、翻译、Quick chat 全部失效。解法是把页面经内置通用代理加载,并注入一段"桥"脚本进页面上下文(近似浏览器扩展的 content script)。
 
 ## 架构
 
@@ -28,6 +28,8 @@ Host `features/web/proxy.rs`(agentero-web scheme)
 
 与 `arxivReaderUrl` 同一约束:Windows WebView2 把自定义 scheme 拦截为 `http://<scheme>.localhost`。构造与 `event.origin` 校验统一走 `src/lib/web-view/proxy-url.ts`(`webViewProxyUrl` / `webViewProxyOrigins`,后者两种形态都接受)。
 
+网页论文、本地 HTML 预览与广场 iframe 共用 `src/hooks/use-iframe-drag-shield.ts`：捕获 `dragstart` 后暂停 iframe 命中测试，`dragend` / `drop` 后恢复，使拖放事件能到达 Dockview；各查看器的授权、导航与 sandbox 规则仍独立维护。
+
 ## 安全边界(Host 侧)
 
 | 防线 | 实现 |
@@ -40,33 +42,35 @@ Host `features/web/proxy.rs`(agentero-web scheme)
 
 ## 桥脚本(WEB_BRIDGE)
 
-NAV_BRIDGE 同款 vanilla ES5 IIFE,只装配顶层 frame。经 `parent.postMessage` 与应用通信;应用侧监听 `message` 并校验 `event.origin ∈ webViewProxyOrigins()` 且 `data.source === "agentero-web"`(防无关 frame 伪造)。
+共享 `lib/web-view/selection-bridge.js` IIFE,只装配顶层 frame。经 `parent.postMessage` 与应用通信;应用侧监听 `message` 并校验 `event.origin ∈ webViewProxyOrigins()` 、`event.source === iframe.contentWindow` 且 `data.source === "agentero-web"`(防无关 frame 伪造)。
 
 ### 消息协议
 
 | 方向 | type | 载荷 | 语义 |
 |---|---|---|---|
-| frame → app | `selection` | `{text(≤4000), rect\|null, url}` | 选区(视口坐标矩形);空文本即清菜单。带 rect 时帧内已 `execCommand("copy")`(焦点在 frame,应用侧剪贴板写入可能被拒的降级) |
+| frame → app | `selection` | `{text(≤4000), rect\|null, url, side?, cursorX?}` | 选区(视口坐标矩形)、手势结束侧(`above` / `below`)与光标端点 x;空文本即清菜单。带 rect 时帧内已 `execCommand("copy")`(焦点在 frame,应用侧剪贴板写入可能被拒的降级) |
 | frame → app | `scroll` | — | 页内滚动,隐藏工具栏(plaza 同款语义) |
-| frame → app | `shortcut` | `{id: "quickChat" \| "addToChat"}` | ⌘K / ⌘L——iframe 聚焦时键盘事件进不了主 webview,必须显式转发;editable target 不转发 |
+| frame → app | `escape` | — | 非输入元素上的 Escape（window 捕获阶段转发，站点 `stopPropagation` / `preventDefault` 不影响）；父窗口转交共享选区宿主关闭工具栏 / 批注 / 结果卡。桥不拦截按键,站点自身的 Escape 行为保留 |
+| frame → app | `ready` | — | 桥完成监听后请求当前快捷键配置；每次文档导航重新握手 |
+| frame → app | `shortcut` | `{event: {key, code, metaKey, ctrlKey, altKey, shiftKey}}` | 仅转发匹配的配置；应用以 `resolveShortcutId` 再校验。可编辑元素、IME 与普通输入不转发 |
 | frame → app | `external` | `{url}` | 跨站链接交系统浏览器 |
+| app → frame | `shortcuts` | `{bindings: ShortcutDef[], isMac}` | 同步 toggleChat / quickChat / addSelectionToChat 的有效配置；禁用不传。桥 ready、iframe load 和设置变更均同步 |
 | app → frame | `clearSelection` | — | 加入对话后清除帧内选区 |
-| app → frame | `copySelection` | — | 应用侧复制失败时的兜底 |
 
 站内导航:同 host 链接被改写为 `/<host><path>` 原地导航(每次文档加载都重新注入桥);SPA 的 `pushState`/`replaceState` 被包装以保留 host 段;非 http(s) scheme 的链接直接阻止(私有 scheme 绝不漏给系统浏览器)。
 
 ## 划词动作管线(前端)
 
-`use-web-view-selection.ts`(`src/components/viewer/web-view/`)消费桥消息,产出与 PDF / plaza 同款的浮层:
+`use-web-view-selection.ts`(`src/components/viewer/web-view/`)消费桥消息,将快照交给窗口级 `SelectionActions`，详见[通用划词动作](selection.md)：
 
-- **工具栏**:`SelectionMenu`(复用 `viewer/pdf/cards/`,`showHighlight={false}`——网页无 marks/,藏高亮留翻译)+ 选中即复制标签 `SelectionCopiedLabel`;
-- **翻译**:`TranslateCard` 流式卡,双 provider 执行在共享引擎 `lib/pdf/translate/run-selection.ts`(agent → `runOnce{workflow:"translate"}` 流式;免费 MT → `runTranslate`;与 PDF 划词复用),ephemeral 单卡不写 marks;
-- **Quick chat ⌘K**:`AskPopover` + 共享 `use-selection-ask.ts`(从 plaza 抽出的 ephemeral ask 生命周期:`PdfAskThread` + 共享引擎 `lib/pdf/ask/run-turn.ts` 的 `runOnce{workflow:"free"}` + `attachAgentRun` 流式,plaza 改为消费方);
-- **加入对话 ⌘L**:`addSelectionToChat`(= `publishSelection` + `pinActiveSelection` + `openRightTab("agent")`)。
+- **工具栏**：共享 `SelectionActionMenu`，网页省略 PDF 高亮和标注扩展；选中即复制行为继续保留。
+- **翻译**：共享 `useSelectionTranslation` + `TranslateCard`；使用同一翻译服务与单卡所有权，不写 marks。
+- **Quick chat**：共享 `useSelectionAsk` + `AskPopover`；保留选区、标题和原始 URL，关闭或导航时取消在途请求。
+- **加入对话**：工具栏和快捷键都直接冻结选区并聚焦 Agent composer，不经过批注框。
 
-四个划词表面(PDF / plaza / 网页论文 / 文本编辑器)共用 `src/components/selection/` 下的三件套:`use-copied-label.ts`(自动复制的 copied 确认标签,1000ms 自隐藏)、`use-selection-quick-chat.ts`(⌘K 注册,ref 守卫 mount 稳定 + armed 谓词)、`add-selection-to-chat.ts`(发布 + pin + 打开 Agent 侧栏);ask 生命周期在 `use-selection-ask.ts`。各表面只保留自己的来源 origin、几何信息与 dismissal 编排。
+默认 `⌘L` 仅切换 Agent 侧栏；`⇧⌘L` 加入选区，`⌘K` 打开 Quick chat。提示与 iframe 转发均跟随用户配置。桥本身也用于广场代理与 arXiv HTML 的受信 `srcdoc`；父窗口始终校验 origin 和精确 frame 身份。
 
-坐标换算:`bridgeSelectionScreen(rect, iframeRect)`(桥给的是 frame 视口坐标,加 iframe 元素偏移即应用视口坐标),纯函数在 `bridge-message.ts`,与消息 parse 守卫一起有 vitest 覆盖。
+坐标换算:`bridgeSelectionScreen(rect, iframeRect, side, cursorX)`(桥给的是 frame 视口坐标,加 iframe 元素偏移即应用视口坐标,并一并给出选区矩形 `selectionBounds`、手势结束侧与光标 x),纯函数在 `bridge-message.ts`,与消息 parse 守卫一起有 vitest 覆盖。工具栏以光标结束点为中,按该侧放在选区上/下方;共享翻译卡放在选区下方,快速对话卡优先放在选区上方。
 
 ## 已知限制
 
@@ -75,7 +79,32 @@ NAV_BRIDGE 同款 vanilla ES5 IIFE,只装配顶层 frame。经 `parent.postMessa
 - **跨 host 重定向**:重定向目标 host 必须也在 allowlist(如 www → 裸域),否则该请求报错——SSRF 边界优先。
 - 剪贴板:首选应用侧 `copyTextToClipboard`,被拒时桥内 `execCommand("copy")` 已先行复制。
 
+## 本地 HTML 文件
+
+Vault 中的 `.html` / `.htm`（论文目录下的子文件、`notes/` 里的图）由 `LocalHtmlViewer`（`src/components/viewer/local-html-viewer.tsx`）预览。远程论文页仍走上面的 `HtmlViewer`。Markdown 笔记或 Agent 对话里的本地 HTML 链接会在活动面板右侧分屏打开这个 viewer（#825）。
+
+```text
+打开 logic.html
+  → html_preview_grant(绝对路径) → { token, name }
+  → iframe src: agentero-html://localhost/t/<token>/<name>?v=<htmlKey>
+  → Host 只读该文件所在目录（含子目录）
+```
+
+Windows 上地址是 `http://agentero-html.localhost/t/...`。`sandbox="allow-scripts"`。磁盘上的同一文件变更会增加 `htmlKey`，iframe 重新加载，不必把全文读进 React state。
+
+适合 Skill 写出的单文件图（内联 SVG / CSS / 脚本）。同目录的 `./fig.svg` 可以显示。远程脚本、`fetch`、表单、弹窗和跳出该目录的路径都不放行。字体允许 Google Fonts；要完全离线，生成时改用系统字体。
+
+划词、翻译、加入对话不接在这个 iframe 上。源码编辑也不在预览里。
+
 ## 相关
 
-- 广场各站专属代理(固定 origin,不做任意 host):`docs/development/plaza.md`
+- 广场各站专属代理（固定 origin，不做任意 host）：与 [../backend/api.md](../backend/api.md) §3.6.2 的网页论文代理分开；入库见 [paper-import.md](paper-import.md)
 - PDF 划词(持久化 marks 的对照实现):[pdf.md](pdf.md)
+- Host 契约：[../backend/api.md](../backend/api.md) §3.6.3
+
+
+## RSS 与网页入库边界
+
+当前 Translator 返回 `webpage` 时可映射为 `html` 条目，Connector / Zotero 迁移复用同一数据模型；打开网页条目可同时使用 `NOTES.md`。翻译服务不可用时，普通网页仍按 URL、标题和页面元数据入库，论文详情页优先用页面上的 `citation_*`。这不保证任意 URL 都能解析，也不等于正文已经离线归档。RSS 条目已支持右键「入库」及详情工具栏入库：论文优先用论文 URL，普通网页用来源 URL，复用上述解析链路。正文离线归档和来源去重仍未做（[#821](https://github.com/poco-ai/Agentero/issues/821)）。
+
+订阅列表已支持打开详情自动标记已读、灰色标题、隐藏已读和恢复未读；阅读状态只写订阅缓存，不创建 Vault 条目。

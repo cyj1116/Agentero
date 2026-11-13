@@ -60,8 +60,10 @@ describe("prepareMarkdownForDeserialize", () => {
 	it("escapes an unclosed block-math fence", () => {
 		const source = "before\n$$\nbad _ {\n\nafter\n# heading";
 
+		// The repaired `$$` is no longer a math fence, so the stray `{` is prose
+		// and gets entity-escaped for MDX (remark decodes it back to `{`).
 		expect(prepareMarkdownForDeserialize(source)).toBe(
-			"before\n\\$$\nbad _ {\n\nafter\n# heading",
+			"before\n\\$$\nbad _ &#123;\n\nafter\n# heading",
 		);
 	});
 
@@ -91,6 +93,14 @@ describe("prepareMarkdownForDeserialize", () => {
 		const source = "    $$\n    not math";
 
 		expect(prepareMarkdownForDeserialize(source)).toBe(source);
+	});
+
+	it("skips the blank/math passes when their syntax is absent", () => {
+		// No double newline and no `$$`: both full scans are skipped, output is
+		// byte-identical to the input.
+		expect(prepareMarkdownForDeserialize("A\nB")).toBe("A\nB");
+		expect(prepareMarkdownForDeserialize("A\n \nB")).toBe("A\n \nB");
+		expect(prepareMarkdownForDeserialize("plain title")).toBe("plain title");
 	});
 
 	it("keeps Markdown after an invalid unclosed equation parseable", () => {

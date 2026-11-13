@@ -1,7 +1,7 @@
 /**
- * Built-in command palette registry. Commands close over the action modules
- * (all stable), so this list is a module constant instead of a per-render
- * useMemo with twenty dependencies.
+ * Built-in palette commands. They close over the action modules (all stable),
+ * so this list is a module constant. Importing the module registers them as
+ * builtins; the live palette reads `listCommands()`.
  */
 
 import { fileTreeHandle } from "@/components/shell/file-tree-registry";
@@ -9,6 +9,14 @@ import { focusAgentComposer } from "@/lib/agent/composer-focus";
 import { pinActiveSelection } from "@/lib/agent/selection-store";
 import { openMagicWand } from "@/lib/paper/import-actions";
 import { refreshLibrary } from "@/lib/paper/library-store";
+import {
+	canLoadDevelopmentPlugin,
+	hasDevelopmentPlugins,
+	loadDevelopmentPlugin,
+	unloadDevelopmentPlugins,
+} from "@/lib/plugins/development";
+import { pluginsSurfaceEnabled } from "@/lib/plugins/visibility";
+import { registerBuiltinCommands } from "@/lib/shell/commands/registry";
 import type { AppCommand } from "@/lib/shell/commands/types";
 import {
 	closeSettingsWindow,
@@ -26,17 +34,36 @@ import {
 import { getVaultPath } from "@/lib/vault/store";
 import {
 	closeTabOrWindow,
+	cycleActiveGroupTab,
 	cycleActiveTab,
 	reopenClosedTab,
 	selectLibrary,
 	splitActivePane,
 } from "@/lib/workspace/actions";
+import {
+	activeMarkdownEditorId,
+	toggleActiveMarkdownSource,
+} from "@/lib/workspace/markdown-source-toggle";
 import { getActiveTab } from "@/lib/workspace/store";
 import { resolveActivePdfHandle } from "@/lib/workspace/viewer/pdf-viewer-registry";
 
 const hasVault = () => Boolean(getVaultPath());
 
 export const paletteCommands: AppCommand[] = [
+	{
+		id: "plugins.loadDevelopment",
+		titleKey: "commands.pluginsLoadDevelopment",
+		categoryKey: "commands.catApp",
+		when: () => pluginsSurfaceEnabled && canLoadDevelopmentPlugin(),
+		run: loadDevelopmentPlugin,
+	},
+	{
+		id: "plugins.unloadDevelopment",
+		titleKey: "commands.pluginsUnloadDevelopment",
+		categoryKey: "commands.catApp",
+		when: () => pluginsSurfaceEnabled && hasDevelopmentPlugins(),
+		run: unloadDevelopmentPlugins,
+	},
 	{
 		id: "settings.open",
 		titleKey: "commands.settingsOpen",
@@ -184,6 +211,28 @@ export const paletteCommands: AppCommand[] = [
 		run: () => cycleActiveTab(-1),
 	},
 	{
+		id: "tab.nextInGroup",
+		titleKey: "commands.tabNextInGroup",
+		categoryKey: "commands.catTab",
+		run: () => cycleActiveGroupTab(1),
+	},
+	{
+		id: "tab.prevInGroup",
+		titleKey: "commands.tabPrevInGroup",
+		categoryKey: "commands.catTab",
+		run: () => cycleActiveGroupTab(-1),
+	},
+	{
+		id: "editor.toggleMarkdownSource",
+		titleKey: "commands.toggleMarkdownSource",
+		categoryKey: "commands.catEditor",
+		keywords: ["markdown", "source", "wysiwyg", "源码", "渲染"],
+		when: () => activeMarkdownEditorId() !== null,
+		run: () => {
+			toggleActiveMarkdownSource();
+		},
+	},
+	{
 		id: "pdf.exportAnnotatedPdf",
 		titleKey: "commands.exportAnnotatedPdf",
 		categoryKey: "commands.catPdf",
@@ -203,3 +252,6 @@ export const paletteCommands: AppCommand[] = [
 		run: () => openMagicWand(),
 	},
 ];
+
+// Second evaluation (HMR / reimport) skips ids already registered.
+registerBuiltinCommands(paletteCommands);

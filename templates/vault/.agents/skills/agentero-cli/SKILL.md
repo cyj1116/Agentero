@@ -1,10 +1,10 @@
 ---
 name: agentero-cli
-version: 18
+version: 20
 description: >-
   Use the Agentero CLI (bin `agentero`) to create, discover, and inspect a local
-  research vault and catalog—list/get papers, import by id/URL/PDF, layout regions,
-  reading marks, download assets, parse PAPER.md, export bib—without BYOA.
+  research vault and catalog—list/get papers, import by id/URL/PDF, update metadata,
+  layout regions, reading marks, download assets, parse PAPER.md, export bib—without BYOA.
   Prefer --json. Discover unknown flags via `agentero describe`. Use when
   managing a vault headless, scripting Motif/Agentero, or exploring papers via
   machine APIs ($agentero-cli / /agentero-cli).
@@ -91,6 +91,7 @@ agentero import id <arxiv|doi|url> --json
 agentero import pdf <path...> --json
 agentero paper download papers/<…> --json
 agentero paper parse papers/<…> --json
+agentero paper set-meta papers/<…> --publication "Venue" --json
 agentero paper tag add papers/<…> "label:color" --json
 ```
 
@@ -99,6 +100,8 @@ agentero paper tag add papers/<…> "label:color" --json
 ```bash
 agentero layout list papers/<…> --json
 agentero layout list papers/<…> --kind figure --json
+agentero layout list papers/<…> --kind section --kind paragraph --json
+agentero layout get papers/<…> '#2.1#p3' --json
 agentero mark list papers/<…> --json
 ```
 
@@ -127,6 +130,12 @@ Do **not** run `set-read` after ordinary Q&A or summary that did not finish NOTE
 ## Invariants
 
 - On `mark_locate_failed`, retry with a longer verbatim quote — **never** guess coordinates.
+- For claim-level PDF citations, query `--kind paragraph`, verify the returned `text`,
+  `sectionAnchor`, page and bbox, then append its exact `anchor` to the local PDF path.
+  `#2.1#p3` is the third body block directly owned by Section 2.1; subsections count separately.
+  Never infer paragraph numbers from filtered results. Missing/ambiguous anchors fail;
+  a result without `anchor` is not a usable shorthand citation. Shorthand is PDF-only.
+- On `layout_raw_missing`, ask for desktop layout analysis; do not invent paragraph anchors.
 - On `layout_index_missing`, ask the user to open the paper in Agentero and run Figures analysis — do not invent bboxes.
 - Keep Obsidian wikilinks `[[...]]` when you edit Markdown.
 - Never invent catalog metadata; trust CLI / files.

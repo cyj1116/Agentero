@@ -54,6 +54,8 @@ export type LayoutProviderConfig = {
 	language: string;
 	/** MinerU force-OCR: OCR every page regardless of the PDF text layer. */
 	isOcr: boolean;
+	/** Treat `baseUrl` as a self-hosted MinerU server instead of the cloud API. */
+	selfHosted: boolean;
 };
 
 /**
@@ -63,7 +65,6 @@ export type LayoutProviderConfig = {
  * MinerU vocabulary (16 packs incl. `ch_server`) valid when stored.
  */
 export const MINERU_LANGUAGES = ["ch", "en"] as const;
-export type MineruLanguage = (typeof MINERU_LANGUAGES)[number];
 
 /** Document language used when a provider config has none stored. */
 export const DEFAULT_MINERU_LANGUAGE = "ch";
@@ -150,15 +151,4 @@ export function isLayoutProviderId(value: unknown): value is LayoutProviderId {
 		typeof value === "string" &&
 		(LAYOUT_PROVIDER_IDS as readonly string[]).includes(value)
 	);
-}
-
-/** Same mask convention as translate BYOK keys (all `*`, same length). */
-export function maskLayoutApiKey(key: string): string {
-	const n = key.trim().length;
-	return n === 0 ? "" : "*".repeat(n);
-}
-
-export function isLayoutApiKeyMask(key: string): boolean {
-	const t = key.trim();
-	return t.length > 0 && t.split("").every((c) => c === "*");
 }

@@ -3,6 +3,7 @@ import type {
 	PaperTreeSortMode,
 } from "@/lib/paper/tree-modes";
 import type { LayoutSettings } from "@/lib/pdf/layout/settings";
+import type { ShortcutOverrides } from "@/lib/settings/shortcut-bindings";
 import type {
 	CommercialTranslateProviderId,
 	TranslateProviderConfig,
@@ -31,8 +32,8 @@ export type ThemePreference = "system" | "light" | "dark";
 
 export type LocalePreference = "system" | "en" | "zh-CN";
 
-/** Sortable / customizable columns in the papers Library table. */
-export type LibraryColumnKey =
+/** Builtin sortable / customizable columns in the papers Library table. */
+export type BuiltinLibraryColumnKey =
 	| "title"
 	| "authors"
 	| "date"
@@ -41,6 +42,9 @@ export type LibraryColumnKey =
 	| "tags"
 	| "id"
 	| "citations";
+
+/** Sortable / customizable columns in the papers Library table, including custom properties. */
+export type LibraryColumnKey = BuiltinLibraryColumnKey | `prop:${string}`;
 
 /** Per-column display preference: order comes from array position. */
 export type LibraryColumnPref = {
@@ -88,6 +92,41 @@ export const AUTO_UPDATE_INTERNAL_LINKS: AutoUpdateInternalLinks[] = [
 	"always",
 ];
 
+/** PDF navigation mode; paginated keeps the vertical coordinate system. */
+export type PdfScrollStrategy = "vertical" | "horizontal" | "paginated";
+
+export const PDF_SCROLL_STRATEGIES: readonly PdfScrollStrategy[] = [
+	"vertical",
+	"horizontal",
+	"paginated",
+] as const;
+
+export function isPdfScrollStrategy(v: unknown): v is PdfScrollStrategy {
+	return (
+		typeof v === "string" &&
+		(PDF_SCROLL_STRATEGIES as readonly string[]).includes(v)
+	);
+}
+
+/**
+ * PDF page layout (EmbedPDF spread mode): one page per row (`none`), or
+ * two-page spreads paired from page 1 (`odd`) / after a standalone cover
+ * (`even`).
+ */
+export type PdfSpreadMode = "none" | "odd" | "even";
+
+export const PDF_SPREAD_MODES: readonly PdfSpreadMode[] = [
+	"none",
+	"odd",
+	"even",
+] as const;
+
+export function isPdfSpreadMode(v: unknown): v is PdfSpreadMode {
+	return (
+		typeof v === "string" && (PDF_SPREAD_MODES as readonly string[]).includes(v)
+	);
+}
+
 /**
  * How NOTES.md is initialized when a paper is imported.
  * - `standard`: built-in structured skeleton
@@ -111,24 +150,22 @@ export function isPaperNoteMode(v: unknown): v is PaperNoteMode {
 }
 
 export type AppSettings = {
+	/** Null disables a command; absent ids use their default shortcut. */
+	shortcutOverrides: ShortcutOverrides;
 	// General
-	/**
-	 * Translator Runtime base URL for magic-wand / identifier import.
-	 * Default: hosted poco-ai service.
-	 */
-	translatorBaseUrl: string;
 	/** EasyScholar key for journal ranking and impact-factor lookups. */
 	easyScholarKey: string;
+	/** 知乎开放平台 Access Secret（内置「知乎」Agent 的直答 / 检索凭证）。 */
+	zhihuAccessSecret: string;
+	/** EZProxy/WebVPN prefix for paywalled PDF fallback ("" disables). */
+	institutionProxyPrefix: string;
+	/** Session cookie for institution proxy requests. */
+	institutionProxyCookie: string;
+	/** Gateway type: "auto" | "ezproxy" | "wengine" | "subdomain". */
+	institutionProxyType: string;
 	/** Process-wide HTTP(S)/SOCKS proxy for Host requests and Agent traffic. */
 	networkProxyEnabled: boolean;
 	networkProxyUrl: string;
-	/**
-	 * URL-prefix GitHub mirror for Skill import. When enabled and GitHub is
-	 * unreachable, Host retries via `{base}/https://api|codeload.github.com/...`.
-	 */
-	githubMirrorEnabled: boolean;
-	/** e.g. `https://gh.llkk.cc` (no trailing slash). Empty = no fallback. */
-	githubMirrorBaseUrl: string;
 	/**
 	 * How paper folders are labeled in the file tree (display-only).
 	 * Default: title · author.
@@ -141,6 +178,32 @@ export type AppSettings = {
 	paperTreeSortMode: PaperTreeSortMode;
 	/** Default `ask`: external local renames are previewed before Markdown writes. */
 	autoUpdateInternalLinks: AutoUpdateInternalLinks;
+	/**
+	 * Preferred terminal for "Open in Terminal". Empty = system default.
+	 * Unknown or uninstalled ids fall back at launch time.
+	 */
+	terminalApp: string;
+	/**
+	 * PDF reader navigation: vertical/horizontal continuous scrolling or
+	 * one page at a time (`paginated`).
+	 */
+	pdfScrollStrategy: PdfScrollStrategy;
+	/** Enable Vim-style single-key navigation on the PDF reading surface. */
+	pdfVimKeys: boolean;
+	/**
+	 * Master switch for Vim-style single-key navigation: `j/k/h/l` in the
+	 * file tree, dropdown lists and the PDF reader. Off keeps plain typing.
+	 */
+	vimMode: boolean;
+	/** Enable the ephemeral F-key global element hint overlay. */
+	hintModeEnabled: boolean;
+	/** Subtle in-app sound cues for agent attention / turn done / failure. */
+	soundEnabled: boolean;
+	/**
+	 * PDF reader page layout: `none` (default) = one page per row, `odd`/`even`
+	 * = two-page spreads (paired from page 1 / after a standalone cover).
+	 */
+	pdfSpreadMode: PdfSpreadMode;
 	/**
 	 * How NOTES.md is initialized on paper import. `custom` copies the vault
 	 * template `.agentero/templates/NOTES.md`. Default: built-in skeleton.
@@ -180,6 +243,8 @@ export type AppSettings = {
 	 */
 	mcpEnabled: boolean;
 	mcpPort: number;
+	/** Opt-in: expose paper full text via MCP paper_text_get. */
+	mcpExposePaperText: boolean;
 	/**
 	 * OpenAI Secure MCP Tunnel id (`tunnel_` + 32 hex). Empty = not configured.
 	 */
@@ -199,11 +264,6 @@ export type AppSettings = {
 	 * increase rate-limit risk.
 	 */
 	batchImportConcurrency: number;
-	/**
-	 * Prefill the Markdown export dialog's "Agentero watermark" checkbox.
-	 * Default **off**; per-export choice can still override.
-	 */
-	exportWatermarkEnabled: boolean;
 	/**
 	 * Anonymous product analytics (app version + device info) via PostHog.
 	 * Default **on**; takes effect from the next launch.
@@ -269,6 +329,18 @@ export type AppSettings = {
 	uiScale: number;
 	/** Show the WYSIWYG formatting toolbar above Markdown/notes editors. */
 	showEditorToolbar: boolean;
+	/**
+	 * Font size of the cited excerpt inside `![[wikilink]]` embeds (px, before
+	 * UI scale): annotation location, quote, and translation, plus a Markdown
+	 * embed's body. The card title stays on the callout scale. Annotation notes
+	 * follow `editorFontSize`. Range 12–20; default 13.
+	 */
+	wikiEmbedFontSize: number;
+	/**
+	 * Max width of the Markdown editor column in CSS px. `0` means the column
+	 * fills the pane. Not multiplied by {@link uiScale}.
+	 */
+	markdownMaxWidth: number;
 	// Agent (local UI prefs; registry lives in Host agents.json)
 	/** Global permission handling applied to every agent run. */
 	agentPermissionMode: AgentPermissionMode;
@@ -292,6 +364,12 @@ export type AppSettings = {
 	 */
 	pdfAsk: PdfAskSettings;
 	/**
+	 * Agent seat + model for the background paper-reader (精读) workflow.
+	 * Independent of Chat's current agent and of `pdfAsk`.
+	 * Empty = follow app default agent / that agent's model pref.
+	 */
+	paperReader: PaperReaderSettings;
+	/**
 	 * OpenAI-compatible embedding endpoint (BYOK) for arxiv daily recommendation
 	 * and other semantic features. All fields empty = feature disabled.
 	 */
@@ -300,10 +378,81 @@ export type AppSettings = {
 	translate: TranslateSettings;
 	/** PDF layout-analysis backend (local ONNX or remote PP-StructureV3). */
 	layout: LayoutSettings;
+	/**
+	 * Config reminders dismissed with "don't remind me again". Ids come from
+	 * {@link CONFIG_REMINDER_IDS}; unknown values are dropped on normalize.
+	 */
+	dismissedReminders: ConfigReminderId[];
+	/**
+	 * Decision-layer provider (System One: TypeSafe jEV / Cloudflare Clef /
+	 * compatible). `provider` selects a preset; base URL + model are editable so
+	 * the OpenAI Decisions API is available via the `openai` preset.
+	 */
+	decision: DecisionSettings;
 };
+
+/**
+ * Decision-layer provider ids. `custom` accepts any System One endpoint.
+ * `openai` targets the public OpenAI Decisions API (`/v1/decisions`).
+ */
+export type DecisionProviderId = "jev" | "clef" | "openai" | "custom";
+
+export const DECISION_PROVIDER_IDS: readonly DecisionProviderId[] = [
+	"jev",
+	"clef",
+	"openai",
+	"custom",
+] as const;
+
+export function isDecisionProviderId(v: unknown): v is DecisionProviderId {
+	return (
+		typeof v === "string" &&
+		(DECISION_PROVIDER_IDS as readonly string[]).includes(v)
+	);
+}
+
+/** Decision-layer provider settings (System One + OpenAI Decisions). */
+export type DecisionSettings = {
+	/** Selected vendor preset. */
+	provider: DecisionProviderId;
+	/** API key; masked (`*`) when echoed back from the Host. */
+	apiKey: string;
+	/** Endpoint. System One: `…/v1/systemone`. OpenAI: `…/v1/decisions`. */
+	baseUrl: string;
+	/** Model id injected into every request, e.g. `jev-latest` or `gpt-6-luna`. */
+	model: string;
+	/** Enable the experimental smart-highlight action in the PDF toolbar. */
+	smartHighlight: boolean;
+};
+
+/**
+ * Config reminders the app may surface once per session; "don't remind again"
+ * persists the id in {@link AppSettings.dismissedReminders}.
+ * - `layout-local-model`: local ONNX layout analysis costs memory / CPU.
+ * - `network-proxy`: a network request failed while no proxy is configured.
+ */
+export const CONFIG_REMINDER_IDS = [
+	"layout-local-model",
+	"network-proxy",
+] as const;
+export type ConfigReminderId = (typeof CONFIG_REMINDER_IDS)[number];
+
+export function isConfigReminderId(value: unknown): value is ConfigReminderId {
+	return (
+		typeof value === "string" &&
+		(CONFIG_REMINDER_IDS as readonly string[]).includes(value)
+	);
+}
 
 /** PDF selection Ask (question popover) agent/model prefs. */
 export type PdfAskSettings = {
+	/** Empty = follow registry default agent. */
+	agentId: string;
+	/** Empty = follow loadModelPref(agentId). */
+	modelId: string;
+};
+
+export type PaperReaderSettings = {
 	/** Empty = follow registry default agent. */
 	agentId: string;
 	/** Empty = follow loadModelPref(agentId). */

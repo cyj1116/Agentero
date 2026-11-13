@@ -7,7 +7,7 @@ Agentero 基于 Tauri 2 + React 19，本地优先，Vault 文件与 Catalog SQLi
 ```text
 ┌─────────────────────────────────────────────────┐
 │  React 19 Webview (src/)                        │
-│  zustand vanilla stores → AI Elements UI        │
+│  zustand stores → 业务组合 → shadcn AI UI       │
 ├─────────────────────────────────────────────────┤
 │  Tauri IPC (invoke / events)                    │
 ├─────────────────────────────────────────────────┤
@@ -20,7 +20,7 @@ Agentero 基于 Tauri 2 + React 19，本地优先，Vault 文件与 Catalog SQLi
 
 - **前端**：[`docs/frontend/index.md`](frontend/index.md) — React 19、TypeScript、Tailwind CSS 4、shadcn/ui、AI Elements。按域 zustand vanilla store（`src/lib/<域>/store.ts` + `actions.ts`）；React 经 `hooks/use-app-stores.ts` selector 订阅。
 - **Host**：[`docs/backend/index.md`](backend/index.md) — Rust、Tauri commands、文件系统、Wiki 索引、ACP Client。`app/` 装配、`core/` 基础、`features/<域>/`（`mod` + `commands` + 按需 `models`）。
-- **CLI**：[`docs/backend/cli.md`](backend/cli.md) — `agentero` headless Vault/Catalog，只依赖 tauri 无关的 `agentero-core` crate。
+- **CLI**：[`docs/backend/cli.md`](backend/cli.md) — `agentero` headless Vault/Catalog。依赖 tauri 无关的 `agentero-core`，MCP 监听再依赖 `agentero-mcp`。
 
 ## 工作台布局
 
@@ -45,11 +45,11 @@ Agentero 基于 Tauri 2 + React 19，本地优先，Vault 文件与 Catalog SQLi
 - **补下载**：paper 行缺 PDF 或既无 TeX 也无 `PAPER.md` 时显示 Download（hover 说明原因）；`papers/` 论文库节点右键可批量补下。
 - **Rescan**：`paper_rescan` 从 `papers/` 目录（以 `NOTES.md` 为标记）补齐盘上有、catalog 无的条目。
 - **Zotero Connector**：Host 在 `127.0.0.1:23119` 收浏览器扩展 `saveItems` + `saveAttachment`。详见 [backend/connector.md](backend/connector.md)。
-- **MCP Server**：设置开关打开后 Host 在 `127.0.0.1:8765/mcp` 提供 Streamable HTTP MCP（论文 metadata / 入库 / NOTES，以及 Vault 内其它 UTF-8 文本，如 Papers 外的 LaTeX）。详见 [backend/mcp.md](backend/mcp.md)。
+- **MCP Server**：设置开关打开后 Host 在 `127.0.0.1:8765/mcp` 提供 Streamable HTTP MCP（论文 metadata / 入库 / NOTES，以及 Vault 内其它 UTF-8 文本，如 Papers 外的 LaTeX）。详见 [backend/mcp.md](backend/mcp.md)。应用内 Quick Chat / 侧边栏另有会话级只读 `agentero-context`，见 [backend/context.md](backend/context.md)。
 
 ### 论文库
 
-`paper_list` 读 catalog 一次进内存。表头排序/右键选列/拖拽排序（持久化到 `settings.json` 的 `libraryColumns`，标题列不可隐藏）。tags 列展示，搜索框可匹配标签子串；标题列左侧显示阅读进度热力条。文件夹作用域仅对 `papers/` 下目录按 `paper.path` 前缀过滤（不扫盘）；`notes/` / `.agents/` 等非 papers 目录显示全库。可从访达把 PDF 拖到 Library 表入库（仅 PDF overlay）。详见 [frontend/library.md](frontend/library.md) / [backend/catalog.md](backend/catalog.md)。
+`paper_list` 读 catalog 一次进内存。表头排序/右键选列/拖拽排序（持久化到 `settings.json` 的 `libraryColumns`，标题列不可隐藏）。tags 列展示，搜索框可匹配标签子串；标题列左侧显示阅读进度热力条。文件夹作用域仅对 `papers/` 下目录按 `paper.path` 前缀过滤（不扫盘）；`notes/` / `.agents/` 等非 papers 目录只切换树选中，不切换当前视图。可从访达把 PDF 拖到 Library 表入库（仅 PDF overlay）。详见 [frontend/library.md](frontend/library.md) / [backend/catalog.md](backend/catalog.md)。
 
 ### 标签
 
@@ -65,7 +65,7 @@ BYOA，连接本机 ACP Agent。详见 [frontend/agent.md](frontend/agent.md) / 
 
 - **空态**：建议 chips → `summary` / `qa` / `related_work`。
 - **上下文**：当前论文默认加入（实心 chip，可 X 移除）。`@` 提及与文件树拖入为可移除 context chip。
-- **选区上下文**：划词不自动进对话；`⌘L` / `⇧⌘A` / 划词工具栏「加入对话」固定为 chip 并打开 Agent；`⌘K` /「快速对话」打开页内 Ask。发送时以引用块消费；PDF 带几何的选区在发送后插入 `kind: ask` 对话卡片页边针（非视觉批注）。
+- **选区上下文**：划词不自动进对话；`⇧⌘L` / 划词工具栏「加入对话」与笔记块菜单「加入会话」把引用固定进 Agent 输入框（行内引用块插在光标后，最大宽度省略）并打开 Agent；`⌘K` /「快速对话」打开页内 Ask。发送时以引用块消费；PDF 带几何的选区在发送后插入 `kind: ask` 对话卡片页边针（非视觉批注）。
 - **运行中继续输入**：后续消息进 Queue waitlist，当前回复结束后自动发送。
 - **权限**：全局模式 `restricted`（默认）/ `ask` / `auto`。`ask` 时弹权限对话框。
 - **结构化提问**：各 harness 的 ask-user / elicitation / Grok ext 归一为底部问卷（与 free-text composer 互斥）。详见 [frontend/agent.md](frontend/agent.md) / [backend/agent.md](backend/agent.md)。
@@ -89,6 +89,7 @@ Plate + `@platejs/markdown`。普通文本粘贴默认按 Markdown 解析。`\$a
 |---|---|---|
 | 文件 | NOTES、PDF、TeX、Markdown、assets、attachments | Vault 内 |
 | Catalog | 论文集合 + metadata | `.agentero/catalog.sqlite` |
+| 科研表格 | 首版科研对象／结果字段与记录（JSON 真源，尚未建 SQLite 索引） | Vault 内 `*.table.json`，见 [科研表格](frontend/research-tables.md) |
 | 阅读标注 | 高亮、划词问答、翻译、视觉批注 | `{paper}/marks/` |
 | 版面分析 | 原始 layout regions / 侧栏索引 | `{paper}/source/layout.json` / `layout-index.json` |
 | 引用解析 | 参考文献元数据 | `{paper}/source/agentero-cite.json` |
@@ -105,9 +106,9 @@ Plate + `@platejs/markdown`。普通文本粘贴默认按 Markdown 解析。`\$a
 
 - **启动**：`src/main.tsx` `boot()` 串行完成设置加载、主题/字体、i18n、store 种子，再按窗口种类 `createRoot`；Rust 侧 `app/mod.rs` 的顺序同样有约束（单实例插件必须最先装，settings 要在 builder 之前读出）。
 - **语义事件**：Rust 在关键节点 emit（`paper:imported`、`paper:assets-ready`、job 终态、`window:closed`），经 `src/lib/lifecycle/tauri-bridge.ts` 转发进前端 typed bus；handler 集中注册在 `lifecycle/register.ts`。
-- **作用域释放**：`vault:opened` 是 scoped 事件，handler 返回 teardown，"打开时做什么"和"切走时撤销什么"写在同一闭包里 —— 各 store 的 vault 级 clear 与 app 层 `vault_release`（取消该 vault 的后台 jobs、清 paper caps cache、驱逐 Host catalog 连接）都挂在这里。退出时 run closure 关闭 connector、telemetry、sync 与 Bridge relay。
+- **作用域释放**：`vault:opened` 是 scoped 事件，handler 返回 teardown，"打开时做什么"和"切走时撤销什么"写在同一闭包里 —— setup 里 `vault_hold` 注册窗口级持有、各 store 的 vault 级 clear 与 app 层 `vault_release`（取消该 vault 的后台 jobs、清 paper caps cache、驱逐 Host catalog 连接）都在 teardown。释放是 vault 全局语义：仅当最后一个持有该 vault 的窗口离开时才执行（窗口销毁由 Host 兜底清理持有）。退出时 run closure 关闭 connector、telemetry、sync 与 Bridge relay。
 
-细节与取舍（为何不需要 `vault:closed`、为何 `app:will-quit` 延后）见 [development/lifecycle-events.md](development/lifecycle-events.md)。
+不另设 `vault:closed`：切走时要撤销的事写在同一个 `vault:opened` teardown 里。`app:will-quit` 仍延后——`RunEvent::Exit` 时 webview 已销毁，前端事件救不了退出前的 debounce 写盘；Rust 侧 teardown 放在 run closure。退出前 flush 需要 `CloseRequested` → `prevent_close` → 等前端确认 → `destroy`，那是独立特性。事件名用 `domain:event`（单个冒号、kebab-case）。
 
 ### 国际化
 
@@ -115,15 +116,15 @@ Plate + `@platejs/markdown`。普通文本粘贴默认按 Markdown 解析。`\$a
 
 ### 外部改动自动重载
 
-Host `notify` → `vault:file-changed`。打开的 `.md`/`NOTES.md` 磁盘变化：无未存改动则重载；有未存改动则 toast 提示；内容相等抑制自写回声。create/remove/rename 去抖刷新文件树。窗口隐藏/失焦时先缓冲变更，回到前台再 flush；后台去抖窗口更长。
+Host `notify` → `vault:file-changed`。打开的 `.md`/`NOTES.md` 磁盘变化：无未存改动则重载；有未存改动则 toast，不自动重载（论文 PDF 标签不算笔记编辑器，不能替它重载）。本次刚写入的正文，以及与种子相同的内容，都不当成外部修改。create/remove/rename 去抖刷新文件树。窗口隐藏/失焦时先缓冲变更，回到前台再 flush；后台去抖窗口更长。
 
 ### 保存冲突
 
-写盘前比对上次落盘内容；磁盘已被外部改则中止写入并警告（`diskConflict.saveBlocked`）。
+写盘前比对上次落盘内容；磁盘已被外部改则中止写入并警告（`diskConflict.saveBlocked`）。本窗口刚写过的同一正文不算外部修改：PDF 锚点解析会占住双链索引，编辑器快照可能还停在写入之前。
 
 ### 多窗口
 
-`⌘N` → Host `window_new`。Vault 按窗口 session 隔离，最近列表在 localStorage。设置窗口独立原生单例。
+`⌘N` → Host `window_new`。Vault 按窗口 session 隔离，最近列表在 localStorage。设置窗口独立原生单例。同一 vault 可被多个窗口同时打开：Host 侧 `vault_hold` / `vault_release` 按窗口持有计数（`VaultHolders`），仅最后一个窗口离开（切库 / 关窗）时才执行 vault 全局释放；窗口销毁由 `on_window_event(Destroyed)` 兜底清理该窗口的持有。
 
 ### 配色主题
 
@@ -135,7 +136,7 @@ Host `tauri-plugin-log` + 前端 `logger` + CLI `env_logger`。详见 [backend/l
 
 ### 命令面板
 
-`⌘P` 快速打开（论文 + `vault_search` 全文）；`⇧⌘P`/`>` 执行内置命令。`⌘K` 划词快速对话（Ask）；`⌘L` 有选区时加入 Agent 对话。
+`⌘P` 快速打开（论文 + `vault_search` 全文）；`⇧⌘P`/`>` 执行内置命令。`⌘K` 划词快速对话（Ask）；`⇧⌘L` 加入 Agent 对话，`⌘L` 切换右侧栏；设置支持自定义组合。
 
 ### 翻译服务
 

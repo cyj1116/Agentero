@@ -4,12 +4,14 @@ import i18n from "@/i18n";
 import {
 	commands,
 	events,
+	type PiProjectTrustStatus,
 	type UpsertAgentRequest_Deserialize,
 } from "@/lib/core/bindings";
 import { callApi, callApiResult } from "@/lib/core/ipc";
 import { readJsonStorage, writeJsonStorage } from "@/lib/core/storage";
 import { loadSettings } from "@/lib/settings";
 import type { CatalogAcpStatus, CatalogEntry, ProbeResult } from "./api-types";
+import type { ContextRequest } from "./context-request";
 
 export type {
 	AcpSessionCapabilities,
@@ -20,10 +22,10 @@ export type {
 
 export type AgentTemplate =
 	| "opencode"
-	| "openclaw"
 	| "hermes"
 	| "claude-acp"
 	| "codex-acp"
+	| "cursor-agent"
 	| "antigravity-acp"
 	| "qodercli"
 	| "grok-build"
@@ -32,7 +34,33 @@ export type AgentTemplate =
 	| "kimi-code"
 	| "zcode"
 	| "minimax-code"
+	| "mimo-code"
+	| "codebuddy"
+	| "qoder-cn"
+	| "zhihu"
 	| "custom";
+
+/**
+ * Built-in agents that are chat-only: no Vault access, no ACP process. The
+ * composer must not inject Vault read-instructions for them (the prompt would
+ * otherwise leak local paths to a third-party service).
+ */
+const CHAT_ONLY_TEMPLATES = new Set<AgentTemplate>(["zhihu"]);
+
+export function isChatOnlyAgentTemplate(
+	template: AgentTemplate | string | null | undefined,
+): boolean {
+	return !!template && CHAT_ONLY_TEMPLATES.has(template as AgentTemplate);
+}
+
+/** Template for a registry agent id, for availability / chat-only checks. */
+export function agentTemplateById(
+	registry: { agents: AgentDescriptor[] } | null | undefined,
+	agentId: string | null | undefined,
+): AgentTemplate | undefined {
+	if (!registry || !agentId) return undefined;
+	return registry.agents.find((a) => a.id === agentId)?.template;
+}
 
 export type AgentDescriptor = {
 	id: string;
@@ -79,6 +107,12 @@ export type AcpListSessionsResult = {
 	sessions: AcpSessionInfo[];
 	nextCursor?: string | null;
 	supported: boolean;
+};
+
+export type AcpDeleteSessionResult = {
+	sessionId: string;
+	deletedOnAgent: boolean;
+	agentError?: string | null;
 };
 
 export type PromptImage = {
@@ -313,7 +347,7 @@ export type ElicitationField = {
 	title: string;
 	description?: string | null;
 	required: boolean;
-	/** select | text | boolean | number | other */
+	/** select | multiselect | text | boolean | number | other */
 	kind: string;
 	options: ElicitationOption[];
 	/** Codex free-text companion for the same logical question ("Other"). */
@@ -366,6 +400,8 @@ export type PermissionRequest = {
 	kind?: string | null;
 	paths: string[];
 	options: PermissionOption[];
+	/** Remote host when the request came from a delegated run. */
+	host?: string | null;
 };
 
 /** Shared non-Tauri guard message for every agent Host call. */
@@ -483,6 +519,14 @@ export async function openAgentLoginTerminal(
 	);
 }
 
+/** Open the installed Agent's interactive host CLI in a confirm-to-run terminal. */
+export async function openAgentCliTerminal(templateId: string): Promise<void> {
+	await callApi(
+		() => commands.doctorOpenAgentCliTerminal(templateId),
+		AGENT_CALL_OPTS,
+	);
+}
+
 export type ToolLifecycleAction = "install" | "update" | "uninstall";
 
 /**
@@ -584,6 +628,16 @@ export async function runOnce(request: {
 	 * (paper-reader and other non-composer workflows).
 	 */
 	hideFromChatHistory?: boolean;
+	/**
+	 * Vault anchors for this turn. The host resolver adds the minimum evidence
+	 * and, on a local session, the session-scoped context tools.
+	 */
+	context?: ContextRequest;
+	/**
+	 * Earlier turns to insert only if the host refuses to resume the session.
+	 * Omit when `prompt` already starts with that transcript.
+	 */
+	resumeTranscript?: string;
 }): Promise<RunOnceAccepted> {
 	const settings = loadSettings();
 	const language = request.responseLanguage ?? settings.aiResponseLanguage;
@@ -622,6 +676,8 @@ export async function runOnce(request: {
 				responseLanguage,
 				personalPrompt,
 				hideFromChatHistory: request.hideFromChatHistory ?? false,
+				context: request.context,
+				resumeTranscript: request.resumeTranscript,
 			}),
 		AGENT_CALL_OPTS,
 	);
@@ -642,6 +698,29 @@ export async function listSessions(request: {
 			),
 		AGENT_CALL_OPTS,
 	)) as AcpListSessionsResult;
+}
+
+/**
+ * Remove one session from history.
+ *
+ * The host always hides the id from later lists. `deletedOnAgent` is true
+ * only when the agent accepted `session/delete`. `agentError` means that
+ * call failed and the agent's own copy may remain.
+ */
+export async function deleteSession(request: {
+	agentId?: string;
+	sessionId: string;
+	vaultPath?: string;
+}): Promise<AcpDeleteSessionResult> {
+	return (await callApiResult(
+		() =>
+			commands.agentDeleteSession(
+				request.agentId ?? null,
+				request.sessionId,
+				request.vaultPath ?? null,
+			),
+		AGENT_CALL_OPTS,
+	)) as AcpDeleteSessionResult;
 }
 
 /** Load an ACP session's history via `session/load`. */
@@ -681,7 +760,7 @@ export async function respondPermission(
 export async function respondElicitation(request: {
 	requestId: string;
 	action: "accept" | "decline" | "cancel";
-	content?: Record<string, string>;
+	content?: Record<string, string | string[]>;
 }): Promise<void> {
 	await callApi(
 		() =>
@@ -719,6 +798,38 @@ export type WarmResult = {
 	usageSize?: number | null;
 	error?: string | null;
 };
+
+/**
+ * Pi's effective project-trust state for a local Vault.
+ *
+ * Pi runs headless under `pi-acp`, so `defaultProjectTrust: "ask"` resolves to
+ * untrusted and project skills are skipped. The Host mirrors Pi's lookup order
+ * instead of guessing.
+ */
+export async function piProjectTrustStatus(
+	agentId: string,
+	vaultPath: string,
+): Promise<PiProjectTrustStatus> {
+	return callApi(
+		() => commands.agentPiProjectTrustStatus(agentId, vaultPath),
+		AGENT_CALL_OPTS,
+	);
+}
+
+/**
+ * Explicitly trust this Vault for Pi. The Host merges the Vault entry into
+ * `~/.pi/agent/trust.json` and discards the agent's warm connection so the next
+ * session loads project resources.
+ */
+export async function grantPiProjectTrust(
+	agentId: string,
+	vaultPath: string,
+): Promise<PiProjectTrustStatus> {
+	return callApi(
+		() => commands.agentPiProjectTrustGrant(agentId, vaultPath),
+		AGENT_CALL_OPTS,
+	);
+}
 
 /** Start ACP in the background (no prompt) to prefetch models / usage for Chat UI. */
 export async function warmAgent(request: {

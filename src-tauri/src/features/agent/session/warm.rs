@@ -3,9 +3,9 @@
 //! Setup (spawn → initialize → session/new → preferences → settle) runs inside
 //! the connect future; the resulting connection + fresh session are published
 //! to the [`AgentWarmPool`] and kept alive by a keepalive loop until
-//! evicted, closed (EOF) or idle past [`POOL_IDLE_TTL`]. A slot that never
-//! served a turn has its empty session `session/delete`d at teardown so warm
-//! starts do not pile up empty threads in agent history.
+//! evicted, closed (EOF) or idle past [`POOL_IDLE_TTL`]. A warm session is
+//! hidden from history until a user prompt is delivered on that id. Teardown
+//! and abandoned setup call `session/delete` when the agent supports it.
 
 use crate::features::agent::acp::client::{
     acp_terminals, agent_spawn_cwd, client_initialize_request, timed_acp_initialize,
@@ -13,7 +13,7 @@ use crate::features::agent::acp::client::{
 };
 use crate::features::agent::acp::updates::{
     emit_session_config_options, models_from_config_options, models_from_session_models_value,
-    richer_models_event,
+    richer_models_event, store_richer_models,
 };
 use crate::features::agent::models::{AgentDescriptor, WarmResult};
 use crate::features::agent::runtime::events::AgentEventEmitter;
@@ -24,18 +24,44 @@ use crate::features::agent::session::handlers::{
 use crate::features::agent::session::pool::{
     pool_key, AgentWarmPool, PoolKey, PooledSlot, POOL_IDLE_TTL,
 };
-use agent_client_protocol::schema::v1::{DeleteSessionRequest, NewSessionRequest};
+use agent_client_protocol::schema::v1::{DeleteSessionRequest, McpServer, NewSessionRequest};
 use agent_client_protocol::{Agent, ConnectionTo, UntypedMessage};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tauri::Manager;
 use tokio::sync::watch;
 use uuid::Uuid;
 
 /// Upper bound for the setup half of warm-up (initialize + session/new can be
-/// slow on cold disks / first login); the keepalive keeps running regardless.
+/// slow on cold disks / first login). Timeout cancels the connection task.
 const WARM_SETUP_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const WARM_CANCELLED_ERROR: &str = "warm setup cancelled";
+
+type SetupOutcome = Result<
+    Result<Result<(), String>, tokio::sync::oneshot::error::RecvError>,
+    tokio::time::error::Elapsed,
+>;
+
+/// Cancellation covers both the setup deadline and a dropped command future.
+/// Failed setup does not return until its background connection has ended.
+async fn await_setup<T>(
+    receiver: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    cancellation: tokio_util::sync::CancellationToken,
+    background: impl std::future::Future<Output = T>,
+) -> (SetupOutcome, bool) {
+    let guard = cancellation.clone().drop_guard();
+    let setup = tokio::time::timeout(WARM_SETUP_TIMEOUT, receiver).await;
+    let cancelled = cancellation.is_cancelled();
+    if matches!(&setup, Ok(Ok(Ok(())))) {
+        guard.disarm();
+    } else {
+        drop(guard);
+        background.await;
+    }
+    (setup, cancelled)
+}
 
 /// Background warm-up: spawn ACP → initialize → new_session → publish the
 /// live connection to the pool → emit models/usage (no prompt). Used when Chat
@@ -65,7 +91,15 @@ pub async fn warm_agent(
             };
         }
     };
-    let key: PoolKey = pool_key(&agent_id, cwd.clone(), remote.as_ref());
+    // Pi reads its project-trust decision only at process start. Including it
+    // in the key retires a warm connection created under another decision.
+    let variant = if remote.is_none() {
+        crate::features::agent::pi_trust::pool_variant(&desc, &cwd)
+    } else {
+        None
+    };
+    let key: PoolKey = pool_key(&agent_id, cwd.clone(), remote.as_ref(), variant);
+    pool.retire_idle(&key);
 
     // Healthy pooled slot from an earlier warm: reuse its cached models /
     // usage instead of spawning a second agent process.
@@ -108,10 +142,22 @@ pub async fn warm_agent(
         session_id: session_id.clone(),
         agent_id: agent_id.clone(),
         usage: usage_out.clone(),
+        models: models_out.clone(),
     };
     let registry = new_registry();
     let terminals = acp_terminals(Some(cwd.clone()));
+    let mcp_servers = if remote.is_none() {
+        app.app_handle()
+            .try_state::<Arc<crate::features::agent::delegate::DelegateBridge>>()
+            .and_then(|bridge| bridge.mcp_server(&session_id, app.window_label()))
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
     let (setup_tx, setup_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let task = pool.start_warm(&key);
+    let cancellation = task.cancellation.clone();
 
     // Everything the connect closure needs; the spawned task below holds the
     // connect future (and with it the agent process) for the pool's lifetime.
@@ -128,20 +174,50 @@ pub async fn warm_agent(
         usage_out: usage_out.clone(),
         terminals: terminals.clone(),
         registry: registry.clone(),
+        task_id: task.id,
+        cancellation: cancellation.clone(),
+        created: Mutex::new(None),
+        mcp_servers,
     };
 
-    tauri::async_runtime::spawn(async move {
-        let result = agentero_turn_builder!(terminals, registry, Some(idle))
-            .connect_with(acp, move |connection: ConnectionTo<Agent>| {
+    let task_cancellation = cancellation.clone();
+    let handle = tauri::async_runtime::spawn(async move {
+        let _task = task;
+        if task_cancellation.is_cancelled() {
+            return;
+        }
+        let connection = agentero_turn_builder!(terminals, registry, Some(idle)).connect_with(
+            acp,
+            move |connection: ConnectionTo<Agent>| {
                 closure_ctx.setup_and_keepalive(connection, setup_tx)
-            })
-            .await;
+            },
+        );
+        tokio::pin!(connection);
+        let result = tokio::select! {
+            result = &mut connection => result,
+            _ = task_cancellation.cancelled() => {
+                // Allow bounded session/delete, then drop the connect future
+                // and its process-tree guard even if the adapter hangs.
+                tokio::time::timeout(Duration::from_secs(1), &mut connection)
+                    .await.unwrap_or(Ok(()))
+            }
+        };
         if let Err(e) = result {
             log::debug!(target: "agentero::agent", "warm connection ended: {e}");
         }
     });
 
-    let setup = tokio::time::timeout(WARM_SETUP_TIMEOUT, setup_rx).await;
+    let (setup, cancelled) = await_setup(setup_rx, cancellation, handle).await;
+    if cancelled {
+        return WarmResult {
+            agent_id,
+            ok: false,
+            models: None,
+            usage_used: None,
+            usage_size: None,
+            error: Some(WARM_CANCELLED_ERROR.to_string()),
+        };
+    }
     match setup {
         // Setup published a slot (or the sender dropped after a failed send).
         Ok(Ok(setup)) => match setup {
@@ -174,27 +250,25 @@ pub async fn warm_agent(
             usage_size: None,
             error: Some("warm connection closed before setup finished".to_string()),
         },
-        Err(_elapsed) => {
-            // The background task keeps running; a late publish still benefits
-            // the next run (take does not consult the warm gate).
-            WarmResult {
-                agent_id,
-                ok: false,
-                models: None,
-                usage_used: None,
-                usage_size: None,
-                error: Some(format!(
-                    "warm setup timed out after {}s",
-                    WARM_SETUP_TIMEOUT.as_secs()
-                )),
-            }
-        }
+        Err(_elapsed) => WarmResult {
+            agent_id,
+            ok: false,
+            models: None,
+            usage_used: None,
+            usage_size: None,
+            error: Some(format!(
+                "warm setup timed out after {}s",
+                WARM_SETUP_TIMEOUT.as_secs()
+            )),
+        },
     }
 }
 
 /// Setup + keepalive halves of the pooled warm connection, extracted so the
 /// closure passed to `connect_with` stays a thin move wrapper.
 struct WarmSetupCtx {
+    task_id: Uuid,
+    cancellation: tokio_util::sync::CancellationToken,
     app: AgentEventEmitter,
     key: PoolKey,
     cwd: PathBuf,
@@ -207,6 +281,48 @@ struct WarmSetupCtx {
     usage_out: Arc<Mutex<Option<(u64, u64)>>>,
     terminals: Arc<tokio::sync::Mutex<crate::features::agent::acp::terminal::AcpTerminalManager>>,
     registry: crate::features::agent::session::handlers::TurnRegistry,
+    /// Set once `session/new` returns, so a failed setup can still discard it.
+    created: Mutex<Option<(agent_client_protocol::schema::v1::SessionId, bool)>>,
+    mcp_servers: Vec<McpServer>,
+}
+
+/// Remove a warm session the user never prompted.
+///
+/// Agents that advertise `sessionCapabilities.delete` get `session/delete`.
+/// The id stays in the unprompted set when delete is unsupported, fails, or
+/// times out, so `session/list` keeps hiding it.
+pub(crate) async fn discard_unprompted_session(
+    connection: &ConnectionTo<Agent>,
+    session_id: &agent_client_protocol::schema::v1::SessionId,
+    supports_delete: bool,
+    pool: &AgentWarmPool,
+) {
+    let id = session_id.to_string();
+    if !supports_delete {
+        log::debug!(
+            target: "agentero::agent",
+            "warm left unprompted session {id} (no sessionCapabilities.delete)"
+        );
+        return;
+    }
+    let delete = timed_acp_request(
+        "delete_session",
+        connection
+            .send_request(DeleteSessionRequest::new(session_id.clone()))
+            .block_task(),
+    );
+    match tokio::time::timeout(Duration::from_millis(800), delete).await {
+        Ok(Ok(_)) => {
+            pool.forget_unprompted(&id);
+            log::debug!(target: "agentero::agent", "warm deleted unprompted session {id}");
+        }
+        Ok(Err(e)) => {
+            log::debug!(target: "agentero::agent", "warm session/delete failed for {id}: {e}");
+        }
+        Err(_) => {
+            log::debug!(target: "agentero::agent", "warm session/delete timed out for {id}");
+        }
+    }
 }
 
 /// Teardown state returned by setup and consumed by the keepalive loop.
@@ -232,6 +348,14 @@ impl WarmSetupCtx {
                 Ok(())
             }
             Err(error) => {
+                if let Some((id, supports_delete)) = self
+                    .created
+                    .lock()
+                    .ok()
+                    .and_then(|mut created| created.take())
+                {
+                    discard_unprompted_session(&connection, &id, supports_delete, &self.pool).await;
+                }
                 let _ = setup_tx.send(Err(error.to_string()));
                 Err(error)
             }
@@ -252,17 +376,21 @@ impl WarmSetupCtx {
         let session_caps = &init.agent_capabilities.session_capabilities;
         let can_resume = session_caps.resume.is_some();
         let can_load = init.agent_capabilities.load_session;
+        let supports_delete = session_caps.delete.is_some();
 
         // Send session/new untyped so the raw response survives: the schema drops
         // hermes-agent's pre-stabilization top-level `models` field on deserialize,
         // and the typed NewSessionResponse would lose it before we can look.
+        let mut new_session = NewSessionRequest::new(self.cwd.clone());
+        if !self.mcp_servers.is_empty() {
+            new_session = new_session.mcp_servers(self.mcp_servers.clone());
+        }
         let raw_new_session = timed_acp_new_session(
             connection
                 .send_request(
-                    UntypedMessage::new("session/new", NewSessionRequest::new(self.cwd.clone()))
-                        .map_err(|e| {
-                            agent_client_protocol::Error::internal_error().data(e.to_string())
-                        })?,
+                    UntypedMessage::new("session/new", new_session).map_err(|e| {
+                        agent_client_protocol::Error::internal_error().data(e.to_string())
+                    })?,
                 )
                 .block_task(),
         )
@@ -274,6 +402,10 @@ impl WarmSetupCtx {
             )?;
 
         let acp_session_id = new_session.session_id;
+        self.pool.track_unprompted(&acp_session_id.to_string());
+        if let Ok(mut created) = self.created.lock() {
+            *created = Some((acp_session_id.clone(), supports_delete));
+        }
         let config_options = apply_model_and_collaboration_prefs(
             connection,
             &self.session_id,
@@ -291,17 +423,24 @@ impl WarmSetupCtx {
         );
         if let Some(ev) = models_event {
             if let Ok(mut g) = self.models_out.lock() {
-                *g = Some(ev);
+                store_richer_models(&mut g, ev);
             }
         }
 
         // Brief settle so agents can push usage/config updates after session create.
         tokio::time::sleep(Duration::from_millis(400)).await;
+        if self.cancellation.is_cancelled() {
+            return Err(agent_client_protocol::util::internal_error(
+                WARM_CANCELLED_ERROR,
+            ));
+        }
 
         let (end_tx, end_rx) = watch::channel(false);
         let (activity_tx, activity_rx) = watch::channel(0u64);
         let used = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.pool.publish(PooledSlot {
+            task_id: self.task_id,
+            cancellation: self.cancellation.clone(),
             key: self.key.clone(),
             connection: connection.clone(),
             acp_session_id: acp_session_id.clone(),
@@ -313,6 +452,7 @@ impl WarmSetupCtx {
             end: end_tx,
             activity: activity_tx,
             used: used.clone(),
+            supports_delete,
             models: self.models_out.lock().ok().and_then(|g| g.clone()),
             usage: self.usage_out.lock().ok().and_then(|g| *g),
         });
@@ -327,15 +467,14 @@ impl WarmSetupCtx {
             end_rx,
             activity_rx,
             used,
-            supports_delete: session_caps.delete.is_some(),
+            supports_delete,
             acp_session_id,
             agent_id: self.agent_id.clone(),
         })
     }
 
     /// Hold the connection open until evicted, closed (EOF) or idle past the
-    /// TTL, then delete the empty session when the slot never served a turn
-    /// (agents without `sessionCapabilities.delete` keep today's debug log).
+    /// TTL, then discard the session when it never received a user prompt.
     async fn keepalive(&self, connection: &ConnectionTo<Agent>, mut slot: KeepaliveCtx) {
         let mut idle_deadline = tokio::time::Instant::now() + POOL_IDLE_TTL;
         let reason = loop {
@@ -364,36 +503,68 @@ impl WarmSetupCtx {
         );
 
         if !slot.used.load(Ordering::SeqCst) {
-            if slot.supports_delete {
-                match timed_acp_request(
-                    "delete_session",
-                    connection
-                        .send_request(DeleteSessionRequest::new(slot.acp_session_id.clone()))
-                        .block_task(),
-                )
-                .await
-                {
-                    Ok(_) => log::debug!(
-                        target: "agentero::agent",
-                        "agent={} warm deleted unused session {}",
-                        slot.agent_id,
-                        slot.acp_session_id
-                    ),
-                    Err(e) => log::debug!(
-                        target: "agentero::agent",
-                        "agent={} warm session/delete failed for {}: {e}",
-                        slot.agent_id,
-                        slot.acp_session_id
-                    ),
-                }
-            } else {
-                log::debug!(
-                    target: "agentero::agent",
-                    "agent={} warm left unused session {} (no sessionCapabilities.delete)",
-                    slot.agent_id,
-                    slot.acp_session_id
-                );
-            }
+            discard_unprompted_session(
+                connection,
+                &slot.acp_session_id,
+                slot.supports_delete,
+                &self.pool,
+            )
+            .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::await_setup;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test(start_paused = true)]
+    async fn setup_timeout_cancels_and_joins_background_connection() {
+        let token = CancellationToken::new();
+        let ended = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let cancelled = token.clone();
+        let end = ended.clone();
+        let background = tokio::spawn(async move {
+            let _sender = sender;
+            cancelled.cancelled().await;
+            end.store(true, Ordering::SeqCst);
+        });
+        let (result, superseded) = await_setup(receiver, token.clone(), background).await;
+        assert!(result.is_err());
+        assert!(!superseded);
+        assert!(token.is_cancelled());
+        assert!(ended.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn dropping_setup_waiter_cancels_background_connection() {
+        let token = CancellationToken::new();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
+        let cancelled = token.clone();
+        let background = tokio::spawn(async move {
+            let _sender = sender;
+            let _ = started_tx.send(());
+            cancelled.cancelled().await;
+            let _ = ended_tx.send(());
+        });
+        let waiter = tokio::spawn(await_setup(receiver, token.clone(), background));
+        started_rx.await.unwrap();
+        // Poll the waiter before aborting, so its DropGuard is installed.
+        tokio::task::yield_now().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(1), ended_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(token.is_cancelled());
     }
 }

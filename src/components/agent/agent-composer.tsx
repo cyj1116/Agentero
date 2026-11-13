@@ -1,16 +1,26 @@
 import { ImageIcon } from "lucide-react";
-import type {
-	KeyboardEvent,
-	DragEvent as ReactDragEvent,
-	RefObject,
+import {
+	type KeyboardEvent,
+	type DragEvent as ReactDragEvent,
+	type RefObject,
+	useCallback,
+	useEffect,
+	useRef,
+	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { ComposerAnnotations } from "@/components/agent/composer/composer-annotations";
+import {
+	ComposerAnnotations,
+	type SelectionHoverAnchor,
+} from "@/components/agent/composer/composer-annotations";
 import {
 	ComposerImageAttachments,
 	ComposerSubmitControl,
 } from "@/components/agent/composer/composer-attachments";
-import { ComposerContextChips } from "@/components/agent/composer/composer-context-chips";
+import {
+	ComposerContextChips,
+	VisualReferenceCard,
+} from "@/components/agent/composer/composer-context-chips";
 import { ComposerDropTarget } from "@/components/agent/composer/composer-drop-target";
 import type { ComposerInlineInputHandle } from "@/components/agent/composer/composer-inline-input";
 import { ComposerInlineInput } from "@/components/agent/composer/composer-inline-input";
@@ -21,27 +31,29 @@ import {
 	ComposerSlashMenu,
 } from "@/components/agent/composer/composer-quick-menus";
 import { ComposerToolbar } from "@/components/agent/composer/composer-toolbar";
-import { useComposerFileDrag } from "@/components/agent/hooks/use-composer-file-drag";
-import type { QueuedPrompt } from "@/components/agent/types";
+import { FeedReferenceCard } from "@/components/agent/composer/feed-reference-card";
 import {
 	PromptInput,
 	PromptInputBody,
 	PromptInputFooter,
 	PromptInputTools,
-} from "@/components/ai-elements/prompt-input";
+} from "@/components/agent/composer/prompt-input";
+import { useComposerFileDrag } from "@/components/agent/hooks/use-composer-file-drag";
+import type { QueuedPrompt } from "@/components/agent/types";
 import { Popover, PopoverAnchor } from "@/components/ui/popover";
 import type { AgentSkill, PromptImage } from "@/lib/agent";
+import { annotationOrdinal } from "@/lib/agent/annotation-prompt";
 import {
-	mergeSelectionDraftInput,
-	withoutSelectionTokens,
+	extractMentionPaths,
+	extractVisualIds,
 } from "@/lib/agent/composer-inline-tokens";
+import { openMentionTarget } from "@/lib/agent/mention-open";
 import {
 	COMPOSER_IMAGE_ACCEPT,
 	COMPOSER_IMAGE_MAX_BYTES,
 	COMPOSER_IMAGE_MAX_FILES,
 	fileUiPartsToPromptImages,
 } from "@/lib/agent/prompt-image";
-import type { SelectionContext } from "@/lib/agent/selection-store";
 import type { AcpCommand } from "@/lib/agent/slash-commands";
 import type { PdfVisualDraft } from "@/lib/agent/visual-context-store";
 import { notifyError } from "@/lib/core/notify";
@@ -66,8 +78,6 @@ export type AgentComposerProps = {
 	currentFilePath: string | null;
 	currentFileLabel: string;
 	mentionChipPaths: string[];
-	selectionChips: SelectionContext[];
-	onRemoveSelection: (id: string) => void;
 	visualDrafts: PdfVisualDraft[];
 	onRemoveVisualDraft: (id: string) => void;
 	directoryPathSet: ReadonlySet<string>;
@@ -100,6 +110,12 @@ export type AgentComposerProps = {
 	composerInputRef: RefObject<ComposerInlineInputHandle | null>;
 };
 
+type ReferenceHover = {
+	kind: "selection" | "visual" | "plaza";
+	id: string;
+	anchor: HTMLElement;
+};
+
 export function AgentComposer(props: AgentComposerProps) {
 	const {
 		autoFocus,
@@ -126,11 +142,108 @@ export function AgentComposer(props: AgentComposerProps) {
 	} = props;
 	const { t } = useTranslation("agent");
 	const hasComposerText = Boolean(composerText.trim());
-	const hasVisualDrafts = visualDrafts.length > 0;
+	const hasVisualDrafts = extractVisualIds(composerText).some((id) =>
+		visualDrafts.some((draft) => draft.id === id),
+	);
 	// Attachments live inside PromptInput; base gate ignores them (see ComposerSubmitControl).
 	const canSubmitBase = hasComposerText || hasVisualDrafts;
 	const composerMenuOpen = showMentionMenu || showSkillMenu || showSlashMenu;
 	const hasQueuedMessages = props.messageQueue.length > 0;
+	const [referenceHover, setReferenceHover] = useState<ReferenceHover | null>(
+		null,
+	);
+	const hoverOpenTimer = useRef<number | null>(null);
+	const hoverCloseTimer = useRef<number | null>(null);
+	const referenceHoverRef = useRef(referenceHover);
+	referenceHoverRef.current = referenceHover;
+	const pendingHoverRef = useRef<ReferenceHover | null>(null);
+	const clearHoverTimers = useCallback(() => {
+		if (hoverOpenTimer.current != null) {
+			window.clearTimeout(hoverOpenTimer.current);
+			hoverOpenTimer.current = null;
+		}
+		if (hoverCloseTimer.current != null) {
+			window.clearTimeout(hoverCloseTimer.current);
+			hoverCloseTimer.current = null;
+		}
+	}, []);
+	const onReferencePointer = useCallback(
+		(
+			kind: ReferenceHover["kind"],
+			phase: "enter" | "leave",
+			id: string,
+			anchor: HTMLElement,
+		) => {
+			if (phase === "enter") {
+				if (hoverCloseTimer.current != null) {
+					window.clearTimeout(hoverCloseTimer.current);
+					hoverCloseTimer.current = null;
+				}
+				const next = { kind, id, anchor };
+				pendingHoverRef.current = next;
+				const current = referenceHoverRef.current;
+				if (current?.kind === kind && current.id === id) {
+					if (current.anchor !== anchor) setReferenceHover(next);
+					return;
+				}
+				// A move between chips keeps the timer already running and opens
+				// whichever reference the pointer settled on.
+				if (hoverOpenTimer.current != null) return;
+				hoverOpenTimer.current = window.setTimeout(() => {
+					hoverOpenTimer.current = null;
+					const pending = pendingHoverRef.current;
+					if (pending) setReferenceHover(pending);
+				}, 150);
+				return;
+			}
+			const pending = pendingHoverRef.current;
+			if (pending?.kind === kind && pending.id === id) {
+				pendingHoverRef.current = null;
+			}
+			if (hoverOpenTimer.current != null && pendingHoverRef.current == null) {
+				window.clearTimeout(hoverOpenTimer.current);
+				hoverOpenTimer.current = null;
+			}
+			if (hoverCloseTimer.current != null) {
+				window.clearTimeout(hoverCloseTimer.current);
+			}
+			hoverCloseTimer.current = window.setTimeout(() => {
+				hoverCloseTimer.current = null;
+				pendingHoverRef.current = null;
+				setReferenceHover(null);
+			}, 180);
+		},
+		[],
+	);
+	const holdReferenceHover = useCallback(() => {
+		if (hoverCloseTimer.current != null) {
+			window.clearTimeout(hoverCloseTimer.current);
+			hoverCloseTimer.current = null;
+		}
+	}, []);
+	const releaseReferenceHover = useCallback(() => {
+		clearHoverTimers();
+		pendingHoverRef.current = null;
+		setReferenceHover(null);
+	}, [clearHoverTimers]);
+	useEffect(() => clearHoverTimers, [clearHoverTimers]);
+	const selectionHover: SelectionHoverAnchor | null =
+		referenceHover?.kind === "selection" ? referenceHover : null;
+	const visualHover = referenceHover?.kind === "visual" ? referenceHover : null;
+	const plazaHover = referenceHover?.kind === "plaza" ? referenceHover : null;
+	const hoveredVisual = visualHover
+		? (visualDrafts.find((draft) => draft.id === visualHover.id) ?? null)
+		: null;
+	useEffect(() => {
+		if (visualHover && !hoveredVisual) releaseReferenceHover();
+	}, [hoveredVisual, releaseReferenceHover, visualHover]);
+	// Backspace / drafting can drop the chip without a pointer leave.
+	const plazaPathAlive = plazaHover
+		? extractMentionPaths(composerText).includes(plazaHover.id)
+		: true;
+	useEffect(() => {
+		if (!plazaPathAlive) releaseReferenceHover();
+	}, [plazaPathAlive, releaseReferenceHover]);
 	const {
 		shellRef,
 		isFileDragOver,
@@ -170,8 +283,7 @@ export function AgentComposer(props: AgentComposerProps) {
 				)}
 				style={!compact && heightPx != null ? { height: heightPx } : undefined}
 			>
-				{/* Block chips: current file / visual only. Selections use the annotation summary. */}
-				{props.currentFilePath || visualDrafts.length > 0 ? (
+				{props.currentFilePath ? (
 					<div
 						className={cn(
 							"flex shrink-0 items-center gap-1.5",
@@ -179,20 +291,38 @@ export function AgentComposer(props: AgentComposerProps) {
 						)}
 					>
 						<ComposerContextChips
-							compact={compact}
 							currentFilePath={props.currentFilePath}
 							currentFileLabel={props.currentFileLabel}
 							mentionChipPaths={[]}
-							selectionChips={[]}
-							onRemoveSelection={props.onRemoveSelection}
-							visualDrafts={visualDrafts}
-							onRemoveVisualDraft={props.onRemoveVisualDraft}
 							directoryPathSet={props.directoryPathSet}
 							paperPathSet={props.paperPathSet}
 							labelForPath={props.labelForPath}
 							onRemoveContextPath={props.onRemoveContextPath}
 						/>
 					</div>
+				) : null}
+				{visualHover && hoveredVisual ? (
+					<VisualReferenceCard
+						draft={hoveredVisual}
+						index={
+							annotationOrdinal(composerText, "visual", hoveredVisual.id) ??
+							visualDrafts.findIndex((draft) => draft.id === hoveredVisual.id) +
+								1
+						}
+						anchor={visualHover.anchor}
+						onHoverHold={holdReferenceHover}
+						onHoverRelease={releaseReferenceHover}
+						onRemove={props.onRemoveVisualDraft}
+					/>
+				) : null}
+				{plazaHover ? (
+					<FeedReferenceCard
+						path={plazaHover.id}
+						anchor={plazaHover.anchor}
+						onHoverHold={holdReferenceHover}
+						onHoverRelease={releaseReferenceHover}
+						onRemove={props.onRemoveContextPath}
+					/>
 				) : null}
 				<div
 					className={cn(
@@ -237,6 +367,9 @@ export function AgentComposer(props: AgentComposerProps) {
 						<ComposerAnnotations
 							value={composerText}
 							onChange={onComposerTextChange}
+							hover={selectionHover}
+							onHoverHold={holdReferenceHover}
+							onHoverRelease={releaseReferenceHover}
 						/>
 						<PromptInputBody>
 							<Popover
@@ -303,15 +436,22 @@ export function AgentComposer(props: AgentComposerProps) {
 											ref={props.composerInputRef}
 											autoFocus={Boolean(autoFocus)}
 											compact={compact}
-											value={withoutSelectionTokens(composerText)}
-											onValueChange={(text) =>
-												onComposerTextChange(
-													mergeSelectionDraftInput(composerText, text),
-												)
-											}
+											value={composerText}
+											onValueChange={onComposerTextChange}
 											onKeyDown={onComposerKeyDown}
 											disabled={switching}
 											labelForPath={props.labelForPath}
+											visualDrafts={visualDrafts}
+											onSelectionPointer={(phase, id, anchor) =>
+												onReferencePointer("selection", phase, id, anchor)
+											}
+											onVisualPointer={(phase, id, anchor) =>
+												onReferencePointer("visual", phase, id, anchor)
+											}
+											onOpenMention={openMentionTarget}
+											onPlazaFeedPointer={(phase, path, anchor) =>
+												onReferencePointer("plaza", phase, path, anchor)
+											}
 											skillLabel={(skillId) =>
 												props.selectedSkills.find((s) => s.id === skillId)
 													?.name ??
@@ -385,7 +525,7 @@ export function AgentComposer(props: AgentComposerProps) {
 							)}
 							aria-hidden
 						>
-							<div className="flex items-center gap-2 rounded-full border border-primary/25 bg-background/90 px-3 py-1.5 text-primary text-xs font-medium shadow-sm">
+							<div className="flex items-center gap-2 rounded-full border border-primary/25 bg-background/90 px-3 py-1.5 text-primary text-xs font-medium shadow-raised">
 								<ImageIcon className="size-3.5 shrink-0" />
 								<span>{t("composer.dropImageHint")}</span>
 							</div>

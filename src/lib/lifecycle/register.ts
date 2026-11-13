@@ -1,3 +1,4 @@
+import { loadCustomProperties } from "@/lib/paper/custom-properties-store";
 /**
  * Central lifecycle handler registration. The bus runs handlers serially in
  * registration order, so cross-handler ordering lives in this file.
@@ -6,16 +7,30 @@
 import i18n from "@/i18n";
 import { clearAgentVaultState } from "@/lib/agent/agent-session-store";
 import { commands } from "@/lib/core/bindings";
+import { errorText } from "@/lib/core/error";
 import { callApi, callApiResult } from "@/lib/core/ipc";
+import { logger } from "@/lib/core/logger";
 import { notifySuccess } from "@/lib/core/notify";
+import { perfActive, perfFollow } from "@/lib/core/perf";
 import { isTauri } from "@/lib/core/tauri";
 import { lifecycle } from "@/lib/lifecycle";
+import { jobTerminalCue } from "@/lib/lifecycle/job-cues";
+import {
+	noteCommittedLibraryList,
+	noteCommittedPaths,
+	noteCommittedRename,
+	registerExternalLibraryReconciler,
+} from "@/lib/lifecycle/refresh-wave";
+import { registerSuggestionLifecycle } from "@/lib/navigator/suggestion-lifecycle";
+import {
+	dismissPaperBackfill,
+	maybeShowPaperBackfill,
+} from "@/lib/paper/backfill";
 import {
 	clearLibraryVaultState,
 	refreshLibrary,
-	runLibraryRefresh,
-	scheduleLibraryRefresh,
 } from "@/lib/paper/library-store";
+import { reconcileExternalLibraryChange } from "@/lib/paper/library-sync";
 import { clearAnnotationsVaultState } from "@/lib/pdf/annotations-store";
 import { clearLayoutVaultState } from "@/lib/pdf/layout/store";
 import { recommendArxiv } from "@/lib/recommend";
@@ -25,6 +40,7 @@ import {
 	setFeaturePoppedOut,
 	setSettingsOpenState,
 } from "@/lib/shell/ui-store";
+import { playCue } from "@/lib/ui/sound";
 import { seedVaultSkills } from "@/lib/vault/actions";
 import { joinVaultPath } from "@/lib/vault/path";
 import { isRemoteVaultHandle } from "@/lib/vault/remote/remote-vault";
@@ -33,29 +49,47 @@ import {
 	refreshTree,
 	scheduleTreeRefresh,
 } from "@/lib/vault/store";
-import { remapMovedWorkspacePaths } from "@/lib/wiki/actions";
 import {
-	bumpWikiIndexRevision,
 	clearWikiVaultState,
-	rebuildWikiAndNotify,
 	trackInternalRenamePaths,
 } from "@/lib/wiki/store";
-import { syncRenamedPaperTabs } from "@/lib/workspace/actions";
+import {
+	remapMovedWorkspacePaths,
+	syncRenamedPaperTabs,
+} from "@/lib/workspace/actions";
 
-/** Batch imports emit one `paper:imported` per paper; merge the rebuilds. */
-let importWikiTimer: ReturnType<typeof setTimeout> | null = null;
-
-function scheduleImportWikiRebuild(vault: string): void {
-	if (importWikiTimer) clearTimeout(importWikiTimer);
-	importWikiTimer = setTimeout(() => {
-		importWikiTimer = null;
-		if (isRemoteVaultHandle(vault) || getVaultPath() !== vault) return;
-		void rebuildWikiAndNotify(vault);
-	}, 300);
+/**
+ * Every webview receives the same broadcast job events. Audio belongs to the
+ * main window only, otherwise two Web Audio contexts play the cue twice.
+ * Resolved once at startup; jobs finish long after this settles.
+ */
+let jobAudioOwner = !isTauri();
+if (isTauri()) {
+	void import("@tauri-apps/api/window")
+		.then(({ getCurrentWindow }) => {
+			jobAudioOwner = getCurrentWindow().label === "main";
+		})
+		.catch(() => undefined);
+}
+function ownsJobAudioCues(): boolean {
+	return jobAudioOwner;
 }
 
 export function registerLifecycleHandlers(): () => void {
+	registerExternalLibraryReconciler(reconcileExternalLibraryChange);
+	const unregisterSuggestions = registerSuggestionLifecycle();
 	const offs = [
+		// Full-document layout translation runs for minutes with the user
+		// elsewhere, so its terminal state gets an audio cue. Other job kinds
+		// stay visual: they are frequent and usually already on screen.
+		lifecycle.on("job:completed", ({ kind }) => {
+			const cue = jobTerminalCue("completed", kind);
+			if (cue && ownsJobAudioCues()) playCue(cue);
+		}),
+		lifecycle.on("job:failed", ({ kind }) => {
+			const cue = jobTerminalCue("failed", kind);
+			if (cue && ownsJobAudioCues()) playCue(cue);
+		}),
 		lifecycle.on("window:closed", ({ kind, view }) => {
 			if (kind === "settings") {
 				setSettingsOpenState(false);
@@ -65,19 +99,26 @@ export function registerLifecycleHandlers(): () => void {
 				setFeaturePoppedOut(view, false);
 			}
 		}),
-		lifecycle.on("vault:opened", ({ vaultId }) => {
-			void refreshTree(vaultId);
-			void refreshLibrary();
-			seedVaultSkills(vaultId);
-			if (isTauri()) {
-				// T2 reconcile: backfill PAPER.md for catalog papers missing it. Fire
-				// & forget; jobs are idempotent and throttled (ParseBody cap = 1).
-				void callApiResult(
-					() => commands.jobReconcileVault({ vaultPath: vaultId }),
-					{ fallback: "vault reconcile failed" },
-				).catch(() => undefined);
-			}
+		lifecycle.on("vault:opened", async ({ vaultId }) => {
+			const opened = Promise.all([
+				refreshTree(vaultId),
+				refreshLibrary(),
+				loadCustomProperties(vaultId),
+			]);
+			perfFollow(opened);
+			if (!perfActive()) seedVaultSkills(vaultId);
 			if (isTauri() && !isRemoteVaultHandle(vaultId)) {
+				// Establish the Host scope before later handlers activate plugins.
+				await callApi(() => commands.vaultHold(vaultId), {
+					fallback: "vault hold failed",
+				}).catch((e: unknown) => {
+					logger.warn("vault hold failed", { error: errorText(e) });
+				});
+			}
+			if (isTauri() && !perfActive() && !isRemoteVaultHandle(vaultId)) {
+				void maybeShowPaperBackfill(vaultId);
+			}
+			if (isTauri() && !perfActive() && !isRemoteVaultHandle(vaultId)) {
 				// Auto-ingest: adopt bare papers/ folders created while the app
 				// was closed; the FS watcher only covers the live session.
 				void callApiResult(
@@ -85,7 +126,7 @@ export function registerLifecycleHandlers(): () => void {
 					{ fallback: "paper ingest reconcile failed" },
 				).catch(() => undefined);
 			}
-			if (isTauri() && !isRemoteVaultHandle(vaultId)) {
+			if (isTauri() && !perfActive() && !isRemoteVaultHandle(vaultId)) {
 				// Warm today's arXiv ranking so the Plaza panel opens instantly. The
 				// Host returns its stored same-day run untouched and exits early when
 				// no embedding endpoint is configured, so this is usually free.
@@ -96,6 +137,7 @@ export function registerLifecycleHandlers(): () => void {
 			// painted frame of the new vault from showing the old one, which is a
 			// different concern from releasing resources.
 			return () => {
+				dismissPaperBackfill(vaultId);
 				clearLibraryVaultState();
 				clearWikiVaultState();
 				clearAgentVaultState();
@@ -109,18 +151,33 @@ export function registerLifecycleHandlers(): () => void {
 				}
 			};
 		}),
-		lifecycle.on("paper:imported", ({ vaultId, paperId }) => {
+		lifecycle.on("paper:imported", ({ vaultId, paperId, path }) => {
 			// `app.emit` broadcasts to every window; only react to the active vault.
 			if (vaultId !== getVaultPath()) return;
-			// `paperId` is the folder basename, so point the targeted refresh at
-			// `papers/` (re-listed eagerly by the Host, org subfolders included)
-			// instead of rebuilding the whole tree, which would re-mark lazily
-			// expanded folders as pending and cascade extra listings.
+			// The catalog row is already committed. Hold the list refresh and a
+			// path-scoped wiki update until this import wave, including
+			// recognition renames, goes idle. `path` is the real folder
+			// (`papers/nlp/<id>`), not `papers/` plus the basename.
+			const rel = path?.trim();
+			const folder = rel ? rel : paperId ? `papers/${paperId}` : "";
+			if (folder) {
+				const abs = joinVaultPath(vaultId, folder);
+				noteCommittedPaths([abs]);
+				void syncRenamedPaperTabs(vaultId, abs);
+			} else {
+				noteCommittedLibraryList();
+				scheduleTreeRefresh();
+			}
+		}),
+		lifecycle.on("paper:assets-ready", ({ vaultId, paperId, path }) => {
+			if (vaultId !== getVaultPath()) return;
+			const folder = path?.trim() || (paperId ? `papers/${paperId}` : "");
+			// Re-list the parent so the paper row's hasTex/needsSource flags
+			// are replaced too; refreshing only source/ leaves them stale.
 			scheduleTreeRefresh(
-				paperId ? [joinVaultPath(vaultId, `papers/${paperId}`)] : undefined,
+				folder ? [joinVaultPath(vaultId, folder)] : undefined,
 			);
-			scheduleImportWikiRebuild(vaultId);
-			scheduleLibraryRefresh();
+			noteCommittedLibraryList();
 		}),
 		lifecycle.on("paper:renamed", (event) => {
 			const { vaultId, oldPath, newPath, outcome } = event;
@@ -133,14 +190,9 @@ export function registerLifecycleHandlers(): () => void {
 			trackInternalRenamePaths([fromAbs, toAbs], Date.now() + 2000);
 			if (outcome === "renamed") {
 				remapMovedWorkspacePaths(fromAbs, toAbs, oldPath, newPath);
-				bumpWikiIndexRevision();
-				scheduleImportWikiRebuild(vaultId);
 				void syncRenamedPaperTabs(vaultId, toAbs);
-				void runLibraryRefresh();
-				void refreshTree(vaultId, { quiet: true });
 			}
-			scheduleTreeRefresh([fromAbs, toAbs]);
-			scheduleLibraryRefresh();
+			noteCommittedRename(fromAbs, toAbs);
 			if (outcome === "merged") {
 				notifySuccess(
 					i18n.t("sidebar:papersLibrary.recognizeMerged", {
@@ -151,10 +203,8 @@ export function registerLifecycleHandlers(): () => void {
 		}),
 	];
 	return () => {
-		if (importWikiTimer) {
-			clearTimeout(importWikiTimer);
-			importWikiTimer = null;
-		}
+		unregisterSuggestions();
 		for (const off of offs) off();
+		registerExternalLibraryReconciler(null);
 	};
 }

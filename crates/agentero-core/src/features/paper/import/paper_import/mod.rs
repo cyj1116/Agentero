@@ -8,6 +8,9 @@
 use crate::app_handle::AppHandle;
 use crate::error::AppError;
 use crate::features::catalog::{papers, probe_paper_caps, CapsCache};
+use crate::features::import::preparation::{
+    plan_after_assets, plan_after_merged_pdf, PreparationPlan,
+};
 use crate::features::import::{
     allocate_paper_path, ensure_paper_assets_with_progress, normalize_parent_dir,
     write_paper_shell_opts, AssetDownloadResult, AssetProgressContext, NoteShellMode,
@@ -31,7 +34,7 @@ pub enum CommitStatus {
 pub enum DedupePolicy {
     /// Catalog has a row with the same `id` → `Deduped` (single-item entries).
     ByCatalogId,
-    /// Catalog row shares `id` or any identifier (arXiv ID, DOI, PMID, ISBN)
+    /// Catalog row shares a canonical id or identifier (arXiv ID, DOI, PMID, ISBN)
     /// → `Deduped`. With `CopyPdf`, the local PDF is merged into the existing
     /// folder instead of being discarded (Fix #406).
     ByIdentifiers,
@@ -76,9 +79,9 @@ pub struct PaperCommitOptions<'a> {
     pub cache: Option<&'a CapsCache>,
     /// Lifecycle event sink (`paper:imported` / `paper:assets-ready`).
     pub app: Option<&'a AppHandle>,
-    /// Skip the commit-time ParseBody/ParseRefs spawns; the caller
-    /// orchestrates follow-ups (deferred-recognition imports run them after
-    /// the paper's final path is known, i.e. after rename/merge).
+    /// Omit ParseBody/ParseRefs from the returned [`PreparationPlan`].
+    /// Deferred-recognition imports add `RecognizeMetadata` and run parse
+    /// after the final path is known (rename/merge).
     pub defer_parse_jobs: bool,
 }
 
@@ -99,6 +102,10 @@ pub struct PaperCommitResult {
     pub asset_messages: Vec<String>,
     /// True when assets are still downloading in the background (`Deferred`).
     pub assets_pending: bool,
+    /// Follow-up steps for this commit. Not part of the IPC payload.
+    #[serde(skip)]
+    #[specta(skip)]
+    pub preparation: PreparationPlan,
 }
 
 /// Commit one paper draft to the vault. Fixed step order:
@@ -162,7 +169,7 @@ pub async fn paper_commit(
                     .unwrap_or_else(|| probe_paper_caps(&dir));
                 return Ok(PaperCommitResult {
                     status: CommitStatus::Skipped,
-                    path: candidate,
+                    path: candidate.clone(),
                     id: meta.id,
                     title: meta.title,
                     paper_dir: dir.to_string_lossy().to_string(),
@@ -171,13 +178,17 @@ pub async fn paper_commit(
                     paper_md: caps.has_paper_md,
                     asset_messages: Vec::new(),
                     assets_pending: false,
+                    preparation: PreparationPlan::empty(candidate),
                 });
             }
         }
         DedupePolicy::None => {}
     }
 
-    let (folder_id, path_rel, paper_dir) = allocate_paper_path(vault, &parent_rel, &meta.id);
+    let unique_local_id =
+        meta.paper_type == papers::PaperKind::Pdf && meta.doi.is_none() && meta.arxiv_id.is_none();
+    let (folder_id, path_rel, paper_dir) =
+        allocate_paper_path(vault, &parent_rel, &meta.id, unique_local_id);
     meta.id = folder_id;
     if opts.fresh_timestamps {
         let now = crate::time::now_rfc3339_millis();
@@ -221,15 +232,9 @@ pub async fn paper_commit(
         return Err(e);
     }
 
-    crate::features::lifecycle::emit_paper_imported(opts.app, vault, &meta.id);
+    crate::features::lifecycle::emit_paper_imported(opts.app, vault, &meta.id, &path_rel);
 
-    let parse_app = match &opts.assets {
-        AssetsPolicy::SyncDownload { progress, .. } | AssetsPolicy::CopyPdf { progress, .. } => {
-            progress.app
-        }
-        AssetsPolicy::Deferred => None,
-    };
-
+    let arxiv_request = crate::features::paper::source::arxiv_request(&meta);
     let (assets, assets_pending) = match opts.assets {
         AssetsPolicy::SyncDownload { cookies, progress } => {
             let assets = match ensure_paper_assets_with_progress(
@@ -237,7 +242,7 @@ pub async fn paper_commit(
                 vault,
                 &path_rel,
                 &meta.id,
-                meta.arxiv_id.as_deref(),
+                arxiv_request.as_deref(),
                 meta.pdf_url.as_deref(),
                 meta.doi.as_deref(),
                 cookies,
@@ -247,19 +252,28 @@ pub async fn paper_commit(
             .await
             {
                 Ok(assets) => {
-                    crate::features::lifecycle::emit_paper_assets_ready(opts.app, vault, &meta.id);
+                    crate::features::lifecycle::emit_paper_assets_ready(
+                        opts.app, vault, &meta.id, &path_rel,
+                    );
                     assets
                 }
                 Err(e) => {
-                    let mut r = AssetDownloadResult::default();
-                    r.messages.push(format!("asset download error: {e}"));
-                    r
+                    let caps = probe_paper_caps(&paper_dir);
+                    AssetDownloadResult {
+                        pdf: caps.has_pdf(),
+                        tex: caps.has_tex,
+                        paper_md: caps.has_paper_md,
+                        messages: vec![format!("asset download error: {e}")],
+                        ..Default::default()
+                    }
                 }
             };
             (assets, false)
         }
         AssetsPolicy::CopyPdf { .. } => {
-            crate::features::lifecycle::emit_paper_assets_ready(opts.app, vault, &meta.id);
+            crate::features::lifecycle::emit_paper_assets_ready(
+                opts.app, vault, &meta.id, &path_rel,
+            );
             let assets = AssetDownloadResult {
                 pdf: true,
                 ..Default::default()
@@ -269,21 +283,24 @@ pub async fn paper_commit(
         AssetsPolicy::Deferred => (AssetDownloadResult::default(), true),
     };
 
-    if !opts.defer_parse_jobs {
-        if assets.pdf && !assets.tex && !assets.paper_md {
-            if let Some(app) = parse_app {
-                app.spawn_parse_body_after_assets(vault, &path_rel, false);
-            }
-        }
-
-        // Background reference parse so the References panel has a sidecar soon
-        // after import (fingerprint-cached; safe if callers also spawn).
-        crate::features::refs::spawn_parse_after_import(parse_app, vault, &path_rel);
-    }
+    let preparation = plan_after_assets(
+        &path_rel,
+        assets.pdf,
+        assets.tex,
+        assets.paper_md,
+        opts.defer_parse_jobs,
+    );
 
     if let Some(c) = opts.cache {
         c.invalidate(vault, &path_rel);
     }
+
+    if assets.pdf {
+        super::code_repo::fill_code_repo_from_pdf(vault, &path_rel).await;
+    }
+    // Best-effort catalog fill by arXiv id; detached so the import never waits
+    // on the network. No arXiv id makes it a no-op.
+    crate::features::paper::discovery::pwc::spawn_enrich(vault, &path_rel);
 
     Ok(PaperCommitResult {
         status: CommitStatus::Created,
@@ -296,6 +313,7 @@ pub async fn paper_commit(
         paper_md: assets.paper_md,
         asset_messages: assets.messages,
         assets_pending,
+        preparation,
     })
 }
 
@@ -309,17 +327,27 @@ fn existing_result(
     let caps = cache
         .map(|c| c.caps_for(vault, &existing.path))
         .unwrap_or_else(|| probe_paper_caps(dir));
+    let path = existing.path.clone();
+    let mut preparation = PreparationPlan::empty(&path);
+    if existing.arxiv_id.is_some()
+        && crate::features::paper::source::needs_preparation(vault, &existing)
+    {
+        preparation
+            .steps
+            .push(super::preparation::PreparationStep::ParseBody { force: false });
+    }
     PaperCommitResult {
         status,
         pdf: caps.has_pdf(),
         tex: caps.has_tex,
         paper_md: caps.has_paper_md,
         paper_dir: dir.to_string_lossy().to_string(),
-        path: existing.path,
+        path,
         id: existing.id,
         title: existing.title,
         asset_messages: Vec::new(),
         assets_pending: false,
+        preparation,
     }
 }
 
@@ -443,15 +471,28 @@ fn backfill_existing_metadata(
     changed
 }
 
-/// First catalog row matching `id` or any shared identifier of `meta`
+/// First catalog row matching a canonical id or shared identifier of `meta`
 /// (arXiv ID, DOI, PMID, ISBN) — the cross-identifier lookup behind
 /// [`DedupePolicy::ByIdentifiers`].
 fn find_existing_by_identifiers(
     vault: &Path,
     meta: &papers::PaperRecord,
 ) -> Result<Option<papers::PaperRecord>, AppError> {
-    if let Some(existing) = papers::get_by_id(vault, &meta.id)? {
-        return Ok(Some(existing));
+    // Local PDF names are placeholders, never proof of scholarly identity.
+    // Keep id-based recovery for identifier imports with incomplete old rows.
+    let canonical_id = meta.paper_type != papers::PaperKind::Pdf
+        || meta
+            .arxiv_id
+            .as_deref()
+            .is_some_and(|id| super::slug_from_stem(id) == meta.id)
+        || meta
+            .doi
+            .as_deref()
+            .is_some_and(|doi| super::doi_slug(doi) == meta.id);
+    if canonical_id {
+        if let Some(existing) = papers::get_by_id(vault, &meta.id)? {
+            return Ok(Some(existing));
+        }
     }
     let lookups: [(&str, Option<&str>); 4] = [
         ("arxiv_id", meta.arxiv_id.as_deref()),
@@ -519,8 +560,11 @@ async fn merge_pdf_into_existing(
     if let Some(c) = cache {
         c.invalidate(vault, &existing.path);
     }
-    crate::features::lifecycle::emit_paper_imported(app, vault, &existing.id);
-    crate::features::lifecycle::emit_paper_assets_ready(app, vault, &existing.id);
+    if became_main {
+        super::code_repo::fill_code_repo_from_pdf(vault, &existing.path).await;
+    }
+    crate::features::lifecycle::emit_paper_imported(app, vault, &existing.id, &existing.path);
+    crate::features::lifecycle::emit_paper_assets_ready(app, vault, &existing.id, &existing.path);
 
     let caps = cache
         .map(|c| c.caps_for(vault, &existing.path))
@@ -536,11 +580,20 @@ async fn merge_pdf_into_existing(
     };
     log::info!(target: "agentero::import", "{}: {}", message, existing.path);
 
-    if became_main && caps.has_pdf() && !caps.has_tex && !caps.has_paper_md {
-        if let Some(app) = app {
-            app.spawn_parse_body_after_assets(vault, &existing.path, false);
-        }
-        crate::features::refs::spawn_parse_after_import(app, vault, &existing.path);
+    let mut preparation = plan_after_merged_pdf(
+        &existing.path,
+        became_main,
+        caps.has_pdf(),
+        caps.has_tex,
+        caps.has_paper_md,
+    );
+    if !preparation.has_parse_body()
+        && existing.arxiv_id.is_some()
+        && crate::features::paper::source::needs_preparation(vault, &existing)
+    {
+        preparation
+            .steps
+            .push(super::preparation::PreparationStep::ParseBody { force: false });
     }
 
     Ok(PaperCommitResult {
@@ -554,6 +607,7 @@ async fn merge_pdf_into_existing(
         title: existing.title,
         asset_messages: vec![message],
         assets_pending: false,
+        preparation,
     })
 }
 
@@ -655,6 +709,10 @@ mod tests {
         assert_eq!(res.status, CommitStatus::Deduped);
         assert_eq!(res.path, "papers/pmid-12345");
         assert!(vault.join("papers/pmid-12345/pmid-12345.pdf").is_file());
+        assert!(res.preparation.steps.iter().any(|step| matches!(
+            step,
+            crate::features::import::PreparationStep::ParseBody { force: false }
+        )));
         assert!(!vault.join("papers/fulltext-slug").exists());
         let row = papers::get_by_path(&vault, "papers/pmid-12345")
             .unwrap()
@@ -670,6 +728,7 @@ mod tests {
         assert!(vault
             .join("papers/pmid-12345/attachments/supplement.pdf")
             .is_file());
+        assert!(!res2.preparation.has_parse_body());
         // Same filename again → suffixed, never overwritten.
         let res3 = commit_pdf(&vault, &src2, "10.1000/journal.123").await;
         assert_eq!(res3.status, CommitStatus::Deduped);
@@ -678,6 +737,65 @@ mod tests {
             .is_file());
 
         let _ = fs::remove_dir_all(&vault);
+    }
+
+    #[tokio::test]
+    async fn by_identifiers_never_merges_local_filename_collisions() {
+        for id in ["paper", "中文论文"] {
+            let vault = tmp_vault("local-name-collision");
+            let existing_dir = vault.join("papers/舞蹈概论");
+            fs::create_dir_all(&existing_dir).unwrap();
+            fs::write(existing_dir.join("NOTES.md"), "# 舞蹈概论\n").unwrap();
+            fs::write(existing_dir.join("paper.pdf"), b"%PDF-1.4 dance").unwrap();
+            papers::upsert_paper(
+                &vault,
+                &papers::PaperRecord::local_pdf(id.into(), "舞蹈概论".into())
+                    .at_path("papers/舞蹈概论"),
+            )
+            .unwrap();
+            let src = vault.join("家长情绪支持与儿童英语学习兴趣转化研究.pdf");
+            fs::write(&src, b"%PDF-1.4 unrelated education paper").unwrap();
+            let result = paper_commit(
+                papers::PaperRecord::local_pdf(
+                    id.into(),
+                    "家长情绪支持与儿童英语学习兴趣转化研究".into(),
+                ),
+                PaperCommitOptions {
+                    vault: &vault,
+                    parent_dir: "papers/英语启蒙",
+                    dedupe: DedupePolicy::ByIdentifiers,
+                    assets: AssetsPolicy::CopyPdf {
+                        src: &src,
+                        progress: AssetProgressContext {
+                            app: None,
+                            task_id: None,
+                        },
+                    },
+                    translate_abstract: false,
+                    note_mode: NoteShellMode::TitleOnly,
+                    fresh_timestamps: false,
+                    cache: None,
+                    app: None,
+                    defer_parse_jobs: true,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.status, CommitStatus::Created);
+            assert_ne!(result.id, id);
+            assert!(result.path.starts_with("papers/英语启蒙/"));
+            assert_eq!(
+                fs::read(vault.join(&result.path).join(format!("{}.pdf", result.id))).unwrap(),
+                fs::read(&src).unwrap()
+            );
+            assert!(!existing_dir.join("attachments").exists());
+            assert_eq!(
+                fs::read(existing_dir.join("paper.pdf")).unwrap(),
+                b"%PDF-1.4 dance"
+            );
+            assert_eq!(papers::list_all_unique_by_id(&vault).unwrap().len(), 2);
+            let _ = fs::remove_dir_all(vault);
+        }
     }
 
     #[tokio::test]
@@ -715,6 +833,14 @@ mod tests {
         assert_eq!(res.status, CommitStatus::Created);
         assert_eq!(res.path, "papers/unrelated");
         assert!(vault.join("papers/unrelated/unrelated.pdf").is_file());
+        // No host hooks: the plan is still produced from the copied PDF.
+        assert_eq!(
+            res.preparation.steps,
+            vec![
+                crate::features::import::PreparationStep::ParseBody { force: false },
+                crate::features::import::PreparationStep::ParseRefs,
+            ]
+        );
 
         let _ = fs::remove_dir_all(&vault);
     }
@@ -723,8 +849,9 @@ mod tests {
     async fn by_identifiers_repairs_incomplete_existing_entry() {
         let vault = tmp_vault("repair-existing");
 
-        let existing = papers::PaperRecord::local_pdf("1706.03762".into(), "".into())
+        let mut existing = papers::PaperRecord::local_pdf("1706.03762".into(), "".into())
             .at_path("papers/1706.03762");
+        existing.openreview_url = Some("https://openreview.net/forum?id=keep".into());
         papers::upsert_paper(&vault, &existing).unwrap();
 
         let mut incoming =
@@ -770,6 +897,10 @@ mod tests {
             Some("The dominant sequence transduction models.")
         );
         assert_eq!(row.arxiv_id.as_deref(), Some("1706.03762"));
+        assert_eq!(
+            row.openreview_url.as_deref(),
+            Some("https://openreview.net/forum?id=keep")
+        );
 
         let _ = fs::remove_dir_all(&vault);
     }

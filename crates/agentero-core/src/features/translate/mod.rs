@@ -9,6 +9,8 @@ use std::time::Duration;
 
 mod sources;
 
+pub use sources::openai_compatible::strip_unknown_translate_placeholders;
+
 /// Soft cap for a single translation request (characters).
 pub const MAX_TEXT_CHARS: usize = 5000;
 
@@ -26,6 +28,7 @@ pub const FREE_PROVIDERS: &[&str] = &[
     "google",
     "googleapi",
     "deeplx",
+    "cnki",
     "huoshanweb",
     "tencenttransmart",
 ];
@@ -51,6 +54,16 @@ pub const FREE_MT_ZH_TIMEOUT_MS: u32 = 5_000;
 /// Spawns one request per [`ZH_RACE_PROVIDERS`] entry and returns the **first**
 /// non-empty translation. Dropping unfinished tasks cancels their HTTP work.
 pub async fn free_mt_to_zh(text: &str) -> Option<String> {
+    free_mt_to_zh_with(text, translate_text).await
+}
+
+async fn free_mt_to_zh_with<Fut>(
+    text: &str,
+    translate: impl Fn(TranslateTextArgs) -> Fut,
+) -> Option<String>
+where
+    Fut: std::future::Future<Output = Result<TranslateTextResult, AppError>>,
+{
     use futures_util::stream::{FuturesUnordered, StreamExt};
 
     let slice: String = text.chars().take(MAX_TEXT_CHARS).collect();
@@ -62,8 +75,9 @@ pub async fn free_mt_to_zh(text: &str) -> Option<String> {
     for provider in ZH_RACE_PROVIDERS {
         let text = slice.clone();
         let provider = (*provider).to_string();
+        let translate = &translate;
         tasks.push(async move {
-            let r = translate_text(TranslateTextArgs {
+            let r = translate(TranslateTextArgs {
                 text,
                 source_lang: "auto".into(),
                 target_lang: "zh-CN".into(),
@@ -72,7 +86,10 @@ pub async fn free_mt_to_zh(text: &str) -> Option<String> {
                 base_url: None,
                 region: None,
                 model: None,
+                extra_request_body: None,
                 custom_prompt: None,
+                custom_system: None,
+                custom_user: None,
                 timeout_ms: Some(FREE_MT_ZH_TIMEOUT_MS),
             })
             .await
@@ -131,11 +148,22 @@ pub struct TranslateTextArgs {
     /// OpenAI-compatible model id.
     #[serde(default)]
     pub model: Option<String>,
-    /// Custom translate instruction (settings `translate.customPrompt`); empty →
-    /// built-in academic prompt. Injected by the Host command; replaces the
-    /// system+rules block on the OpenAI-compatible path only.
+    /// OpenAI-compatible JSON object replacing automatic sampling/thinking
+    /// parameters. Blank uses model defaults; an empty object disables them.
+    #[serde(default)]
+    pub extra_request_body: Option<String>,
+    /// Legacy single template (settings `translate.customPrompt`). A short line
+    /// is a preference; a longer value replaces the academic style block only.
+    /// Ignored when `custom_system` is non-empty.
     #[serde(default)]
     pub custom_prompt: Option<String>,
+    /// Settings `translate.customSystem`. Wins over `custom_prompt`.
+    #[serde(default)]
+    pub custom_system: Option<String>,
+    /// Settings `translate.customUser`. Replaces the quoted source when it
+    /// contains `{{text}}`.
+    #[serde(default)]
+    pub custom_user: Option<String>,
     /// Optional request timeout in milliseconds (clamped 1s–30s). Default 30s.
     /// Settings probe uses a shorter value for snappy parallel checks.
     #[serde(default)]
@@ -203,6 +231,7 @@ pub async fn translate_text(args: TranslateTextArgs) -> Result<TranslateTextResu
             .await?
         }
         "deeplx" => sources::deeplx::translate_deeplx(text, &source, &target, timeout).await?,
+        "cnki" => sources::cnki::translate_cnki(text, &source, &target, timeout).await?,
         "huoshanweb" => {
             sources::huoshanweb::translate_huoshan_web(text, &source, &target, timeout).await?
         }
@@ -254,6 +283,9 @@ pub async fn translate_text(args: TranslateTextArgs) -> Result<TranslateTextResu
                 args.base_url.as_deref(),
                 args.model.as_deref(),
                 args.custom_prompt.as_deref(),
+                args.custom_system.as_deref(),
+                args.custom_user.as_deref(),
+                args.extra_request_body.as_deref(),
             )
             .await?
         }
@@ -378,6 +410,10 @@ mod tests {
     #[test]
     fn free_providers_listed() {
         assert!(FREE_PROVIDERS.contains(&"deeplx"));
+        assert!(FREE_PROVIDERS.contains(&"cnki"));
+        // CNKI stays out of the zh race: slow (chunked + pauses) and
+        // captcha-prone, racing it would only trip the rate limit.
+        assert!(!ZH_RACE_PROVIDERS.contains(&"cnki"));
         assert!(FREE_PROVIDERS.contains(&"huoshanweb"));
         assert!(FREE_PROVIDERS.contains(&"tencenttransmart"));
         assert!(FREE_PROVIDERS.contains(&"googleapi"));

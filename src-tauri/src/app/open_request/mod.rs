@@ -52,12 +52,106 @@ pub fn handle_open_path<R: Runtime>(app: &AppHandle<R>, path: &Path) -> Result<S
     Ok(path_str)
 }
 
+/// Validate a workspace UI action, allow fs scope, store pending, emit + focus.
+#[cfg(feature = "desktop")]
+pub fn handle_ui_request<R: Runtime>(
+    app: &AppHandle<R>,
+    req: UiRequestPayload,
+) -> Result<UiRequestPayload, AppError> {
+    let payload = validate_ui_request(req)?;
+
+    if payload.action == UI_ACTION_OPEN_WINDOW {
+        // `app::window` is compiled out on iOS; named window targets only
+        // exist on desktop/Android builds.
+        #[cfg(not(target_os = "ios"))]
+        {
+            let window = payload.window.as_deref().unwrap_or("");
+            if !crate::app::window::commands::is_known_window(window) {
+                return Err(AppError::message(format!("unknown window: {window}")));
+            }
+        }
+    } else if let Some(vault) = payload.vault_path.as_deref() {
+        if let Err(e) = app
+            .fs_scope()
+            .allow_directory(std::path::Path::new(vault), true)
+        {
+            log::warn!(
+                target: "agentero::op",
+                "ui request allow_directory failed vault={} error={e}",
+                trunc(vault)
+            );
+        }
+    }
+
+    if let Some(state) = app.try_state::<PendingUiRequest>() {
+        state.set(payload.clone());
+    }
+
+    let _ = app.emit(EVENT_UI_REQUEST, &payload);
+    focus_main_window(app);
+    log::info!(
+        target: "agentero::op",
+        "op end ui_request ok=true action={} vault={} path={} window={}",
+        payload.action,
+        trunc(payload.vault_path.as_deref().unwrap_or("")),
+        trunc(payload.path.as_deref().unwrap_or("")),
+        trunc(payload.window.as_deref().unwrap_or(""))
+    );
+    Ok(payload)
+}
+
+/// Stable dedupe key for a UI request (watcher double-write guard).
+#[cfg(feature = "desktop")]
+fn ui_request_key(req: &UiRequestPayload) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        req.action,
+        req.vault_path.as_deref().unwrap_or(""),
+        req.path.as_deref().unwrap_or(""),
+        req.window.as_deref().unwrap_or(""),
+        req.section.as_deref().unwrap_or(""),
+        req.direction.as_deref().unwrap_or(""),
+        req.reference.as_deref().unwrap_or("")
+    )
+}
+
+/// Emit the shared `vault:open-error` toast payload.
+#[cfg(feature = "desktop")]
+fn emit_open_error<R: Runtime>(app: &AppHandle<R>, message: &str) {
+    let _ = app.emit(
+        "vault:open-error",
+        serde_json::json!({ "message": message }),
+    );
+}
+
 /// Handle one or more deep-link URLs; non-open URLs are ignored with a warning.
 #[cfg(feature = "desktop")]
 pub fn handle_deep_link_urls<R: Runtime>(app: &AppHandle<R>, urls: &[String]) {
     for raw in urls {
+        // Auth callbacks belong to the identity plugin. Never log their one-use
+        // authorization code through the generic open/UI diagnostics.
+        if let Ok(url) = url::Url::parse(raw) {
+            if url.scheme() == "agentero"
+                && ((url.host_str() == Some("auth") && url.path() == "/callback")
+                    || (url.host_str().is_none() && url.path() == "/auth/callback"))
+            {
+                continue;
+            }
+        }
         if raw.contains("://pair") || raw.contains(":pair") {
             // Mobile pairing — leave to the mobile UI / other handlers.
+            continue;
+        }
+        // `agentero://ui?action=…` — workspace UI action (open paper/path/window).
+        if let Ok(req) = parse_ui_url(raw) {
+            if let Err(e) = handle_ui_request(app, req) {
+                log::warn!(
+                    target: "agentero::op",
+                    "op end ui_request ok=false url={} error={e}",
+                    trunc(raw)
+                );
+                emit_open_error(app, &e.to_string());
+            }
             continue;
         }
         match parse_open_url(raw) {
@@ -68,10 +162,7 @@ pub fn handle_deep_link_urls<R: Runtime>(app: &AppHandle<R>, urls: &[String]) {
                         "op end vault_open_request ok=false url={} error={e}",
                         trunc(raw)
                     );
-                    let _ = app.emit(
-                        "vault:open-error",
-                        serde_json::json!({ "message": e.to_string() }),
-                    );
+                    emit_open_error(app, &e.to_string());
                 }
             }
             Err(e) => {
@@ -101,10 +192,7 @@ pub fn handle_argv_urls<R: Runtime>(app: &AppHandle<R>, argv: &[String]) {
                 "op end vault_open_request ok=false argv_dir={} error={e}",
                 trunc(&path.to_string_lossy())
             );
-            let _ = app.emit(
-                "vault:open-error",
-                serde_json::json!({ "message": e.to_string() }),
-            );
+            emit_open_error(app, &e.to_string());
         }
     }
 }
@@ -143,34 +231,48 @@ fn trunc(s: &str) -> String {
     }
 }
 
-/// Poll the CLI open-request file and forward into the normal open pipeline.
+/// Poll the CLI open-request files and forward into the normal open pipeline.
 #[cfg(feature = "desktop")]
 pub fn spawn_cli_open_request_watcher<R: Runtime>(app: AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         let mut last_handled: Option<String> = None;
+        let mut last_ui: Option<String> = None;
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-            let Some(path) = take_cli_open_request_file() else {
-                continue;
-            };
-            let key = path.to_string_lossy().into_owned();
-            if last_handled.as_deref() == Some(key.as_str()) {
-                continue;
-            }
-            match handle_open_path(&app, &path) {
-                Ok(p) => {
-                    last_handled = Some(p);
+            if let Some(path) = take_cli_open_request_file() {
+                let key = path.to_string_lossy().into_owned();
+                if last_handled.as_deref() != Some(key.as_str()) {
+                    match handle_open_path(&app, &path) {
+                        Ok(p) => {
+                            last_handled = Some(p);
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                target: "agentero::op",
+                                "cli open request file failed path={} error={e}",
+                                trunc(&key)
+                            );
+                            emit_open_error(&app, &e.to_string());
+                        }
+                    }
                 }
-                Err(e) => {
-                    log::warn!(
-                        target: "agentero::op",
-                        "cli open request file failed path={} error={e}",
-                        trunc(&key)
-                    );
-                    let _ = app.emit(
-                        "vault:open-error",
-                        serde_json::json!({ "message": e.to_string() }),
-                    );
+            }
+            if let Some(req) = take_cli_ui_request_file() {
+                let key = ui_request_key(&req);
+                if last_ui.as_deref() != Some(key.as_str()) {
+                    match handle_ui_request(&app, req) {
+                        Ok(p) => {
+                            last_ui = Some(ui_request_key(&p));
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                target: "agentero::op",
+                                "cli ui request file failed key={} error={e}",
+                                trunc(&key)
+                            );
+                            emit_open_error(&app, &e.to_string());
+                        }
+                    }
                 }
             }
         }

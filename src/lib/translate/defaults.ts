@@ -11,9 +11,17 @@ export const DEFAULT_TRANSLATE_SETTINGS: TranslateSettings = {
 	providerConfigs: {},
 	autoTranslateSelection: false,
 	dualPaneTranslate: false,
+	displayMode: "overlay",
+	dualPaneSource: "pdf",
 	agentId: "",
 	modelId: "",
 	customPrompt: "",
+	customSystem: "",
+	customUser: "",
+	cacheReflowIr: true,
+	cacheReflowFinal: false,
+	autoTranslateImport: false,
+	autoTranslateImportConcurrency: 1,
 };
 
 /** Blank commercial provider config (missing draft/stored entry fallback). */
@@ -22,4 +30,5 @@ export const EMPTY_TRANSLATE_PROVIDER_CONFIG: TranslateProviderConfig = {
 	baseUrl: "",
 	region: "",
 	model: "",
+	extraRequestBody: "",
 };

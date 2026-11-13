@@ -8,6 +8,7 @@ import {
 	type SetStateAction,
 	useCallback,
 	useEffect,
+	useRef,
 	useState,
 } from "react";
 import type {
@@ -64,6 +65,7 @@ import { type AcpCommand, mapAcpCommands } from "@/lib/agent/slash-commands";
 import {
 	classifyStreamChunk,
 	promoteOrphanThoughtToText,
+	type StreamSlice,
 	ThinkTagParser,
 } from "@/lib/agent/stream-parse";
 import { isTauri } from "@/lib/core/tauri";
@@ -81,6 +83,7 @@ import {
 	writePdfAskThread,
 } from "@/lib/pdf/ask";
 import { nextLineId, nextPartId } from "@/lib/pdf-visual/ids";
+import { playCue } from "@/lib/ui/sound";
 
 export type UseAgentSessionRuntimeOptions = {
 	refs: Pick<
@@ -169,6 +172,53 @@ export function useAgentSessionRuntime({
 		[],
 	);
 
+	/**
+	 * Streamed chunks arrive ~25×/s and each one used to trigger a store update
+	 * plus a full panel re-render. Buffer the classified slices per session and
+	 * flush once per animation frame so streaming aligns with the render loop.
+	 * Non-stream updates flush the buffer first, preserving event order.
+	 */
+	const streamBufferRef = useRef<Map<string, StreamSlice[]>>(new Map());
+	const streamFlushFrameRef = useRef(0);
+
+	const flushStreamBuffer = useCallback(
+		(sessionId: string) => {
+			const buffer = streamBufferRef.current.get(sessionId);
+			if (!buffer?.length) return;
+			streamBufferRef.current.delete(sessionId);
+			updateSessionLines(sessionId, (prev) => {
+				const next = [...prev];
+				const last = next[next.length - 1];
+				if (last?.kind !== "agent" || !last.streaming) return prev;
+				let parts = last.parts;
+				for (const slice of buffer) {
+					parts = appendStreamPart(parts, slice.kind, slice.text);
+				}
+				next[next.length - 1] = {
+					...last,
+					parts,
+				};
+				return next;
+			});
+		},
+		[updateSessionLines],
+	);
+
+	const flushAllStreamBuffers = useCallback(() => {
+		for (const sessionId of [...streamBufferRef.current.keys()]) {
+			flushStreamBuffer(sessionId);
+		}
+	}, [flushStreamBuffer]);
+
+	/** Apply a non-stream update after any buffered chunks of the same session. */
+	const updateSessionLinesOrdered = useCallback(
+		(sessionId: string, update: (lines: ChatLine[]) => ChatLine[]) => {
+			flushStreamBuffer(sessionId);
+			updateSessionLines(sessionId, update);
+		},
+		[flushStreamBuffer, updateSessionLines],
+	);
+
 	/** Only composer-owned sessions (or pending submit) update the chat transcript. */
 	const isChatOwnedSession = useCallback(
 		(sessionId: string) => {
@@ -219,30 +269,26 @@ export function useAgentSessionRuntime({
 			if (slices.length === 0) return;
 			// Real model output arrived — the loading phase is over.
 			clearPhase(ev.sessionId);
-			updateSessionLines(ev.sessionId, (prev) => {
-				const next = [...prev];
-				const last = next[next.length - 1];
-				if (last?.kind !== "agent" || !last.streaming) return prev;
-				let parts = last.parts;
-				for (const slice of slices) {
-					if (!slice.text) continue;
-					parts = appendStreamPart(parts, slice.kind, slice.text);
-				}
-				next[next.length - 1] = {
-					...last,
-					parts,
-				};
-				return next;
+			const buffer = streamBufferRef.current.get(ev.sessionId) ?? [];
+			for (const slice of slices) {
+				if (slice.text) buffer.push(slice);
+			}
+			if (!buffer.length) return;
+			streamBufferRef.current.set(ev.sessionId, buffer);
+			if (streamFlushFrameRef.current) return;
+			streamFlushFrameRef.current = requestAnimationFrame(() => {
+				streamFlushFrameRef.current = 0;
+				flushAllStreamBuffers();
 			});
 		},
-		[clearPhase, isChatOwnedSession, thinkParsersRef, updateSessionLines],
+		[clearPhase, flushAllStreamBuffers, isChatOwnedSession, thinkParsersRef],
 	);
 
 	const applyToolEvent = useCallback(
 		(ev: AgentToolEvent) => {
 			if (!isChatOwnedSession(ev.sessionId)) return;
 			clearPhase(ev.sessionId);
-			updateSessionLines(ev.sessionId, (prev) =>
+			updateSessionLinesOrdered(ev.sessionId, (prev) =>
 				applyToolToLines(prev, {
 					id: ev.toolCallId,
 					title: ev.title,
@@ -272,14 +318,14 @@ export function useAgentSessionRuntime({
 				);
 			}
 		},
-		[clearPhase, isChatOwnedSession, updateSessionLines],
+		[clearPhase, isChatOwnedSession, updateSessionLinesOrdered],
 	);
 
 	const applyPlanEvent = useCallback(
 		(ev: AgentPlanEvent) => {
 			if (!isChatOwnedSession(ev.sessionId)) return;
 			clearPhase(ev.sessionId);
-			updateSessionLines(ev.sessionId, (prev) => {
+			updateSessionLinesOrdered(ev.sessionId, (prev) => {
 				const next = [...prev];
 				const last = next[next.length - 1];
 				if (last?.kind !== "agent" || !last.streaming) return prev;
@@ -290,7 +336,7 @@ export function useAgentSessionRuntime({
 				return next;
 			});
 		},
-		[clearPhase, isChatOwnedSession, updateSessionLines],
+		[clearPhase, isChatOwnedSession, updateSessionLinesOrdered],
 	);
 
 	const deferSessionEvent = useCallback(
@@ -418,7 +464,7 @@ export function useAgentSessionRuntime({
 					kind: "system",
 					text: t("messages.cancelled"),
 				};
-				updateSessionLines(ev.sessionId, (prev) => {
+				updateSessionLinesOrdered(ev.sessionId, (prev) => {
 					const next = [...prev];
 					const last = next[next.length - 1];
 					if (last?.kind === "agent" && last.streaming) {
@@ -452,8 +498,9 @@ export function useAgentSessionRuntime({
 				});
 				return;
 			}
+			playCue("done");
 			thinkParsersRef.current.delete(ev.sessionId);
-			updateSessionLines(ev.sessionId, (prev) => {
+			updateSessionLinesOrdered(ev.sessionId, (prev) => {
 				const next = [...prev];
 				const last = next[next.length - 1];
 				if (last?.kind === "agent" && last.streaming) {
@@ -534,7 +581,7 @@ export function useAgentSessionRuntime({
 			isChatOwnedSession,
 			t,
 			thinkParsersRef,
-			updateSessionLines,
+			updateSessionLinesOrdered,
 			setSessionHistory,
 		],
 	);
@@ -542,9 +589,10 @@ export function useAgentSessionRuntime({
 	const failSession = useCallback(
 		(sessionId: string, error: string) => {
 			if (!isChatOwnedSession(sessionId)) return;
+			playCue("error");
 			clearPhase(sessionId);
 			const failedLine: ChatLine = errorChatLine(error);
-			updateSessionLines(sessionId, (prev) => {
+			updateSessionLinesOrdered(sessionId, (prev) => {
 				const next = [...prev];
 				const last = next[next.length - 1];
 				if (last?.kind === "agent" && last.streaming) {
@@ -579,7 +627,7 @@ export function useAgentSessionRuntime({
 			finalizeAskThreads,
 			finalizeVisualTraces,
 			isChatOwnedSession,
-			updateSessionLines,
+			updateSessionLinesOrdered,
 			setSessionHistory,
 		],
 	);
@@ -651,8 +699,14 @@ export function useAgentSessionRuntime({
 						const matches =
 							s.id === ev.sessionId ||
 							(providerId !== "" && s.providerSessionId === providerId);
-						// Visual-trace titles are user-meaningful; never override them.
-						if (!matches || s.visualTraceId || s.title === title) return s;
+						// Visual-trace and user-renamed titles are meaningful; never override.
+						if (
+							!matches ||
+							s.visualTraceId ||
+							s.titleLocked ||
+							s.title === title
+						)
+							return s;
 						changed = true;
 						return { ...s, title };
 					});
@@ -757,6 +811,11 @@ export function useAgentSessionRuntime({
 		return () => {
 			cancelled = true;
 			for (const u of unsubs) u();
+			if (streamFlushFrameRef.current) {
+				cancelAnimationFrame(streamFlushFrameRef.current);
+				streamFlushFrameRef.current = 0;
+			}
+			flushAllStreamBuffers();
 		};
 	}, [
 		applyCollaborationEvent,
@@ -769,6 +828,7 @@ export function useAgentSessionRuntime({
 		completeSession,
 		deferSessionEvent,
 		failSession,
+		flushAllStreamBuffers,
 		isChatOwnedSession,
 		pendingTerminalEventsRef,
 		setAcpCommandsByAgent,

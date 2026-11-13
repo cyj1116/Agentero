@@ -4,6 +4,16 @@
 @import "@fontsource-variable/geist";
 @import "dockview-react/dist/styles/dockview.css";
 
+/*
+ * Streamdown keeps its component classes in node_modules, which Tailwind v4
+ * does not scan by default. Without these sources, utilities it relies on
+ * (e.g. `list-inside`) are never generated: lists fall back to outside
+ * markers, which the comment card's overflow clips — previews then show no
+ * bullets even though the Markdown parsed correctly.
+ */
+@source "../node_modules/streamdown/dist";
+@source "../node_modules/@streamdown/*/dist";
+
 @custom-variant dark (&:is(.dark *));
 
 @keyframes library-shimmer {
@@ -12,6 +22,26 @@
 	}
 	100% {
 		background-position: -200% 0;
+	}
+}
+
+@keyframes pdf-translate-indeterminate {
+	from {
+		transform: translateX(-110%);
+	}
+	to {
+		transform: translateX(370%);
+	}
+}
+
+.pdf-translate-indeterminate {
+	animation: pdf-translate-indeterminate 2.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.pdf-translate-indeterminate {
+		animation: none;
+		left: 31%;
 	}
 }
 
@@ -134,17 +164,6 @@
 }
 
 /*
- * Rail collapse/expand: use-shell-layout marks every panel in the group with
- * data-rail-animating, then commits the final layout via collapse()/expand().
- * Panel size is an inline flex-grow, so transitioning it animates all rails
- * in lockstep. The attribute is removed when the transition settles (or when
- * a separator drag cancels it), so manual resizing stays transition-free.
- */
-[data-panel][data-rail-animating] {
-	transition: flex-grow var(--motion-duration-normal) var(--motion-ease-out);
-}
-
-/*
  * Global reduced-motion fallback: Radix/tw-animate popovers, sonner toasts and
  * keyframe loaders have no per-component opt-out, so collapse all motion to a
  * near-zero duration here (state changes still apply, just without movement).
@@ -168,6 +187,14 @@
 		animation: none;
 		color: oklch(0.82 0.19 95);
 		fill: oklch(0.82 0.19 95);
+	}
+	.pdf-translate-wave {
+		animation: none;
+		opacity: 0;
+	}
+	.pdf-translate-rim {
+		animation: none;
+		opacity: 0;
 	}
 	/* Keep indeterminate ring spinning; freeze success flourishes. */
 	.task-ring-indeterminate {
@@ -200,6 +227,13 @@
 		-webkit-backdrop-filter: none;
 		box-shadow: none;
 		border-bottom-width: 1px;
+	}
+	[data-plaza-header] {
+		background-color: var(--background);
+		backdrop-filter: none;
+		-webkit-backdrop-filter: none;
+		box-shadow: none;
+		border-bottom: 1px solid var(--border);
 	}
 }
 
@@ -263,16 +297,30 @@
 
 	/*
 	 * Motion tokens — single source of truth for custom CSS + JS (see
-	 * lib/core/motion.ts). Keep RAIL_ANIMATION_MS in use-shell-layout.ts in
-	 * sync with --motion-duration-normal.
+	 * lib/core/motion.ts).
 	 *   micro  100ms — press / hover feedback (Button, tabs, rings)
 	 *   fast   150ms — overlay enter/exit, chrome color fades
-	 *   normal 200ms — layout choreography (rails, panels, task HUD)
+	 *   normal 200ms — task HUD timeout / larger choreography
 	 */
 	--motion-duration-micro: 100ms;
 	--motion-duration-fast: 150ms;
 	--motion-duration-normal: 200ms;
 	--motion-ease-out: cubic-bezier(0.25, 1, 0.5, 1);
+
+	/*
+	 * Elevation ladder. Light mode keeps shadows cool and barely visible at
+	 * rest; floating chrome relies on the hairline ring, while overlays and
+	 * dialogs add depth so they separate from dense paper/PDF content.
+	 * Dark mode raises alpha because black-on-black carries no contrast.
+	 */
+	--agentero-shadow-raised:
+		0 1px 2px oklch(0 0 0 / 0.04), 0 2px 6px -1px oklch(0 0 0 / 0.06);
+	--agentero-shadow-overlay:
+		0 1px 2px oklch(0 0 0 / 0.05), 0 10px 24px -8px oklch(0 0 0 / 0.16),
+		0 3px 8px -2px oklch(0 0 0 / 0.08);
+	--agentero-shadow-dialog:
+		0 2px 4px oklch(0 0 0 / 0.04), 0 24px 64px -16px oklch(0 0 0 / 0.28),
+		0 8px 24px -8px oklch(0 0 0 / 0.1);
 }
 
 @theme inline {
@@ -333,6 +381,13 @@
 	--color-input: var(--input);
 	--color-border: var(--border);
 	--color-destructive: var(--destructive);
+	/*
+	 * Semantic status colors. UI theme presets only carry the shadcn token set,
+	 * so success / warning stay app-level and keep their meaning across presets
+	 * instead of being frozen emerald / amber utilities.
+	 */
+	--color-success: var(--success);
+	--color-warning: var(--warning);
 	--color-accent-foreground: var(--accent-foreground);
 	--color-accent: var(--accent);
 	--color-muted-foreground: var(--muted-foreground);
@@ -354,6 +409,9 @@
 	--radius-2xl: calc(var(--radius) * 1.8);
 	--radius-3xl: calc(var(--radius) * 2.2);
 	--radius-4xl: calc(var(--radius) * 2.6);
+	--shadow-raised: var(--agentero-shadow-raised);
+	--shadow-overlay: var(--agentero-shadow-overlay);
+	--shadow-dialog: var(--agentero-shadow-dialog);
 	--color-brand: var(--brand);
 	--color-highlight: var(--highlight);
 	/*
@@ -388,6 +446,8 @@
 	--accent: oklch(0.952 0.008 260);
 	--accent-foreground: oklch(0.25 0.012 260);
 	--destructive: oklch(0.577 0.245 27.325);
+	--success: oklch(0.58 0.14 158);
+	--warning: oklch(0.6 0.15 68);
 	--border: oklch(0.905 0.008 260);
 	--input: oklch(0.905 0.008 260);
 	--ring: oklch(0.62 0.02 260);
@@ -428,6 +488,8 @@
 	--accent: oklch(0.27 0.01 260);
 	--accent-foreground: oklch(0.98 0.004 260);
 	--destructive: oklch(0.704 0.191 22.216);
+	--success: oklch(0.8 0.14 158);
+	--warning: oklch(0.82 0.13 76);
 	--border: oklch(0.98 0.004 260 / 12%);
 	--input: oklch(0.98 0.004 260 / 16%);
 	--ring: oklch(0.58 0.02 260);
@@ -446,6 +508,14 @@
 	--sidebar-ring: oklch(0.58 0.02 260);
 	--brand: oklch(0.707 0.165 254.624);
 	--highlight: oklch(0.852 0.199 91.936);
+	--agentero-shadow-raised:
+		0 1px 2px oklch(0 0 0 / 0.4), 0 2px 6px -1px oklch(0 0 0 / 0.35);
+	--agentero-shadow-overlay:
+		0 1px 2px oklch(0 0 0 / 0.5), 0 12px 32px -8px oklch(0 0 0 / 0.55),
+		0 3px 10px -2px oklch(0 0 0 / 0.35);
+	--agentero-shadow-dialog:
+		0 2px 6px oklch(0 0 0 / 0.5), 0 28px 72px -16px oklch(0 0 0 / 0.65),
+		0 8px 24px -8px oklch(0 0 0 / 0.4);
 }
 
 @layer base {
@@ -498,6 +568,145 @@
 ::selection {
 	background-color: color-mix(in oklch, var(--primary) 26%, transparent);
 	color: var(--foreground);
+}
+
+/*
+ * Translation glyphs sit on PDF paper, not app chrome. The global rule
+ * paints selection in --foreground, which is near-white in dark mode, so a
+ * selection on light paper flips black ink light. WebKit also drops
+ * ::selection color unless background-color is in the same rule — a
+ * background-only utility is enough to trigger that.
+ *
+ * Sentence spans do not inherit this. A rule on the paragraph styles only
+ * the paragraph's own text; each span matches the global ::selection and
+ * turns white. The descendant rule has to name those spans.
+ */
+/*
+ * The blue line is painted under the glyphs, the same slot as English
+ * selection. A ::selection background here is a second layer: translucent
+ * quads overlap between characters, and an opaque fill covers the ink.
+ */
+/* A PDF drag cannot select the Markdown rail between consecutive page shells. */
+[data-pdf-drag-selection] [data-pdf-chrome],
+[data-pdf-drag-selection] [data-pdf-chrome] * {
+	-webkit-user-select: none;
+	user-select: none;
+}
+
+.pdf-translate-selection::selection,
+.pdf-translate-selection *::selection {
+	background-color: transparent;
+	color: #18181b;
+}
+.pdf-translate-selection[data-paper="dark"]::selection,
+.pdf-translate-selection[data-paper="dark"] *::selection {
+	background-color: transparent;
+	color: #f4f4f5;
+}
+/*
+ * Reflow previews are rasterized translations. Each character is its own
+ * absolutely positioned box on top of that image. A translucent ::selection
+ * on every box stacks in the seam between two characters. The line band
+ * paints the highlight once; this layer only keeps the text invisible.
+ */
+.pdf-translate-selection[data-reflow-selection="true"]::selection,
+.pdf-translate-selection[data-reflow-selection="true"] *::selection {
+	background-color: transparent;
+	color: transparent;
+}
+
+/*
+ * Preserved tokens ([12], 图 3, URLs) use the original glyph fill (inline
+ * style). Inherit until that fill arrives so the token does not flash the
+ * browser's link blue. No underline: colorlinks PDFs already mark the link
+ * by ink color, and a zero-width border paints nothing on the source page.
+ */
+.pdf-translate-selection [data-translated-link] {
+	color: inherit;
+	cursor: pointer;
+	text-decoration: none;
+	-webkit-user-select: text;
+	user-select: text;
+}
+
+/*
+ * Compact Markdown shared by the PDF comment card's Plate editor and its
+ * Streamdown preview so both states render identically. Unlayered on purpose:
+ * it must win over Streamdown's generated utilities (list-inside, space-y-4,
+ * py-1). The editor's unordered items are `display:list-item` blocks whose
+ * gutter comes from the comment kit's IndentPlugin (1.15rem); the preview's
+ * <ul>/<ol> mirror that gutter here. Paragraphs and list items share the same
+ * compact vertical rhythm so spacing matches too.
+ */
+.comment-md {
+	--comment-list-indent: 1.15rem;
+	line-height: 1.5;
+}
+.comment-md :is(ul, ol) {
+	list-style-position: outside;
+	padding-left: var(--comment-list-indent);
+	margin-block: 0;
+}
+.comment-md .slate-p {
+	padding-block: 0.125rem;
+}
+/* Streamdown list items own the item rhythm in preview. The editor's ordered
+ * and todo items also render an <li> wrapper, but their paragraph block
+ * already carries the same padding; adding it to the wrapper too would make
+ * those items taller than the same Markdown in preview. */
+.comment-md [data-streamdown="list-item"] {
+	padding-block: 0.125rem;
+	padding-left: 0;
+}
+/* Empty editors keep the 3-line typing area; filled notes hug their content
+ * so entering edit mode never adds bottom whitespace. */
+.comment-md:has([data-slate-placeholder]) {
+	min-height: 3.75rem;
+}
+/* Ordered/todo items render as an <ol>/<ul> wrapper (BlockList) inside the
+ * indented block; the wrapper padding already provides the gutter, so cancel
+ * the IndentPlugin margin on that block to avoid indenting twice. Unordered
+ * items have no wrapper and keep the block margin as their gutter. */
+.comment-md :has(> ol, > ul) {
+	/* biome-ignore lint/complexity/noImportantStyles: must beat Plate IndentPlugin's inline margin-left on the list block */
+	margin-left: 0 !important;
+}
+.comment-md p {
+	margin-block: 0;
+	padding-block: 0.125rem;
+}
+.comment-md ::marker {
+	color: var(--muted-foreground);
+}
+.comment-md :is(blockquote, pre, hr, h1, h2, h3, h4, h5, h6) {
+	margin-block: 0.125rem;
+}
+.comment-md > :first-child {
+	margin-top: 0;
+}
+.comment-md > :last-child {
+	margin-bottom: 0;
+}
+.comment-md :is(h1, h2, h3, h4, h5, h6) {
+	font-size: 1em;
+	font-weight: 600;
+	line-height: 1.4;
+}
+.comment-md blockquote {
+	padding-left: 0.75rem;
+	border-left: 2px solid var(--border);
+	color: var(--muted-foreground);
+	font-style: normal;
+}
+.comment-md pre {
+	padding: 0.5rem 0.625rem;
+	font-size: 0.85em;
+}
+.comment-md :not(pre) > code {
+	padding: 0.1em 0.35em;
+	border-radius: 0.3em;
+	background-color: color-mix(in oklab, var(--muted) 60%, transparent);
+	font-size: 0.85em;
 }
 
 /*
@@ -728,6 +937,65 @@
 	);
 }
 
+/*
+ * CodeMirror's scroller draws a native scrollbar; keep the thumb hidden while
+ * idle so the source pane matches the app's auto-hiding pane scrollbars.
+ */
+.cm-scroller {
+	scrollbar-width: thin;
+	scrollbar-color: transparent transparent;
+}
+
+.cm-scroller.scrolling {
+	scrollbar-color: color-mix(in oklch, var(--muted-foreground) 32%, transparent)
+		transparent;
+}
+
+.cm-scroller::-webkit-scrollbar {
+	width: 8px;
+	height: 8px;
+}
+
+.cm-scroller::-webkit-scrollbar-track,
+.cm-scroller::-webkit-scrollbar-corner {
+	background: transparent;
+}
+
+.cm-scroller::-webkit-scrollbar-thumb {
+	background-color: transparent;
+	border: 2px solid transparent;
+	border-radius: 999px;
+	background-clip: content-box;
+}
+
+.cm-scroller.scrolling::-webkit-scrollbar-thumb,
+.cm-scroller::-webkit-scrollbar-thumb:hover {
+	background-color: color-mix(
+		in oklch,
+		var(--muted-foreground) 28%,
+		transparent
+	);
+}
+
+/*
+ * Linux WebKitGTK can draw native overlay scrollbars above tooltips and menus.
+ * Hide page scrollbars while a floating layer is open, keeping the floating
+ * layer's own scrollbars. Enabled only on Linux desktop (lib/core/scrollbars.ts).
+ * Keep the selector list to real scrollers: it is restyled on every open / close.
+ */
+html[data-linux-scrollbars]:has(
+	body > :is([data-radix-popper-content-wrapper], [data-viewport-floating])
+)
+:is(
+	.agentero-scroll,
+	.agentero-scroll-both,
+	.overflow-auto,
+	.overflow-x-auto,
+	.overflow-y-auto
+):not(:is([data-radix-popper-content-wrapper], [data-viewport-floating]) *) {
+	scrollbar-width: none;
+}
+
 /* dockview: map native theme class to app design tokens */
 .agentero-dockview,
 .agentero-dockview-theme {
@@ -756,10 +1024,11 @@
 	--dv-inactivegroup-hiddenpanel-tab-color: var(--muted-foreground);
 	--dv-tab-divider-color: var(--border);
 	--dv-separator-border: var(--border);
-	/* IDE-style sash (VS Code): rest is invisible, only the 1px separator
-	 * line shows; hover/drag paints a translucent highlight over it. */
+	/* IDE-style sash: the sash itself stays invisible; the 1px separator
+	 * line is the divider and darkens in place on hover/drag, like the
+	 * writing split handle. */
 	--dv-sash-color: transparent;
-	--dv-active-sash-color: color-mix(in oklab, var(--primary) 40%, transparent);
+	--dv-active-sash-color: transparent;
 	--dv-drag-over-background-color: color-mix(
 		in oklab,
 		var(--primary) 16%,
@@ -774,8 +1043,7 @@
 	--dv-context-menu-background-color: var(--popover);
 	--dv-context-menu-color: var(--popover-foreground);
 	--dv-overlay-z-index: 1000;
-	--dv-floating-box-shadow: 0 8px 24px
-		color-mix(in oklab, var(--foreground) 12%, transparent);
+	--dv-floating-box-shadow: var(--agentero-shadow-overlay);
 	background-color: var(--background);
 	color: var(--foreground);
 	height: 100%;
@@ -836,6 +1104,11 @@
  * A Dockview sash move resizes multiple nested views in the same frame.
  * Temporarily contain those layout/paint trees so a heavy PDF or editor panel
  * cannot invalidate sibling panels while the divider is moving.
+ *
+ * `contain: paint` here is also what makes the Markdown re-wrap freeze work:
+ * while the gesture runs, `lib/workspace/markdown-resize-freeze.ts` pins each
+ * editor's content box to its pre-drag width, so the pane follows the pointer
+ * and the pinned overflow is clipped by this containment instead of spilling.
  */
 .agentero-dockview.agentero-dock-sash-active .dv-view,
 .agentero-dockview.agentero-dock-sash-active .dv-render-overlay {
@@ -848,13 +1121,37 @@
 }
 
 /*
- * Drag feedback for the sash being moved. Class-based (see dockview-sash.ts)
- * because the frame loop prevents pointerdown default, which suppresses
- * `:active`, and dockview never sets pointer capture — so pseudo-class
- * styling cannot be relied on while dragging.
+ * Sash feedback matches the writing split handle: keep the 1px separator as
+ * the divider and recolor that line in place (hover 25%, drag 35%) instead of
+ * painting a band over it.
  */
-.agentero-dockview .dv-sash.agentero-dock-sash-dragging {
-	background-color: var(--dv-active-sash-color);
+.agentero-dockview .dv-split-view-container.dv-separator-border
+	> .dv-view-container
+	> .dv-view:not(:first-child)::before {
+	transition: background-color 150ms;
+}
+
+.agentero-dockview
+	.dv-split-view-container.dv-separator-border:has(
+		> .dv-sash-container > .dv-sash:hover
+	)
+	> .dv-view-container
+	> .dv-view:not(:first-child)::before {
+	background-color: color-mix(in oklab, var(--foreground) 25%, transparent);
+}
+
+/*
+ * The dragged sash is tagged with `agentero-dock-sash-dragging` (see
+ * dockview-sash.ts): the frame loop prevents pointerdown default, which
+ * suppresses `:active`, and dockview sets no pointer capture, so `:hover`
+ * cannot be relied on once the pointer leaves the 4px strip mid-drag.
+ */
+.agentero-dockview .dv-split-view-container.dv-separator-border:has(
+		> .dv-sash-container > .dv-sash.agentero-dock-sash-dragging
+	)
+	> .dv-view-container
+	> .dv-view:not(:first-child)::before {
+	background-color: color-mix(in oklab, var(--foreground) 35%, transparent);
 }
 
 /*
@@ -887,6 +1184,8 @@ body.agentero-dockview-dragging * {
 	max-width: 12rem;
 	min-width: 0;
 	overflow: hidden;
+	/* Browser-style tab silhouette: square at the content edge, soft on top. */
+	border-radius: 0.375rem 0.375rem 0 0;
 	-webkit-user-select: none;
 	user-select: none;
 	/* Tab chrome fades like every other row; content still switches instantly. */
@@ -897,6 +1196,32 @@ body.agentero-dockview-dragging * {
 }
 
 .agentero-dockview .dv-tab:active {
+	opacity: 0.85;
+}
+
+/* A hairline of light across the active tab keeps it lifted without a hard border. */
+.agentero-dockview .dv-tab.dv-active-tab {
+	box-shadow: inset 0 1px 0
+		color-mix(in oklab, var(--foreground) 7%, transparent);
+}
+
+/* Keep the close affordance quiet at rest and give it a real hit target. */
+.agentero-dockview .dv-tab .dv-default-tab .dv-default-tab-action {
+	border-radius: 0.25rem;
+	padding: 3px;
+	opacity: 0.55;
+	transition:
+		background-color var(--motion-duration-micro) var(--motion-ease-out),
+		opacity var(--motion-duration-micro) var(--motion-ease-out);
+}
+
+.agentero-dockview .dv-tab .dv-default-tab .dv-default-tab-action:hover {
+	border-radius: 0.25rem;
+	opacity: 1;
+}
+
+.agentero-dockview .dv-tab.dv-active-tab .dv-default-tab .dv-default-tab-action,
+.agentero-dockview .dv-tab .dv-default-tab:hover .dv-default-tab-action {
 	opacity: 0.85;
 }
 
@@ -1062,8 +1387,98 @@ body.agentero-dockview-dragging * {
 	color: #f2cc60;
 }
 
+/*
+ * Wikilink embeds are inline Slate nodes, so a paragraph always keeps an empty
+ * text leaf on each side. Those leaves render a `<br>`, which opens a blank
+ * line above and below a block card and drops the card onto the next line.
+ * An embed that shares the paragraph with real text stays inline-block. An
+ * embed that is the paragraph's only content becomes a full-width block, and
+ * the placeholder leaves are taken out of flow.
+ */
+[data-slate-editor] .agentero-wiki-embed:not([data-wiki-source]) {
+	display: inline-block;
+	max-width: 100%;
+	vertical-align: top;
+}
+
+[data-slate-editor]
+	[data-slate-node="element"]:has(
+		> .agentero-wiki-embed:not([data-wiki-source])
+	):not(:has(> [data-slate-node="text"] [data-slate-string="true"]))
+	> .agentero-wiki-embed:not([data-wiki-source]) {
+	display: block;
+	width: 100%;
+}
+
+[data-slate-editor]
+	[data-slate-node="element"]:has(
+		> .agentero-wiki-embed:not([data-wiki-source])
+	):not(:has(> [data-slate-node="text"] [data-slate-string="true"]))
+	> [data-slate-node="text"] {
+	position: absolute;
+	width: 1px;
+	height: 0;
+	overflow: hidden;
+	white-space: nowrap;
+}
+
+/*
+ * Markdown reading performance (#702).
+ *
+ * A long note renders every block; changing the pane width (dragging a rail or
+ * a Dockview sash) re-wraps the whole document every frame, and scrolling
+ * paints it all. `content-visibility: auto` lets Chromium skip layout and paint
+ * for offscreen top-level blocks — the Slate-recommended technique for large
+ * documents. It is scoped to the live editor (only it renders
+ * `.slate-blockWrapper`) and disabled while the editor holds focus, so editing,
+ * caret placement and IME keep their uncontained semantics. `contain-intrinsic-
+ * size: auto` caches each block's real height after its first render, so the
+ * `4rem` fallback only applies to never-seen blocks.
+ *
+ * WebKit is slower than not using this per element, so the attribute is set
+ * only on non-WebKit webviews (see lib/core/paint-perf.ts).
+ */
+html[data-offscreen-md-blocks] [data-slate-editor][data-selection-chat-origin="markdown"]:not(
+		:focus-within
+	)
+	.slate-blockWrapper {
+	content-visibility: auto;
+	contain-intrinsic-size: auto 4rem;
+}
+
 ::highlight(agentero-context-selection),
 ::highlight(agentero-annotation-selection),
 ::highlight(agentero-annotation-navigation) {
 	background-color: #3b82f650;
+}
+
+/*
+ * Config reminders (#658): Sonner lays action buttons out in the same flex row
+ * as the text, which squeezes a long description into a narrow column. Stack
+ * the content above a right-aligned button row for `cn-reminder-toast` toasts.
+ * Specificity is raised past Sonner's own rules so source order does not matter.
+ */
+[data-sonner-toast][data-styled="true"].cn-reminder-toast {
+	display: grid;
+	grid-template-columns: 1fr auto auto;
+	align-items: center;
+	column-gap: 6px;
+	row-gap: 10px;
+	--toast-button-margin-start: 0;
+	--toast-button-margin-end: 0;
+}
+[data-sonner-toast][data-styled="true"].cn-reminder-toast [data-content] {
+	grid-column: 1 / -1;
+	grid-row: 1;
+}
+[data-sonner-toast][data-styled="true"].cn-reminder-toast [data-icon] {
+	display: none;
+}
+[data-sonner-toast][data-styled="true"].cn-reminder-toast [data-cancel] {
+	grid-column: 2;
+	grid-row: 2;
+}
+[data-sonner-toast][data-styled="true"].cn-reminder-toast [data-action] {
+	grid-column: 3;
+	grid-row: 2;
 }

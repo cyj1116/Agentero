@@ -9,13 +9,13 @@ import {
 	commands,
 	type PaperMetaPatch as PaperMetaPatchWire,
 	type PaperRecord_Serialize as PaperRecordWire,
-	type PaperRescanResult,
 	type PaperTag as PaperTagWire,
 	type TrashEntry,
 	type TrashResult,
 } from "@/lib/core/bindings";
 import { callApi, callApiResult } from "@/lib/core/ipc";
 import { normalizeRelPath } from "@/lib/core/path";
+import { perfOp } from "@/lib/core/perf";
 import { isTauri } from "@/lib/core/tauri";
 import type {
 	PaperLibraryRow,
@@ -23,7 +23,7 @@ import type {
 	PaperTagInput,
 } from "@/lib/paper/types";
 import { paperFromWire } from "@/lib/paper/wire";
-import { type AppSettings, DEFAULT_TRANSLATOR_BASE_URL } from "@/lib/settings";
+import { DEFAULT_TRANSLATOR_BASE_URL } from "@/lib/settings";
 import type { WikiRenameResult } from "@/lib/wiki";
 
 /**
@@ -51,7 +51,7 @@ export function normalizeLibraryScope(path: string): string {
 /**
  * Whether a vault-relative path is a meaningful Library folder scope.
  * Only `papers` / `papers/...` filter the catalog; `notes`, `.agents`,
- * `plans`, etc. are not paper trees and must show the full library (#160).
+ * `plans`, etc. are not paper trees and get no Library scope.
  */
 export function isPapersLibraryScope(
 	scopeRel: string | null | undefined,
@@ -63,7 +63,7 @@ export function isPapersLibraryScope(
 
 /**
  * Resolve a folder click to a Library scope path.
- * Non-papers folders → `null` (full library).
+ * Non-papers folders → `null` (no Library navigation).
  */
 export function resolveLibraryScopePath(
 	rel: string | null | undefined,
@@ -126,23 +126,26 @@ export async function listPapers(
 	vaultPath: string,
 ): Promise<PaperLibraryRow[]> {
 	if (!isTauri()) return [];
-	const { isRemoteVaultHandle, remotePaperList, remoteSessionIdFromHandle } =
-		await import("@/lib/vault/remote/remote-vault");
-	if (isRemoteVaultHandle(vaultPath)) {
-		const sessionId = remoteSessionIdFromHandle(vaultPath);
-		if (!sessionId) return [];
-		// Remote listings are bare records: nothing probes the remote host for
-		// a local PDF, so the row says "unknown" rather than "missing".
-		const rows = (await remotePaperList(sessionId)) as PaperRecordWire[];
-		return rows.map((row) => ({ ...paperFromWire(row), has_pdf: undefined }));
-	}
-	const rows = await callApiResult(() => commands.paperList({ vaultPath }), {
-		fallback: "paper_list failed",
+	return perfOp("paper_list", async () => {
+		const { isRemoteVaultHandle, remotePaperList, remoteSessionIdFromHandle } =
+			await import("@/lib/vault/remote/remote-vault");
+		if (isRemoteVaultHandle(vaultPath)) {
+			const sessionId = remoteSessionIdFromHandle(vaultPath);
+			if (!sessionId) return [];
+			// Remote listings are bare records: nothing probes the remote host for
+			// a local PDF, so the row says "unknown" rather than "missing".
+			const rows = (await remotePaperList(sessionId)) as PaperRecordWire[];
+			return rows.map((row) => ({
+				...paperFromWire(row),
+				has_pdf: undefined,
+			}));
+		}
+		const rows = await callApiResult(() => commands.paperList({ vaultPath }), {
+			fallback: "paper_list failed",
+		});
+		return rows.map(paperFromWire);
 	});
-	return rows.map(paperFromWire);
 }
-
-export type { PaperRescanResult };
 
 /** Rebuild catalog rows from papers/ on disk (recover disk-only papers). */
 export async function rescanPapers(vaultPath: string): Promise<number> {
@@ -159,6 +162,20 @@ export async function rescanPapers(vaultPath: string): Promise<number> {
 		fallback: i18n.t("sidebar:papersLibrary.rescanFailed"),
 	});
 	return r.count;
+}
+
+/**
+ * Ensure catalog rows for watcher paths under `papers/`. The host rescans
+ * the library only when a path is not one paper folder.
+ */
+export async function ensurePaperRows(
+	vaultPath: string,
+	paths: string[],
+): Promise<{ count: number; rescanned: boolean }> {
+	if (!isTauri() || paths.length === 0) return { count: 0, rescanned: false };
+	return callApi(() => commands.paperEnsureRows({ vaultPath, paths }), {
+		fallback: "paper_ensure_rows failed",
+	});
 }
 
 /**
@@ -293,10 +310,32 @@ export async function movePaperFolder(
 	);
 }
 
+export type PaperCopyResult = {
+	newRel: string;
+	cataloged: boolean;
+};
+
+/**
+ * Duplicate a paper/org folder into another papers/ folder. Never overwrites;
+ * the source keeps its catalog row and incoming links.
+ */
+export async function copyPaperFolder(
+	vaultPath: string,
+	fromRel: string,
+	destParentRel: string,
+): Promise<PaperCopyResult> {
+	if (!isTauri()) {
+		throw new Error(i18n.t("sidebar:fileTree.copyDesktopOnly"));
+	}
+	return callApi(
+		() => commands.paperCopy({ vaultPath, fromRel, destParentRel }),
+		{ fallback: i18n.t("sidebar:fileTree.copyFailed") },
+	);
+}
+
 /**
  * Mark paper as read / unread after paper-reader workflow (catalog authority).
- */
-export async function setPaperIsRead(
+ */ export async function setPaperIsRead(
 	vaultPath: string,
 	path: string,
 	isRead: boolean,
@@ -371,6 +410,35 @@ export async function setPaperTags(
 	return paperFromWire(paper);
 }
 
+export type PublicationSyncResult = {
+	updated: number;
+	metricsUpdated: number;
+	metricsFailed: number;
+};
+
+/**
+ * Host-owned publication sync for a set of papers: refreshes the
+ * `#submitted:` projection, removes retired `#venue:` tags, and updates
+ * EasyScholar metrics when a key is configured.
+ */
+export async function syncPublication(
+	vaultPath: string,
+	paths: string[],
+): Promise<PublicationSyncResult> {
+	if (!isTauri() || paths.length === 0) {
+		return { updated: 0, metricsUpdated: 0, metricsFailed: 0 };
+	}
+	const report = await callApi(
+		() => commands.paperSyncPublication({ vaultPath, paths }),
+		{ fallback: i18n.t("sidebar:papersLibrary.syncPublicationFailed") },
+	);
+	return {
+		updated: report.updated,
+		metricsUpdated: report.metricsUpdated,
+		metricsFailed: report.metricsFailed,
+	};
+}
+
 /**
  * Manual metadata patch: omitted fields keep current values; empty strings
  * clear the column. Mirrors Host `PaperMetaPatch`.
@@ -389,6 +457,8 @@ export type PaperMetaPatch = {
 	abstract?: string;
 	pdfUrl?: string;
 	htmlUrl?: string;
+	codeRepo?: string;
+	openreviewUrl?: string;
 };
 
 /**
@@ -425,6 +495,8 @@ export async function updatePaperMeta(
 		abstract: patch.abstract ?? null,
 		pdfUrl: patch.pdfUrl ?? null,
 		htmlUrl: patch.htmlUrl ?? null,
+		codeRepo: patch.codeRepo ?? null,
+		openreviewUrl: patch.openreviewUrl ?? null,
 	};
 	const paper = await callApi(
 		() => commands.paperUpdateMeta({ vaultPath, path, patch: wirePatch }),
@@ -450,13 +522,10 @@ export async function resolveIdentifierMetadata(
 	if (!isTauri()) {
 		throw new Error(i18n.t("sidebar:paperInfo.editMeta.desktopOnly"));
 	}
-	const { getSettings } = await import("@/lib/settings/react-store");
-	const settings: AppSettings = getSettings();
 	const record = await callApi(
 		() =>
 			commands.paperResolveIdentifier({
 				text: text.trim(),
-				translatorBaseUrl: settings.translatorBaseUrl,
 			}),
 		{ fallback: i18n.t("sidebar:paperInfo.editMeta.fetchFailed") },
 	);
@@ -471,19 +540,12 @@ export type PaperImportResult = {
 	errors: string[];
 };
 
-function translatorBase(settings?: AppSettings): string {
-	const raw =
-		settings?.translatorBaseUrl?.trim() || DEFAULT_TRANSLATOR_BASE_URL;
-	return raw.replace(/\/+$/, "");
-}
-
 /**
  * Export catalog via Host → Translator `POST /export`.
  * Host converts catalog rows to a **Zotero API JSON array** (required body shape).
  */
 export async function exportLibrary(opts: {
 	vaultPath: string;
-	settings?: AppSettings;
 	/** Default bibtex */
 	format?: string;
 }): Promise<PaperExportResult> {
@@ -495,7 +557,7 @@ export async function exportLibrary(opts: {
 			commands.paperExport({
 				vaultPath: opts.vaultPath,
 				format: opts.format ?? "bibtex",
-				translatorBaseUrl: translatorBase(opts.settings),
+				translatorBaseUrl: DEFAULT_TRANSLATOR_BASE_URL,
 			}),
 		{ fallback: i18n.t("sidebar:papersLibrary.exportFailed") },
 	);
@@ -507,7 +569,6 @@ export async function exportLibrary(opts: {
  */
 export async function exportLibraryToFile(opts: {
 	vaultPath: string;
-	settings?: AppSettings;
 	format?: string;
 }): Promise<PaperExportResult | null> {
 	const data = await exportLibrary(opts);
@@ -532,7 +593,6 @@ export async function importLibraryText(opts: {
 	vaultPath: string;
 	content: string;
 	parentDir?: string;
-	settings?: AppSettings;
 }): Promise<PaperImportResult> {
 	if (!isTauri()) {
 		throw new Error(i18n.t("sidebar:papersLibrary.desktopOnly"));
@@ -543,7 +603,7 @@ export async function importLibraryText(opts: {
 				vaultPath: opts.vaultPath,
 				parentDir: opts.parentDir ?? "papers",
 				content: opts.content,
-				translatorBaseUrl: translatorBase(opts.settings),
+				translatorBaseUrl: DEFAULT_TRANSLATOR_BASE_URL,
 			}),
 		{ fallback: i18n.t("sidebar:papersLibrary.importFailed") },
 	);
@@ -556,7 +616,6 @@ export async function importLibraryText(opts: {
 export async function importLibraryFromFile(opts: {
 	vaultPath: string;
 	parentDir?: string;
-	settings?: AppSettings;
 }): Promise<PaperImportResult | null> {
 	const selected = await open({
 		multiple: false,
@@ -575,6 +634,5 @@ export async function importLibraryFromFile(opts: {
 		vaultPath: opts.vaultPath,
 		content,
 		parentDir: opts.parentDir,
-		settings: opts.settings,
 	});
 }

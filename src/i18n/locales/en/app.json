@@ -1,4 +1,5 @@
 {
+	"navigator": { "hintTargets": "{{count}} keyboard targets" },
 	"labels": {
 		"agent": "Agent",
 		"notes": "Notes",
@@ -7,18 +8,19 @@
 	},
 	"commandPalette": {
 		"title": "Quick open",
-		"placeholder": "Search papers and note contents…",
+		"placeholder": "Search papers, notes, and tables…",
 		"commandsTitle": "Commands",
 		"commandsPlaceholder": "Type a command name…",
 		"commands": "Commands",
 		"commandsEmpty": "Type to filter commands (prefix > also works in Quick open)",
 		"papers": "Papers",
 		"recent": "Recent papers",
+		"aliases": "Aliases",
 		"contents": "In contents",
 		"searching": "Searching…",
 		"noResults": "No matches",
 		"noVault": "Open a vault to search",
-		"empty": "Type to search papers and note contents"
+		"empty": "Type to search papers, notes, and tables"
 	},
 	"commands": {
 		"catApp": "App",
@@ -27,6 +29,8 @@
 		"catLibrary": "Library",
 		"catTab": "Tab",
 		"catPdf": "PDF",
+		"catEditor": "Editor",
+		"toggleMarkdownSource": "Toggle Markdown source",
 		"settingsOpen": "Open Settings",
 		"settingsClose": "Close Settings",
 		"vaultOpen": "Open Vault…",
@@ -48,8 +52,12 @@
 		"tabSplitPane": "Split Pane Right",
 		"tabNext": "Next Tab",
 		"tabPrev": "Previous Tab",
+		"tabNextInGroup": "Next Tab in Group",
+		"tabPrevInGroup": "Previous Tab in Group",
 		"exportAnnotatedPdf": "Export Annotated PDF",
-		"wandOpen": "Magic Wand (Import by ID)"
+		"wandOpen": "Magic Wand (Import by ID)",
+		"pluginsLoadDevelopment": "Load development plugin…",
+		"pluginsUnloadDevelopment": "Unload development plugins"
 	},
 	"titlebar": {
 		"showLeftSidebar": "Show left sidebar",
@@ -80,15 +88,22 @@
 	"diskConflict": {
 		"title": "“{{name}}” changed on disk — kept your unsaved edits",
 		"reload": "Load disk version",
-		"saveBlocked": "“{{name}}” was modified elsewhere — your edit was not saved to avoid losing changes. Load the disk version, then re-apply your edit."
+		"keepDraft": "Keep draft",
+		"saveBlocked": "“{{name}}” was modified elsewhere — your edit was not saved to avoid losing changes. Load the disk version, then re-apply your edit.",
+		"splitTitle": "This note changed on disk",
+		"splitDetail": "Your unsaved draft is still here. Loading the disk version drops the draft. Keeping the draft overwrites the newer version on disk."
 	},
 	"tabs": {
 		"strip": "Open documents",
+		"more": "More tabs",
 		"close": "Close {{title}}",
 		"showHtml": "Show HTML version",
 		"showPdf": "Show PDF version",
 		"openTexPdf": "Open PDF",
 		"texCompiling": "Compiling…",
+		"contextCopyPath": "Copy path",
+		"copiedPath": "Path copied",
+		"copyPathFailed": "Could not copy path",
 		"contextClose": "Close",
 		"contextOpenNotes": "Open Notes",
 		"contextMoveToNewWindow": "Move to New Window",
@@ -232,9 +247,13 @@
 		"layoutModelDownload": "Download layout model",
 		"layoutModelDetail": "ModelScope → HuggingFace · PP-DocLayoutV3",
 		"layoutAnalysis": "Parse figures, tables, and text",
+		"layoutTranslate": "Translate full text",
 		"pdfParse": "Parse PDF body",
 		"parseRefs": "Parse references",
+		"openLayoutSettings": "Open analysis settings",
+		"openTranslateSettings": "Open translation settings",
 		"latexCompile": "Compile LaTeX",
+		"jevSmartHighlights": "jEV smart highlights",
 		"downloadBytes": "{{phase}} · {{downloaded}} / {{total}}",
 		"downloadBytesUnknown": "{{phase}} · {{downloaded}}",
 		"batchProgress": "{{phase}} · {{current}} / {{total}}",
@@ -258,5 +277,25 @@
 		"connector": "Saving Connector attachment",
 		"connectorComplete": "Connector attachment ready",
 		"connectorFailed": "Connector attachment failed"
+	},
+	"reminders": {
+		"dismiss": "Don't remind me again",
+		"layoutLocalModel": {
+			"title": "Layout analysis runs a local model",
+			"description": "Figures, tables, and formulas are detected on this device with a local model, which uses extra memory and CPU. Low-memory machines may feel slow — switch to a cloud provider in settings if needed.",
+			"openSettings": "Open analysis settings"
+		},
+		"networkProxy": {
+			"title": "Network request failed",
+			"description": "If access is restricted, configure a proxy in settings and try again.",
+			"openSettings": "Open network settings"
+		}
+	},
+	"plugins": {
+		"chooseDirectory": "Load plugin — allow reading the current vault",
+		"failed": "Plugin operation failed",
+		"loaded": "Development plugin loaded",
+		"commandTitle": "{{title}}",
+		"suspended": "{{name}} was stopped after repeated failures. Re-enable it in Settings."
 	}
 }

@@ -1,9 +1,11 @@
+import { useScrollCapability } from "@embedpdf/plugin-scroll/react";
 import {
 	useIsViewportGated,
 	useViewportCapability,
 	useViewportPlugin,
 	ViewportElementContext,
 } from "@embedpdf/plugin-viewport/react";
+import { useZoomCapability } from "@embedpdf/plugin-zoom/react";
 import {
 	type HTMLAttributes,
 	type ReactNode,
@@ -13,21 +15,24 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { PageTurnHandler } from "@/components/viewer/pdf/viewport/page-turn-handler";
+import { useSettings } from "@/hooks/use-app-stores";
 import { createPdfViewportResizeGate } from "@/lib/pdf/dockview-resize";
-import { registerScrollSyncElement } from "@/lib/pdf/scroll-sync";
+import { clampPageScroll } from "@/lib/pdf/page-turn";
+import {
+	getScrollSyncPartner,
+	handleScrollSyncIntent,
+	handleScrollSyncScroll,
+	handleScrollSyncScrollEnd,
+	registerScrollSyncElement,
+} from "@/lib/pdf/scroll-sync";
 import { createPdfViewportScrollScheduler } from "@/lib/pdf/viewport-scroll";
-import { isDockviewSashTarget } from "@/lib/workspace/dockview-sash";
+import { subscribeResizeGesture } from "@/lib/workspace/resize-gesture";
 
 type DockviewViewportProps = HTMLAttributes<HTMLDivElement> & {
 	children: ReactNode;
 	documentId: string;
 	hostRef: RefObject<HTMLDivElement | null>;
-	/**
-	 * Extra right padding (px) beyond the viewport gap, reserving room for
-	 * overlays pinned outside the page's right edge (comment rail) so they do
-	 * not grow scrollWidth into a horizontal scrollbar.
-	 */
-	rightGutter?: number;
 };
 
 /**
@@ -41,9 +46,15 @@ export function DockviewViewport({
 	children,
 	documentId,
 	hostRef,
-	rightGutter = 0,
 	...props
 }: DockviewViewportProps) {
+	const paginated = useSettings((s) => s.pdfScrollStrategy === "paginated");
+	const paginatedRef = useRef(paginated);
+	paginatedRef.current = paginated;
+	const { provides: scrollCapability } = useScrollCapability();
+	const { provides: zoomCapability } = useZoomCapability();
+	const readingRef = useRef({ scrollCapability, zoomCapability });
+	readingRef.current = { scrollCapability, zoomCapability };
 	const [viewportGap, setViewportGap] = useState(0);
 	const viewportRef = useRef<HTMLDivElement>(null);
 	const { plugin: viewportPlugin } = useViewportPlugin();
@@ -66,17 +77,8 @@ export function DockviewViewport({
 			return;
 		}
 
-		// Dual-pane scroll sync reads / writes this element directly so the
-		// follower pane does not inherit the scroll-request pipeline's extra
-		// animation frame (and so pan-drag writes propagate immediately).
-		const unregisterScrollSyncElement = registerScrollSyncElement(
-			documentId,
-			viewport,
-		);
-
 		const ownerDocument = viewport.ownerDocument;
 		const ownerWindow = ownerDocument.defaultView;
-		const workspace = hostRef.current?.closest(".agentero-dockview") ?? null;
 		const requestFrame = (callback: FrameRequestCallback) =>
 			ownerWindow
 				? ownerWindow.requestAnimationFrame(callback)
@@ -89,22 +91,58 @@ export function DockviewViewport({
 			requestFrame,
 			cancelFrame,
 			apply: (request) => {
+				let top = request.y;
+				if (paginatedRef.current) {
+					const { scrollCapability, zoomCapability } = readingRef.current;
+					const scope = scrollCapability?.forDocument(documentId);
+					const scale = zoomCapability
+						?.forDocument(documentId)
+						.getState().currentZoomLevel;
+					const item = scope
+						?.getLayout()
+						.virtualItems.find((item) =>
+							item.pageNumbers.includes(scope.getCurrentPage()),
+						);
+					if (item && scale) {
+						const gap = parseFloat(getComputedStyle(viewport).paddingTop) || 0;
+						// Keep short pages fully visible so a hidden neighbour cannot win
+						// EmbedPDF's most-visible-page calculation after a navigation jump.
+						top = clampPageScroll(
+							{ top: item.y * scale, bottom: (item.y + item.height) * scale },
+							viewport.clientHeight - gap * 2,
+							top - gap,
+						);
+					}
+				}
 				viewport.scrollTo({
 					left: request.x,
-					top: request.y,
-					behavior: request.behavior,
+					top,
+					behavior: paginatedRef.current ? "instant" : request.behavior,
 				});
 			},
 		});
+		// Dual-pane scroll sync writes this element inside the scroll event.
+		// A scrollTo still waiting on the next frame is dropped so it cannot
+		// pull the follower back; plugin metrics stay on the frame below.
+		const unregisterScrollSyncElement = registerScrollSyncElement(
+			documentId,
+			viewport,
+			{
+				cancelPendingScroll: () => scrollScheduler.cancelPending(),
+			},
+		);
 		const commitResize = () => {
-			// Report a reduced width so EmbedPDF's fitWidth zoom leaves room for the
-			// comment rail that overflows into the reserved right gutter.
-			const width = Math.max(1, viewport.offsetWidth - rightGutter);
-			const clientWidth = Math.max(1, viewport.clientWidth - rightGutter);
+			viewport.style.setProperty(
+				"--pdf-viewport-height",
+				`${viewport.clientHeight}px`,
+			);
+			// Visibility and tiling need the entire scrollport, including any area
+			// a zoomed page occupies. The viewport reserves no side gutter, so the
+			// zoom plugin's fit-width math matches the reading surface 1:1.
 			viewportPlugin.setViewportResizeMetrics(documentId, {
-				width,
+				width: viewport.offsetWidth,
 				height: viewport.offsetHeight,
-				clientWidth,
+				clientWidth: viewport.clientWidth,
 				clientHeight: viewport.clientHeight,
 				scrollTop: viewport.scrollTop,
 				scrollLeft: viewport.scrollLeft,
@@ -119,45 +157,25 @@ export function DockviewViewport({
 			requestFrame,
 			cancelFrame,
 		});
-		let dockResizeActive = false;
 
-		const removeEndListeners = () => {
-			ownerDocument.removeEventListener("pointerup", finishResize, true);
-			ownerDocument.removeEventListener("pointercancel", finishResize, true);
-			ownerDocument.removeEventListener("contextmenu", finishResize, true);
-			ownerWindow?.removeEventListener("blur", finishResize);
-		};
-
-		const finishResize = () => {
-			if (!dockResizeActive) return;
-			dockResizeActive = false;
-			removeEndListeners();
-			resizeGate.endDockResize();
-		};
-
-		const handlePointerDown = (event: PointerEvent) => {
-			if (
-				dockResizeActive ||
-				!workspace ||
-				!isDockviewSashTarget(event.target, workspace)
-			) {
-				return;
-			}
-
-			dockResizeActive = true;
-			resizeGate.beginDockResize();
-			ownerDocument.addEventListener("pointerup", finishResize, true);
-			ownerDocument.addEventListener("pointercancel", finishResize, true);
-			ownerDocument.addEventListener("contextmenu", finishResize, true);
-			ownerWindow?.addEventListener("blur", finishResize);
-		};
+		// Gate on the shared gesture rather than on `.dv-sash` pointerdown: rail
+		// drags and native window resizes resize this viewport too, and they never
+		// produce a sash event (see `lib/workspace/resize-gesture.ts`). Subscribing
+		// by element would race the workspace's own effect — a child layout effect
+		// runs first — so this uses the order-independent fan-out.
+		const unsubscribeGesture = subscribeResizeGesture((active) => {
+			if (active) resizeGate.beginDockResize();
+			else resizeGate.endDockResize();
+		});
 
 		let scrollFrame: number | null = null;
 		const handleScroll = () => {
-			// Scroll events are not sufficient to identify user input: virtual page
-			// reordering, zoom/layout changes, and dual-pane synchronization all
-			// write the viewport programmatically. Only the explicit wheel precursor
-			// below cancels a deferred request.
+			// Scrollbar, keyboard, drag, and the browser's wheel. The partner is
+			// not moved here; it jumps once the gesture settles. A programmatic
+			// write also arrives here. This handler still must not cancel pending
+			// jumps: virtual-page reordering, zoom, and the jump itself all scroll
+			// programmatically. The wheel listener only claims the leader.
+			handleScrollSyncScroll(documentId);
 			if (scrollFrame != null) return;
 			scrollFrame = requestFrame(() => {
 				scrollFrame = null;
@@ -167,11 +185,28 @@ export function DockviewViewport({
 				});
 			});
 		};
+		const handleScrollEnd = () => handleScrollSyncScrollEnd(documentId);
 		viewport.addEventListener("scroll", handleScroll, { passive: true });
-		// Wheel is an unambiguous user-originated precursor to the native scroll
-		// event. Cancel here, before the native scroll event, so the deferred
-		// request cannot overwrite the user's new position.
-		const handleWheel = () => scrollScheduler.cancelPending();
+		viewport.addEventListener("scrollend", handleScrollEnd);
+		// Passive on purpose. Canceling the wheel forces this pane off the
+		// compositor. The partner is not moved until the gesture settles.
+		// Ctrl/Cmd+wheel and pinches belong to zoom. A wheel over PDF chrome,
+		// a dialog, or a field scrolls that surface.
+		const handleWheel = (event: WheelEvent) => {
+			if (event.ctrlKey || event.metaKey) return;
+			const target = event.target;
+			if (
+				target instanceof Element &&
+				target.closest(
+					"[data-pdf-chrome], [role='dialog'], textarea, input, select",
+				)
+			) {
+				return;
+			}
+			if (!getScrollSyncPartner(documentId)) return;
+			handleScrollSyncIntent(documentId);
+			scrollScheduler.cancelPending();
+		};
 		viewport.addEventListener("wheel", handleWheel, {
 			capture: true,
 			passive: true,
@@ -189,22 +224,20 @@ export function DockviewViewport({
 				scrollScheduler.schedule({ x, y, behavior }),
 		);
 
-		ownerDocument.addEventListener("pointerdown", handlePointerDown, true);
 		return () => {
-			ownerDocument.removeEventListener("pointerdown", handlePointerDown, true);
-			removeEndListeners();
-			dockResizeActive = false;
+			unsubscribeGesture();
 			resizeGate.dispose();
 			resizeObserver.disconnect();
 			if (scrollFrame != null) cancelFrame(scrollFrame);
 			scrollScheduler.dispose();
 			viewport.removeEventListener("scroll", handleScroll);
+			viewport.removeEventListener("scrollend", handleScrollEnd);
 			viewport.removeEventListener("wheel", handleWheel, true);
 			unsubscribeScrollRequest();
 			unregisterScrollSyncElement();
 			viewportPlugin.unregisterViewport(documentId);
 		};
-	}, [documentId, hostRef, viewportPlugin, rightGutter]);
+	}, [documentId, viewportPlugin]);
 
 	const { style, ...restProps } = props;
 
@@ -215,22 +248,34 @@ export function DockviewViewport({
 			<div
 				{...restProps}
 				ref={viewportRef}
+				data-pdf-viewport
+				tabIndex={paginated ? 0 : -1}
 				style={{
 					width: "100%",
 					height: "100%",
 					overflow: "auto",
 					...style,
+					...(paginated ? { overflowY: "hidden" as const } : {}),
 					// Scroller swaps virtualized page nodes while scrolling. Letting
 					// Chromium's scroll anchoring adjust this custom virtual viewport can
 					// move it to an endpoint when the rendered range changes.
 					overflowAnchor: "none",
+					// FitWidth derives the zoom from clientWidth. A scrollbar that
+					// appears with the first page layout would shrink that width and
+					// re-fit the document one step smaller; reserve the gutter so the
+					// auto zoom does not flip between two percentages on open.
+					scrollbarGutter: "stable",
 					padding: `${viewportGap}px`,
-					// The shorthand above would clobber a caller's paddingRight; merge
-					// the reserved rail gutter explicitly.
-					paddingRight: `${viewportGap + rightGutter}px`,
 				}}
 			>
 				{!isGated && children}
+				{!isGated && <PageTurnHandler documentId={documentId} />}
+				{paginated && (
+					<div
+						aria-hidden
+						style={{ height: "var(--pdf-viewport-height, 0px)" }}
+					/>
+				)}
 			</div>
 		</ViewportElementContext.Provider>
 	);

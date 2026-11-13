@@ -1,4 +1,4 @@
-import { ChevronDown, Minus, Plus } from "lucide-react";
+import { ChevronDown, MessageSquare, Quote } from "lucide-react";
 import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
@@ -17,13 +17,25 @@ import { cn } from "@/lib/core/utils";
 interface TextEditorToolbarProps {
 	fontSize: TextEditorFontSize;
 	onFontSizeChange: (size: TextEditorFontSize) => void;
+	/** TeX-only actions; null hides the citation entry. */
+	texTools?: {
+		onCitation: () => void;
+	} | null;
+	review?: {
+		open: boolean;
+		count: number;
+		onToggle: () => void;
+	} | null;
 }
 
 export function TextEditorToolbar({
 	fontSize,
 	onFontSizeChange,
+	texTools,
+	review,
 }: TextEditorToolbarProps) {
 	const { t } = useTranslation("settings");
+	const { t: tx } = useTranslation("latexLanguage");
 	const [open, setOpen] = useState(false);
 	const triggerRef = useRef<HTMLButtonElement>(null);
 
@@ -35,22 +47,8 @@ export function TextEditorToolbar({
 		[onFontSizeChange],
 	);
 
-	const increment = useCallback(() => {
-		const idx = FONT_SIZES.indexOf(fontSize);
-		if (idx < FONT_SIZES.length - 1) {
-			onFontSizeChange(FONT_SIZES[idx + 1]);
-		}
-	}, [fontSize, onFontSizeChange]);
-
-	const decrement = useCallback(() => {
-		const idx = FONT_SIZES.indexOf(fontSize);
-		if (idx > 0) {
-			onFontSizeChange(FONT_SIZES[idx - 1]);
-		}
-	}, [fontSize, onFontSizeChange]);
-
 	return (
-		<div className="pointer-events-none absolute top-2 right-3 z-20 flex origin-top-right items-center gap-1 opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100">
+		<div className="absolute top-2 right-3 z-20 flex items-center gap-1">
 			<div
 				data-text-editor-chrome
 				className={cn(
@@ -58,36 +56,50 @@ export function TextEditorToolbar({
 					PDF_CHROME_CHIP,
 				)}
 			>
-				<Button
-					type="button"
-					size="icon-xs"
-					variant="ghost"
-					className="shrink-0 self-center"
-					aria-label={t("appearance.fontSize.decrease")}
-					disabled={fontSize <= FONT_SIZES[0]}
-					onClick={decrement}
-				>
-					<Minus className="size-3.5" aria-hidden />
-				</Button>
-
+				{texTools ? (
+					<Button
+						type="button"
+						size="xs"
+						variant="ghost"
+						className="shrink-0 self-center whitespace-nowrap"
+						onClick={texTools.onCitation}
+					>
+						<Quote className="size-3.5" aria-hidden />
+						{tx("insertCitation")}
+					</Button>
+				) : null}
+				{review ? (
+					<Button
+						type="button"
+						size="xs"
+						variant={review.open ? "secondary" : "ghost"}
+						className="flex h-5 gap-1 self-center whitespace-nowrap px-1.5 text-xs"
+						aria-pressed={review.open}
+						aria-label={tx("review")}
+						onClick={review.onToggle}
+					>
+						<MessageSquare className="size-3.5" aria-hidden />
+						{review.count > 0 ? <span>{review.count}</span> : null}
+					</Button>
+				) : null}
 				<Popover open={open} onOpenChange={setOpen}>
 					<PopoverTrigger asChild>
 						<Button
 							type="button"
 							size="xs"
 							variant="ghost"
-							className="flex h-5 min-w-7 gap-0.5 self-center whitespace-nowrap px-1.5 text-xs"
+							className="flex h-5 gap-1 self-center whitespace-nowrap px-1.5 text-xs"
 							ref={triggerRef}
 							aria-label={t("appearance.fontSize.select")}
 						>
-							<span>{fontSize}</span>
+							<span>{fontSize}px</span>
 							<ChevronDown className="size-3" aria-hidden />
 						</Button>
 					</PopoverTrigger>
 					<PopoverContent
 						side="bottom"
 						align="end"
-						className="w-auto p-1"
+						className="w-auto p-1.5"
 						onOpenAutoFocus={(e) => e.preventDefault()}
 					>
 						<div className="flex flex-col gap-0.5">
@@ -112,18 +124,6 @@ export function TextEditorToolbar({
 						</div>
 					</PopoverContent>
 				</Popover>
-
-				<Button
-					type="button"
-					size="icon-xs"
-					variant="ghost"
-					className="shrink-0 self-center"
-					aria-label={t("appearance.fontSize.increase")}
-					disabled={fontSize >= FONT_SIZES[FONT_SIZES.length - 1]}
-					onClick={increment}
-				>
-					<Plus className="size-3.5" aria-hidden />
-				</Button>
 			</div>
 		</div>
 	);

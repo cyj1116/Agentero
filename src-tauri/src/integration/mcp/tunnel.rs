@@ -8,6 +8,7 @@
 use crate::core::http::effective_proxy_url;
 use crate::core::paths::mcp_tunnel_dir;
 use crate::core::process::discover::resolve_command;
+use crate::core::process::SanitizeAppImageEnv;
 use serde::Serialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::process::Command;
 
-/// Event name follows `docs/development/lifecycle-events.md` (one domain, one colon).
+/// Event name follows `docs/architecture.md` (one domain, one colon).
 pub const MCP_TUNNEL_STATUS_EVENT: &str = "mcp:tunnel-status";
 
 pub const TUNNEL_CLIENT_BIN: &str = "tunnel-client";
@@ -67,7 +68,7 @@ struct Inner {
     pid: Option<u32>,
     mcp_url: Option<String>,
     last_error: Option<String>,
-    child: Option<Arc<tokio::sync::Mutex<tokio::process::Child>>>,
+    child: Option<Arc<tokio::sync::Mutex<crate::core::process::ProcessTree>>>,
     /// Bumped on every start so poller/waiter tasks from a superseded run
     /// (e.g. an MCP port change) can retire instead of resurrecting the old one.
     generation: u64,
@@ -379,18 +380,14 @@ impl McpTunnelController {
             .env("CONTROL_PLANE_API_KEY", &api_key)
             .env("NO_PROXY", "127.0.0.1,localhost")
             .env_remove("HTTP_PROXY")
-            .env_remove("HTTPS_PROXY")
-            .kill_on_drop(true);
+            .env_remove("HTTPS_PROXY");
         if let Some(url) = proxy.as_deref() {
             cmd.env("AGENTERO_TUNNEL_PROXY", url);
         }
-        #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
+        cmd.sanitize_appimage_env();
+        crate::core::process::hide_console_window_tokio(&mut cmd);
 
-        let child = match cmd.spawn() {
+        let child = match crate::core::process::ProcessTree::spawn(&mut cmd) {
             Ok(child) => child,
             Err(e) => {
                 log::warn!(
@@ -664,14 +661,16 @@ async fn probe_ready(binary: &Path, url_file: &Path, pid: u32) -> (bool, Option<
     }
     let mut cmd = Command::new(binary);
     cmd.args(health_args(url_file, pid)).stdin(Stdio::null());
+    cmd.sanitize_appimage_env();
     // `tunnel-client` is a console binary on Windows; without this flag every
     // keepalive probe flashes a console window on the GUI host.
-    #[cfg(windows)]
+    crate::core::process::hide_console_window_tokio(&mut cmd);
+    let out = match tokio::time::timeout(
+        PROBE_TIMEOUT,
+        crate::core::process::command_output(&mut cmd),
+    )
+    .await
     {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let out = match tokio::time::timeout(PROBE_TIMEOUT, cmd.output()).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => return (false, Some(format!("health probe failed: {e}"))),
         Err(_) => return (false, Some("health probe timed out".to_string())),
@@ -712,16 +711,18 @@ fn poll_error(value: &Value) -> Option<String> {
 async fn list_tunnel_processes() -> Option<String> {
     const LIST_SCRIPT: &str = "Get-CimInstance Win32_Process -Filter \"Name='tunnel-client.exe'\" \
          | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress";
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = Command::new("powershell");
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", LIST_SCRIPT])
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW);
-    let out = tokio::time::timeout(Duration::from_secs(15), cmd.output())
-        .await
-        .ok()?
-        .ok()?;
+        .stderr(Stdio::null());
+    crate::core::process::hide_console_window_tokio(&mut cmd);
+    let out = tokio::time::timeout(
+        Duration::from_secs(15),
+        crate::core::process::command_output(&mut cmd),
+    )
+    .await
+    .ok()?
+    .ok()?;
     String::from_utf8(out.stdout).ok()
 }
 
@@ -732,7 +733,7 @@ fn kill_by_pid(pid: u32) {
     #[cfg(windows)]
     let mut cmd = {
         let mut cmd = std::process::Command::new("taskkill");
-        cmd.args(["/F", "/PID", &pid.to_string()]);
+        cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
         cmd
     };
     #[cfg(not(windows))]
@@ -744,12 +745,7 @@ fn kill_by_pid(pid: u32) {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    crate::core::process::hide_console_window(&mut cmd);
     let _ = cmd.output();
 }
 

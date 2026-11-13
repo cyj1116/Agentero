@@ -161,6 +161,8 @@ mod tests {
             pdf_url: None,
             html_url: None,
             source_url: None,
+            code_repo: None,
+            openreview_url: None,
             body_source: None,
             body_quality: None,
             bibtex_key: None,
@@ -173,6 +175,7 @@ mod tests {
             is_read: false,
             zotero_item_id: None,
             zotero_last_synced: None,
+            custom_props: Default::default(),
             added_at: "t".into(),
             updated_at: "t".into(),
         }

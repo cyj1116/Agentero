@@ -34,14 +34,19 @@ pub fn skill_mention_style(template: &AgentTemplate) -> SkillMentionStyle {
         AgentTemplate::ClaudeAcp
         | AgentTemplate::AntigravityAcp
         | AgentTemplate::Opencode
-        | AgentTemplate::OpenClaw
         | AgentTemplate::Hermes
+        | AgentTemplate::CursorAgent
         | AgentTemplate::QoderCli
+        | AgentTemplate::QoderCn
         | AgentTemplate::GrokBuild
         | AgentTemplate::Dsh
         | AgentTemplate::KimiCode
         | AgentTemplate::Zcode
         | AgentTemplate::MinimaxCode
+        | AgentTemplate::MimoCode
+        | AgentTemplate::Codebuddy
+        // Built-in Zhihu agent has no skill mechanism at all.
+        | AgentTemplate::Zhihu
         | AgentTemplate::Custom => SkillMentionStyle::Slash,
     }
 }

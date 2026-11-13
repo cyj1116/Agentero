@@ -11,7 +11,7 @@ import { pathToFileURL } from "node:url";
 
 const encode = encodeURIComponent;
 
-class HttpError extends Error {
+export class HttpError extends Error {
 	constructor(label, status) {
 		// Never print signed upload URLs, response bodies or credentials.
 		super(`${label}: HTTP ${status}`);
@@ -48,6 +48,41 @@ export async function digest(stream) {
 		hash.update(chunk);
 	}
 	return { size, sha256: hash.digest("hex") };
+}
+
+// A fixed total transfer timeout kills large assets: the route to AtomGit swings
+// between ~8 MB/s and a crawl that ends in HTTP 502 after tens of minutes, so
+// any cap sized for the fast case starves the slow one (#694). Abort only when no
+// bytes move for this long instead; the job-level timeout bounds the whole run.
+const TRANSFER_STALL_TIMEOUT = 300_000;
+
+class StallError extends Error {
+	constructor() {
+		super("AtomGit transfer stalled");
+		this.name = "StallError";
+	}
+}
+
+export function stallWatchdog(timeout = TRANSFER_STALL_TIMEOUT) {
+	const controller = new AbortController();
+	let timer;
+	const progress = () => {
+		clearTimeout(timer);
+		timer = setTimeout(() => controller.abort(new StallError()), timeout);
+	};
+	progress();
+	return {
+		signal: controller.signal,
+		progress,
+		stop: () => clearTimeout(timer),
+	};
+}
+
+async function* trackProgress(source, progress) {
+	for await (const chunk of source) {
+		progress();
+		yield chunk;
+	}
 }
 
 export function selectRelease(releases, tag) {
@@ -126,19 +161,24 @@ export class AtomGit {
 	async remoteDigest(tag, name, registering = false) {
 		console.log(`Checking AtomGit bytes: ${name}`);
 		return retry(async () => {
-			const response = await this.request(
-				`${this.base}/releases/${encode(tag)}/attach_files/${encode(name)}/download`,
-				{
-					headers: { Authorization: `Bearer ${this.token}` },
-					signal: AbortSignal.timeout(600_000),
-				},
-			);
-			if (registering && [400, 404].includes(response.status)) {
-				throw new Error("AtomGit attachment is not downloadable yet");
+			const watchdog = stallWatchdog();
+			try {
+				const response = await this.request(
+					`${this.base}/releases/${encode(tag)}/attach_files/${encode(name)}/download`,
+					{
+						headers: { Authorization: `Bearer ${this.token}` },
+						signal: watchdog.signal,
+					},
+				);
+				if (registering && [400, 404].includes(response.status)) {
+					throw new Error("AtomGit attachment is not downloadable yet");
+				}
+				if (!response.ok)
+					throw new HttpError("AtomGit download", response.status);
+				return await digest(trackProgress(response.body, watchdog.progress));
+			} finally {
+				watchdog.stop();
 			}
-			if (!response.ok)
-				throw new HttpError("AtomGit download", response.status);
-			return digest(response.body);
 		});
 	}
 
@@ -170,25 +210,33 @@ export class AtomGit {
 			const info = await this.api(
 				`/releases/${encode(tag)}/upload_url?file_name=${encode(asset.name)}`,
 			);
-			if (new URL(info.url).protocol !== "https:" || !info.headers) {
+			const target = new URL(info.url);
+			if (target.protocol !== "https:" || !info.headers) {
 				throw new Error("Invalid AtomGit upload response");
 			}
 			const stream = createReadStream(file);
-			console.log(`Uploading: ${asset.name} (${expected.size} bytes)`);
+			// Host only: the signed path and query are credentials. Naming the
+			// host is what tells us whether the pinned edge carries the bulk
+			// bytes or only the API calls.
+			console.log(
+				`Uploading: ${asset.name} (${expected.size} bytes) via ${target.host}`,
+			);
+			const watchdog = stallWatchdog();
 			try {
 				const response = await this.request(info.url, {
 					method: "PUT",
 					// Only OBS-provided headers go to the signed URL, never our PAT.
 					headers: { "Content-Length": String(expected.size), ...info.headers },
-					body: stream,
+					body: trackProgress(stream, watchdog.progress),
 					duplex: "half",
 					redirect: "error",
-					signal: AbortSignal.timeout(600_000),
+					signal: watchdog.signal,
 				});
 				await response.body?.cancel();
 				if (!response.ok)
 					throw new HttpError("AtomGit upload", response.status);
 			} finally {
+				watchdog.stop();
 				stream.destroy();
 			}
 			// Upload success is not sufficient: verify registered, downloadable bytes.
@@ -203,6 +251,45 @@ export class AtomGit {
 	}
 }
 
+/**
+ * Gate a release on the tag already existing on AtomGit.
+ *
+ * AtomGit's repository mirror can lag GitHub, and unlike GitHub it does not
+ * create the tag from `target_commitish`: `POST /releases` answers an opaque
+ * HTTP 400 while the tag is absent. Poll the mirrored tag with a bounded
+ * backoff so a short lag self-heals, then fail with an actionable message
+ * instead of that 400, and reject a tag whose commit disagrees with GitHub.
+ */
+export async function waitForTag(
+	atomgit,
+	tag,
+	commit,
+	{ attempts = 5, pauseMs = 10_000, pause = sleep } = {},
+) {
+	for (let attempt = 0; ; attempt++) {
+		let target;
+		try {
+			// 5xx/408/429 retry inside `retry`; a 404 means "not mirrored yet".
+			target = await retry(() => atomgit.api(`/commits/${encode(tag)}`));
+		} catch (error) {
+			if (error?.status !== 404) throw error;
+			if (attempt >= attempts - 1) {
+				throw new Error(
+					`AtomGit has not mirrored tag ${tag}; fix the repository mirror, then rerun the sync`,
+				);
+			}
+			await pause(pauseMs * 2 ** attempt);
+			continue;
+		}
+		if (target.sha !== commit) {
+			throw new Error(
+				"AtomGit tag does not match the GitHub commit; sync repository tags first",
+			);
+		}
+		return;
+	}
+}
+
 export async function syncRelease({
 	atomgit,
 	release,
@@ -210,10 +297,15 @@ export async function syncRelease({
 	commit,
 	latestTag,
 	download,
+	waitForTag: waitForMirroredTag = waitForTag,
 }) {
 	validateAssets(assets);
 	const tag = release.tag_name;
 	const metadata = { name: release.name || tag, body: release.body || "" };
+	// Gate on the mirrored tag before creating the release: while the mirror is
+	// behind, AtomGit rejects `POST /releases` with HTTP 400 and never tells us
+	// why. Waiting here turns that into a clear, actionable failure.
+	await waitForMirroredTag(atomgit, tag, commit);
 	const existing = await atomgit.findRelease(tag);
 	if (!existing) {
 		// target_commitish must be the exact GitHub tag commit, never default main.
@@ -223,13 +315,6 @@ export async function syncRelease({
 			target_commitish: commit,
 			release_status: "pre",
 		});
-	}
-	// AtomGit may already have a tag; target_commitish does not move it.
-	const target = await retry(() => atomgit.api(`/commits/${encode(tag)}`));
-	if (target.sha !== commit) {
-		throw new Error(
-			"AtomGit tag does not match the GitHub commit; sync repository tags first",
-		);
 	}
 	for (const asset of assets) {
 		const { file, expected, cleanup } = await download(asset);

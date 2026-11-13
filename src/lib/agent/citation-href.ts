@@ -30,17 +30,43 @@ export function splitCitationHref(href: string): {
 	return { path: trimmed.slice(0, idx), fragment: trimmed.slice(idx + 1) };
 }
 
-/** Strip zero-width / BOM noise that paste or LLM output often leaves on URLs. */
+/** Decode one path or fragment piece. Invalid `%` sequences stay as written. */
+function decodeCitationPiece(value: string): string {
+	if (!value.includes("%")) return value;
+	// Decode per segment so one bad `%` does not keep the rest encoded.
+	return value
+		.split("/")
+		.map((segment) => {
+			if (!segment.includes("%")) return segment;
+			try {
+				return decodeURIComponent(segment);
+			} catch {
+				return segment;
+			}
+		})
+		.join("/");
+}
+
+/**
+ * Strip render noise, then URL-decode vault paths.
+ *
+ * Streamdown's rehype-harden rewrites relative hrefs through `URL`, which
+ * percent-encodes spaces (`Quantum Error` → `Quantum%20Error`). A click must
+ * decode before the vault lookup, or the file is missing and the PDF preview
+ * reports an unreadable type. `http(s)` (and other schemes) are left encoded.
+ */
 export function cleanCitationHref(href: string): string {
-	return (
-		href
-			.trim()
-			.replace(/^<|>$/g, "")
-			.replace(/[\u200B-\u200D\uFEFF]/g, "")
-			// Streamdown's rehype-harden only treats paths starting with `/` `./` `../`
-			// as relative; we may prefix `./` for rendering — strip it before jumps.
-			.replace(/^\.\//, "")
-	);
+	const stripped = href
+		.trim()
+		.replace(/^<|>$/g, "")
+		.replace(/[\u200B-\u200D\uFEFF]/g, "")
+		// Streamdown's rehype-harden only treats paths starting with `/` `./` `../`
+		// as relative; we may prefix `./` for rendering — strip it before jumps.
+		.replace(/^\.\//, "");
+	if (/^[a-z][a-z0-9+.-]*:/i.test(stripped)) return stripped;
+	const hash = stripped.indexOf("#");
+	if (hash < 0) return decodeCitationPiece(stripped);
+	return `${decodeCitationPiece(stripped.slice(0, hash))}#${decodeCitationPiece(stripped.slice(hash + 1))}`;
 }
 
 /**
@@ -51,9 +77,24 @@ export function isAgentCitationHref(href: string): boolean {
 	const { path, fragment } = splitCitationHref(cleanCitationHref(href));
 	if (!path || !fragment) return false;
 	if (/^https?:\/\//i.test(path)) return false;
+	if (/\.pdf$/i.test(path) && /^\d+(?:\.\d+)*(?:#p[1-9]\d*)?$/.test(fragment))
+		return true;
 	const key = fragment.split("=", 1)[0]?.trim().toLowerCase();
 	if (!key || !CITATION_FRAGMENT_KEYS.has(key)) return false;
 	return path.includes("/") || /\.(pdf|tex|ltx|md)$/i.test(path);
+}
+
+/**
+ * Vault PDF path, with or without a citation fragment.
+ *
+ * A bare `.pdf` href is not a citation jump, but it must not go through
+ * Markdown link resolution: after `%20` is decoded, that parser keeps only
+ * the first word (`papers/Quantum`) and opens a note.
+ */
+export function isVaultPdfHref(href: string): boolean {
+	const { path } = splitCitationHref(cleanCitationHref(href));
+	if (!path || /^[a-z][a-z0-9+.-]*:/i.test(path)) return false;
+	return /\.pdf$/i.test(path);
 }
 
 /**
@@ -67,10 +108,9 @@ export function citationHrefFromWikiParts(
 	if (!path?.trim()) return null;
 	if (fragment?.kind !== "heading" || !fragment.path?.length) return null;
 	const frag = fragment.path.join("#");
-	const key = frag.split("=", 1)[0]?.trim().toLowerCase();
-	if (!key || !CITATION_FRAGMENT_KEYS.has(key)) return null;
 	const clean = path.replace(/\\/g, "/").replace(/^\/+/, "");
-	return `${clean}#${frag}`;
+	const href = `${clean}#${frag}`;
+	return isAgentCitationHref(href) ? href : null;
 }
 
 /**

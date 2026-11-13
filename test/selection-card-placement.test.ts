@@ -1,8 +1,11 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import {
 	SELECTION_CARD_EDGE as EDGE,
 	placeSelectionCard,
+	SelectionCard,
 } from "@/components/viewer/pdf/cards/selection-card";
 
 /**
@@ -11,6 +14,25 @@ import {
  */
 const VW = 1200;
 const VH = 800;
+
+describe("SelectionCard UI size", () => {
+	it("keeps floating controls at a fixed UI size", () => {
+		const html = renderToStaticMarkup(
+			createElement(SelectionCard, {
+				screen: { x: 100, y: 100 },
+				width: 360,
+				height: 360,
+				lockHeight: true,
+				title: "Selection test",
+				// biome-ignore lint/correctness/noChildrenProp: Typed createElement requires SelectionCard's children prop in this non-JSX test.
+				children: "Popup content",
+			}),
+		);
+
+		expect(html).toContain("width:360px");
+		expect(html).toContain("height:360px");
+	});
+});
 
 describe("placeSelectionCard", () => {
 	it("keeps the card fully inside the viewport near the bottom-right", () => {
@@ -183,5 +205,47 @@ describe("placeSelectionCard", () => {
 		expect(mid.top).toBeLessThanOrEqual(planned.top + 1);
 		expect(mid.top + mid.maxHeight).toBeLessThanOrEqual(VH - EDGE + 0.5);
 		expect(lower.top + lower.maxHeight).toBeLessThanOrEqual(VH - EDGE + 0.5);
+	});
+});
+
+describe("placeSelectionCard with a selection box", () => {
+	const bounds = { left: 100, top: 400, right: 500, bottom: 440 };
+
+	it("opens above the selected lines instead of covering them", () => {
+		const { top } = placeSelectionCard(
+			{ x: 300, y: bounds.top, selectionBounds: bounds },
+			{ width: 340, height: 480, trackPin: true, contentHeight: 200 },
+		);
+
+		expect(top + 200).toBeLessThanOrEqual(bounds.top);
+	});
+
+	it("flips below when the selection sits near the top edge", () => {
+		const { top } = placeSelectionCard(
+			{
+				x: 300,
+				y: 20,
+				selectionBounds: { left: 100, top: 20, right: 500, bottom: 60 },
+			},
+			{ width: 340, height: 480, trackPin: true, contentHeight: 200 },
+		);
+
+		expect(top).toBeGreaterThanOrEqual(60);
+	});
+
+	it("opens below when preferBelow is set for translation cards", () => {
+		const { top, maxHeight } = placeSelectionCard(
+			{ x: 300, y: bounds.top, selectionBounds: bounds },
+			{
+				width: 340,
+				height: 480,
+				trackPin: true,
+				contentHeight: 200,
+				preferBelow: true,
+			},
+		);
+
+		expect(top).toBeGreaterThanOrEqual(bounds.bottom);
+		expect(maxHeight).toBeGreaterThan(0);
 	});
 });

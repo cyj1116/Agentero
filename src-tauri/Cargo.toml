@@ -1,6 +1,6 @@
 [package]
 name = "agentero"
-version = "0.11.4"
+version = "0.16.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -22,6 +22,7 @@ path = "src/main.rs"
 required-features = ["desktop"]
 
 [features]
+bindings-export = ["desktop"]
 default = ["desktop"]
 desktop = [
   "dep:agent-client-protocol",
@@ -31,23 +32,31 @@ desktop = [
   "dep:tauri-plugin-dialog",
   "dep:tauri-plugin-fs",
   "dep:tauri-plugin-log",
+  "dep:fern",
   "dep:tauri-plugin-opener",
-  "dep:tauri-plugin-shell",
-  "dep:tauri-plugin-store",
   "dep:tauri-plugin-updater",
   "dep:tauri-plugin-process",
   "dep:tauri-plugin-single-instance",
+  "dep:tauri-plugin-window-state",
+	"dep:tauri-plugin-better-auth",
   "dep:tauri-specta",
   "dep:specta-typescript",
   "dep:posthog-rs",
   "dep:rmcp",
+  "dep:agentero-mcp",
   "dep:schemars",
+  "dep:rtex-core",
+  "dep:agentero-plugin-host",
 ]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
+# Redirects the XDG dirs to a temp dir before unit tests start (lib.rs).
+ctor = "0.8"
+# In-memory MCP protocol tests; no listener or permanent service.
+rmcp = { version = "3.1", default-features = false, features = ["client", "transport-io"] }
 # `start_paused` virtual clock for stream coalescer / throttle unit tests.
 tokio = { workspace = true, features = ["test-util", "macros"] }
 
@@ -57,16 +66,16 @@ tempfile = { workspace = true }
 # Tauri-independent foundations (errors, fs, http, paths, sqlite, usage log),
 # re-exported as `crate::core::*`. Must stay free of tauri/wry/tao.
 agentero-core = { path = "../crates/agentero-core" }
+agentero-mcp = { path = "../crates/agentero-mcp", optional = true }
 tauri = { version = "2", features = [], optional = true }
 tauri-plugin-opener = { version = "2", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri-plugin-fs = { version = "2.5.1", optional = true }
-tauri-plugin-shell = { version = "2.3.5", optional = true }
-tauri-plugin-store = { version = "2.4.3", optional = true }
 tauri-plugin-dialog = { version = "2.7.1", optional = true }
 tauri-plugin-deep-link = { version = "2.4.9", optional = true }
-agent-client-protocol = { version = "1.2.0", features = ["unstable_elicitation"], optional = true }
+# session/load replay relies on the SDK's notification/response ordering.
+agent-client-protocol = { version = "1.3.0", features = ["unstable_elicitation"], optional = true }
 tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "time", "process", "io-util", "net"] }
 # Per-job CancellationToken for the JobCenter cancel path (no global flag state).
 tokio-util = { version = "0.7", default-features = false }
@@ -76,22 +85,28 @@ rmcp = { version = "3.1", optional = true, default-features = false, features = 
   "server",
   "macros",
   "schemars",
+  "transport-io",
   "transport-streamable-http-server",
 ] }
 schemars = { version = "1", optional = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = { workspace = true }
 which = "7"
-rusqlite = { version = "0.32", features = ["bundled"] }
+semver = "1"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "socks", "multipart", "cookies"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 flate2 = "1.1.9"
+# Read Dsh's existing compressed transcripts when its ACP bridge cannot replay them.
+zstd = { version = "0.14.3", default-features = false }
 tar = "0.4.46"
-zip = { version = "2.4", default-features = false, features = ["deflate"] }
+# 9.0.5+ fixes the zip-cloaking and symlink extraction advisories (GHSA-m665-v7pm-7grj).
+zip = { version = "9.1", default-features = false, features = ["deflate"] }
 htmd = "0.5.4"
 notify-debouncer-full = "0.3"
 log = { workspace = true }
 tauri-plugin-log = { version = "2.9.0", optional = true }
+fern = { version = "0.7.1", optional = true }
 async-trait = "0.1.91"
 sha2 = "0.11.0"
 hex = "0.4.3"
@@ -104,38 +119,37 @@ os_info = "3"
 crypto_box = "0.9"
 ed25519-dalek = "2"
 # Used by lookup batch import (all platforms); also needed by Unix remote vault.
-futures-util = "0.3.33"
+futures-util = { version = "0.3.33", features = ["sink"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tauri-specta = { version = "2.0.0-rc.25", features = ["derive", "typescript"], optional = true }
 specta = { version = "2.0.0-rc.22", features = ["derive", "chrono"] }
 specta-typescript = { version = "0.0.12", optional = true }
 fontdb = "0.23"
+# Local CSL formatting for the Word integration; permissively licensed engine.
+hayagriva = { version = "0.10.1", default-features = false, features = ["archive", "csl-json"] }
 
 # Updates and process relaunch are desktop-only. Mobile distribution is owned by
 # its app stores, not the in-app updater.
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-tauri-plugin-updater = { version = "2", optional = true }
+tauri-plugin-better-auth = { version = "=0.1.2", optional = true }
+agentero-plugin-host = { path = "../crates/agentero-plugin-host", optional = true }
+# Real-time LuaLaTeX preview. In-process (no sidecar): the desktop host owns
+# one session per project root; mobile has no local lualatex and gates it off.
+rtex-core = { git = "https://github.com/HenryXiaoYang/realtime-tex", tag = "v0.0.6", optional = true }
+tauri-plugin-updater = { version = "2.14.1", optional = true }
 tauri-plugin-process = { version = "2", optional = true }
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"], optional = true }
+tauri-plugin-window-state = { version = "2", optional = true }
 # Blocking client: telemetry flush happens in the synchronous RunEvent::Exit callback.
 posthog-rs = { version = "0.23", default-features = false, optional = true }
-
-# LiteParse relies on a desktop PDFium binary. Mobile (iOS/Android) uses the
-# paired desktop Host for PDF parsing instead of packaging PDFium in the app.
-# Keep this cfg in sync with the gates in src/features/import/pdf_parse/mod.rs
-# — desktop (incl. Windows) needs it.
-[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
-liteparse = "2.13"
-# The PDFium binding liteparse itself sits on (shared dylib, one global loader).
-# `features/pdf_locate` uses the text engine directly for quote → page rects,
-# bypassing liteparse's layout pass.
-liteparse-pdfium = "1.7"
-
 
 [target.'cfg(target_os = "ios")'.dependencies]
 security-framework = "3.7"
 security-framework-sys = "2.17"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWindow"] }
 
 # openssh / sendfd are Unix-only (ControlMaster fd passing). Remote vault SFTP
 # is therefore unavailable on Windows until a portable backend lands.
@@ -147,3 +161,12 @@ openssh-sftp-client = { version = "0.15.7", features = ["openssh"] }
 # new terminals can run `agentero-cli` without manual setup.
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+roxmltree = "0.20"
+# Match the WebView2 interface versions used by Tauri/Wry.
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Diagnostics_ToolHelp", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+
+[[example]]
+name = "export_bindings"
+required-features = ["bindings-export"]

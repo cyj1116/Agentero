@@ -27,12 +27,14 @@ import {
 	pinObscuresBodyText,
 	type SelectionPin,
 } from "@/lib/pdf/selection";
+import type { PdfTranslateRecord } from "@/lib/pdf/translate/types";
 
 export type MarksIndexInput = {
 	highlights: PdfHighlight[];
 	/** Annotation id → normalized rect, for gutter-pin placement. */
 	highlightAnchors: ReadonlyMap<string, NormalizedRect>;
 	askPinAnchors: AskPinAnchor[];
+	translates: PdfTranslateRecord[];
 	visualTraces: PdfVisualSessionTrace[];
 	/** 0-based page index → normalized text rects (missing while unloaded). */
 	pageTextMap: ReadonlyMap<number, NormalizedRect[]>;
@@ -51,6 +53,7 @@ export function buildMarksIndex({
 	highlights,
 	highlightAnchors,
 	askPinAnchors,
+	translates,
 	visualTraces,
 	pageTextMap,
 	paperTitle,
@@ -77,6 +80,9 @@ export function buildMarksIndex({
 			comment,
 			color: normalizeHighlightColor(highlight.color),
 			kind: "highlight",
+			...(highlight.translatedRects?.length
+				? { translatedRects: highlight.translatedRects }
+				: {}),
 			linkAlias:
 				annotationWikilinkAlias(
 					paperTitle,
@@ -99,14 +105,37 @@ export function buildMarksIndex({
 			ended: anchor.ended,
 			overText: pinObscuresBodyText(pin, pageText),
 			side: pin.side,
+			rects: anchor.rects,
+			...(anchor.translatedRects?.length
+				? { translatedRects: anchor.translatedRects }
+				: {}),
+		});
+	}
+	for (const translate of translates) {
+		if (!translate.pinned || translate.rects.length === 0) continue;
+		const pageText = pageTextMap.get(translate.page - 1);
+		const pin = pinFromRects(translate.rects, pageText);
+		const preview = (translate.quote || translate.result || "")
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, 96);
+		add(translate.page, {
+			id: translate.id,
+			kind: "translate",
+			x: pin.x,
+			y: pin.y,
+			preview,
+			overText: pinObscuresBodyText(pin, pageText),
+			side: pin.side,
 		});
 	}
 	for (const trace of visualTraces) {
 		const hasAgent = Boolean(trace.agent);
 		const hasComment = trace.comment.trim().length > 0;
-		// Keep fresh crops reachable after the editor blurs so their add-to-chat
-		// action does not disappear. Agent-only marks use the conversation pin.
-		if (hasComment || !hasAgent) {
+		// Empty crops are in-progress drafts. The open editor injects its own
+		// card; blur / outside click / Escape drops them. Agent-only marks use
+		// the conversation pin instead of an empty comment card.
+		if (hasComment) {
 			const entry: PageAnnotationComment = {
 				id: trace.id,
 				pageIndex: trace.page - 1,
@@ -154,4 +183,52 @@ export function buildMarksIndex({
 		}
 	}
 	return { pinsByPage: pins, commentsByPage: comments };
+}
+
+/**
+ * While a translation is showing, a note that recorded the translated
+ * selection anchors to those boxes. English glyph boxes stay in place for the
+ * original page.
+ */
+export function commentForVisibleTranslation(
+	comment: PageAnnotationComment,
+	translationVisible: boolean,
+): PageAnnotationComment {
+	const rects = comment.translatedRects;
+	if (!translationVisible || !rects?.length) return comment;
+	let anchorY = rects[0]?.y ?? comment.anchorY;
+	for (const rect of rects) anchorY = Math.min(anchorY, rect.y);
+	return { ...comment, rects, anchorY };
+}
+
+/**
+ * Boxes for a quick-chat highlight. Translation mode uses the boxes the reader
+ * selected on the overlay; otherwise the English glyph boxes.
+ */
+export function askHighlightRects(
+	anchor: {
+		rects?: readonly NormalizedRect[] | null;
+		translatedRects?: readonly NormalizedRect[] | null;
+	},
+	translationVisible: boolean,
+): readonly NormalizedRect[] {
+	if (translationVisible && anchor.translatedRects?.length) {
+		return anchor.translatedRects;
+	}
+	return anchor.rects ?? [];
+}
+
+/**
+ * Move an ask gutter pin next to the translated selection while that
+ * translation is showing. English pin geometry is unchanged.
+ */
+export function selectionPinForVisibleTranslation(
+	pin: SelectionPin,
+	translationVisible: boolean,
+): SelectionPin {
+	const rects = pin.translatedRects;
+	if (pin.kind !== "ask" || !translationVisible || !rects?.length) return pin;
+	let y = rects[0]?.y ?? pin.y;
+	for (const rect of rects) y = Math.min(y, rect.y);
+	return y === pin.y ? pin : { ...pin, y };
 }

@@ -25,8 +25,9 @@ Agentero Host 端（`src-tauri/src/features/`）在论文识别、入库、引�
 | **medRxiv** | `GET https://api.biorxiv.org/details/medrxiv/{doi}` | DOI → 医学预印本元数据 | `features/paper/scholar_api/sources/biorxiv.rs` |
 | **Zotero Recognizer** | `POST https://services.zotero.org/recognizer/recognize` | PDF 首页文字几何识别 | `features/paper/import/recognize/pdf_recognize.rs` |
 | **Translator Runtime** | `POST {base}/web`, `POST {base}/search`, `POST {base}/import` | 通用 URL/标识符/题录解析 | `features/import/mod.rs` |
-| **Cool Papers (papers.cool)** | `GET https://papers.cool/{branch}/search?query=...`, `GET https://papers.cool/{branch}/kimi?paper={id}` | Kimi 论文解析 / 广场导入 | `features/coolpapers/` |
+| **Cool Papers (papers.cool)** | `GET https://papers.cool/{branch}/search?query=...`, `GET https://papers.cool/{branch}/kimi?paper={id}` | Kimi 论文解析 / 广场导入 / CLI `paper notes fetch` | `crates/agentero-core/src/features/paper/discovery/coolpapers.rs`（桌面壳：`src-tauri/src/features/paper/discovery/coolpapers/`） |
 | **arXiv RSS** | `GET https://rss.arxiv.org/rss/{category}` | 推荐与订阅流 | `features/recommend/mod.rs`, `features/feeds/` |
+| **Papers with Code** | `GET https://paperswithcode.co/api/v1/papers/arxiv/{id}?include_resources=true` | 入库后的录用会议 / 官方代码仓库 / 引用数 / TL;DR 补全 | `crates/agentero-core/src/features/paper/discovery/pwc.rs` |
 
 ## 2. 调用链路详解
 
@@ -43,7 +44,8 @@ Agentero Host 端（`src-tauri/src/features/`）在论文识别、入库、引�
 2. **Translator Runtime**（`features/import/mod.rs::resolve_metadata`）
    - 若用户输入被识别为 arXiv id / DOI / URL，会构造 `{base}/web` 或 `{base}/search` 请求。
    - arXiv 的各类输入（`2508.05004`、`arXiv:2508.05004v2`、`https://arxiv.org/pdf/...`、`https://arxiv.org/html/...`）都会被规范化为 `https://arxiv.org/abs/{id}` 再走 `/web`。
-   - Translator 失败时按标识符类型走**直连兜底链**（`scholar_api::identifiers::fallback`，见下）。
+   - HTTP 503 与响应体里的 `error code: 1102`（Cloudflare Worker 资源上限）记为 `service_unavailable`，同一请求再试两次（400ms、800ms）后放弃这次调用。
+   - Translator 失败时按标识符类型走**直连兜底链**（`scholar_api::identifiers::fallback`，见下）。链没有命中、或链也失败时，`http(s)` URL 改为直接抓取原网页：论文页用 Highwire `citation_*`（有 DOI 再试一次直连链），普通网页用 URL、标题和 `og:` / `<title>` 元数据建成 `html` 条目。翻译服务不可用不会挡住这次导入。没有 DOI / arXiv / PMID、也不是网页的输入仍失败，错误码 `translator_unavailable`，文案带 HTTP 状态和 1102。
 3. **直连兜底链**（`features/paper/scholar_api/identifiers/fallback.rs`）
    - arXiv → `ARXIV_CHAIN` = arXiv Atom → S2 `ARXIV:{id}` → alphaXiv `/papers/v3/{id}/preview`。
    - DOI → `DOI_CHAIN` = Crossref `works/{doi}` → S2 `DOI:{doi}` → OpenAlex。
@@ -133,12 +135,13 @@ UI 刷新（`paper_resolve_identifier`）对 DOI/arXiv/URL **先走标识符解�
 
 ### 2.9 Cool Papers (papers.cool)
 
-入口：`features/coolpapers/mod.rs`。
+入口：`crates/agentero-core/src/features/paper/discovery/coolpapers.rs`（CLI 与桌面共用）；桌面页面导入与广场代理在 `src-tauri/src/features/paper/discovery/coolpapers/`。
 
 - 解析论文 URL：`https://papers.cool/{arxiv|venue}/{id}`。
 - 按标题搜索：`GET https://papers.cool/{branch}/search?query=...`。
 - 获取 Kimi 解析：`GET https://papers.cool/{branch}/kimi?paper={id}`。
 - 这是一个人工整理的学术站点，不是开放 API；解析结果写入 NOTES.md。FAQ 问题写成 `## Qn`，保留答案内 `###` 小节；丢弃末尾「想要进一步了解论文」FAQ（跳转 Kimi 网页版的推广段）。
+- 桌面 NOTES 工具栏与 CLI `agentero paper notes fetch <ref>` 走同一函数；`/kimi` 串行（并发 1），避免消耗上游 LLM 配额。
 
 ### 2.10 PDF / TeX 资产下载
 
@@ -156,6 +159,21 @@ UI 刷新（`paper_resolve_identifier`）对 DOI/arXiv/URL **先走标识符解�
 - **bioRxiv / medRxiv**：共用 `biorxiv.rs`，实现 `AcademicApi`，仅支持 `FETCH_BY_DOI`（上游 API 无 title 搜索端点）。请求 `https://api.biorxiv.org/details/{server}/{doi}`，解析 title、authors、date、abstract，并构造 `.full.pdf` 直链。
 - PMID 在 `scholar_api::identifiers::resolver` 中已有识别器，现在为其补充 PubMed `efetch` 直连 fallback（`scholar_api::identifiers::fallback::fetch_pubmed_metadata`）；Translator 失败时可直接从 NCBI 拉取。
 
+### 2.12 Papers with Code 入库补全
+
+入口：`crates/agentero-core/src/features/paper/discovery/pwc.rs`；调用点 `paper_import::paper_commit` 与识别任务落盘之后（`src-tauri/src/features/paper/import/job_runners.rs`）。
+
+- 触发条件：catalog 行有 `arxiv_id`。`spawn_enrich` 用 `tokio::spawn` 脱钩，**入库不等待网络**；失败只记 debug 日志。
+- 请求 `GET /api/v1/papers/arxiv/{id}?include_resources=true`。**必须先归一化**：上游对 `arXiv:2103.14030`、`2103.14030v2` 直接返回 `400 Invalid ArXiv ID format`。
+- 只填空字段，不覆盖任何已有值：
+  - `publication` ← `conference_name`（只有 PwC 收录了该会议某一届时才有值；这是「已录用」的确认信号）
+  - `code_repo` ← `is_official=true` 且 star 最多的仓库；`code_repo_manual=1` 时跳过
+  - `citation_count` ← 仅在为 NULL 时写入
+  - `summary` ← `tldr`
+- **不写「未录用」**：`proceeding` 的覆盖并不完整（实测 FlashAttention 为 NULL），查不到只代表「目录未收录」。
+- 限流：进程内串行，最小间隔 600 ms（≈100/min），低于目录 GET 的 120/min 上限。
+- 广场入库：`paper_pwc_import`（`src-tauri/src/features/paper/discovery/pwc/commands.rs`）按 `/paper/{id}` 取 `GET /api/v1/papers/{id}?include_resources=true`，映射为 `PaperRecord` 后走 `paper_commit`。有 arXiv 版用 arXiv id 作为文件夹（PDF/TeX 由既有资产链下载）；没有则用 `pwc-<catalog id>`，`PaperKind::Other`，保留 `url_abs` 作为 HTML 入口。
+
 ## 3. 并发与限流
 
 | 能力 | 并发控制 | 说明 |
@@ -166,19 +184,23 @@ UI 刷新（`paper_resolve_identifier`）对 DOI/arXiv/URL **先走标识符解�
 | 批量入库 | 默认 `concurrency = 5` | `LookupImportBatchArgs.concurrency` 可覆盖 |
 | 反向引用发现 | `FETCH_CONCURRENCY = 8` | 实测 8 并发比串行快约 4.6 倍 |
 | Cool Papers /kimi | `1` | 避免触发上游 LLM 配额 |
+| Papers with Code 补全 | 串行 + 600ms 间隔 | 目录 GET 限 120/min；批量入库不并发打 |
 | 通用 HTTP | `crate::core::http::client` | 共享连接池，单个请求超时 20s，PDF/TeX 下载 180s |
 
-默认所有调用均使用无 API key 的免费端点（Semantic Scholar、arXiv、Crossref、Unpaywall）；Semantic Scholar、PubMed 与 OpenAlex 额外支持可选的 BYOK 环境变量（见第 4 节）。Cool Papers 无 auth。Translator Runtime 默认使用项目托管实例 `https://translation-server.agentero.app`，用户可在设置中替换。
+默认所有调用均使用无 API key 的免费端点（Semantic Scholar、arXiv、Crossref、Unpaywall）；Semantic Scholar、PubMed 与 OpenAlex 额外支持可选的 BYOK 环境变量（见第 4 节）。Cool Papers 无 auth。Translator Runtime 在桌面端固定使用项目托管实例 `https://translation-server.agentero.app`，不读设置；CLI/远程调用可显式覆盖。
 
 ## 4. 配置与可替换项
 
 | 配置项 | 位置 | 默认值 | 说明 |
 |---|---|---|---|
-| `translatorBaseUrl` | `features/system/settings/mod.rs` | `https://translation-server.agentero.app` | 可替换为自托管 Translator Runtime |
-| `LookupImportArgs.translator_base_url` | 单次请求参数 | 空则使用设置值 | CLI/批量导入可临时覆盖 |
-| 后台 PDF 识别（RecognizeMetadata job） | `job_runners.rs` 直接读设置 `translator_base_url` | 空则用 `DEFAULT_TRANSLATOR_BASE_URL` | **不**经 IPC 入参传入（`ImportLocalPdfArgs` 无此字段） |
+| `DEFAULT_TRANSLATOR_BASE_URL` | `features/paper/import/mod.rs` | `https://translation-server.agentero.app` | 桌面端固定使用，不读 `settings.json` |
+| `LookupImportArgs.translator_base_url` | 单次请求参数 | 空则使用官方常量 | CLI / 远程调用可显式覆盖 |
+| 后台 PDF 识别（RecognizeMetadata job） | `job_runners.rs` 直接使用官方常量 | `DEFAULT_TRANSLATOR_BASE_URL` | **不**经 IPC 入参传入（`ImportLocalPdfArgs` 无此字段） |
 | `SEMANTIC_SCHOLAR_API_KEY` | 环境变量，`scholar_api/client.rs::auth_headers` 按请求读取 | 未设置 | 对 `api.semanticscholar.org` 的请求追加 `x-api-key` 头；免费 key 可将共享池限速提升至 1 req/s+ |
 | `NCBI_API_KEY` | 环境变量，`scholar_api/sources/pubmed.rs` 按请求读取 | 未设置 | esearch/efetch 追加 `api_key=` 参数；免费 key 将单 IP 限速从 3 提升到 10 req/s |
+| `institutionProxyType` | 设置项 | `auto` | 网关形态。`auto` 先按 URL 规则 + 网关根指纹 + 重写探测判定，再落到具体类型；也可指定 `ezproxy`（查询透传 `{prefix}{urlencode(target)}`，裸域名自动补 `/login?url=`）、`wengine`（网瑞达路径式 `/https/{AES-128-CTR(host)}/{path}`，浙大等）或 `subdomain`（Astraeus 子域映射 `{host 点换横线}-{port}.{gateway}`，经网关换发子域 token，见 [settings.md](settings.md)） |
+| `institutionProxyPrefix` | 设置项（`settings.json`，camelCase） | 未设置 | 机构网关地址（源站即可），如 `https://webvpn.zju.edu.cn`（wengine）。设置页提供**常见院校快速填充**（浙大 / 中科大 / 西交 / 东北大学 / 清华 / 复旦 / 北大医学部），数据在 `crates/agentero-core/src/features/paper/import/institution_proxy/presets.json`。自定义地址保留自由输入，类型为 `auto` 时自动识别。配置后 PDF 下载链在 Unpaywall 未命中时经前缀重写请求，覆盖 #654 一类"浏览器能看、直连 403"的机构订阅场景（预设表为 #677 第一期后的延续项；入口识别不等于订阅验证，#848 跟踪授权账号实测） |
+| `institutionProxyCookie` | 设置项 | 空 | 会话 Cookie。设置页打开独立 WebVPN 登录窗口后，每 2 秒检查网关 Cookie；新 Cookie 通过 10.1038/nature12373 PDF 探测后自动保存并关闭窗口。也可粘贴浏览器 Network 中发往网关的 `Cookie` 请求头。各校登录 Cookie 名称不统一，没有固定最小名称集合。桌面端每天最多自动探测一次，明确跳转登录或 HTTP 401 时 Toast 提醒更新。HTML 但未跳转登录可能是未订阅，不能认定 Cookie 过期。桌面与 headless CLI 共用 `settings.json`，CLI 的 `import id` / `paper download` 同样使用该配置 |
 | `OPENALEX_MAILTO` | 环境变量，`scholar_api/sources/openalex.rs` 按请求读取 | `agentero@users.noreply.github.com` | 覆盖 OpenAlex polite pool 联系邮箱；同时补齐 `doi:` 端点的 `mailto` 参数 |
 
 Translator Runtime 约定端点：

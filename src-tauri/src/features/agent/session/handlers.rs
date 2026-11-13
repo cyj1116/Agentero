@@ -14,8 +14,11 @@
 use crate::features::agent::acp::interaction::{
     await_user_permission, permission_response, PermissionPolicy,
 };
-use crate::features::agent::acp::updates::{emit_rich_session_update, emit_session_config_options};
-use crate::features::agent::models::AgentUsageEvent;
+use crate::features::agent::acp::updates::{
+    emit_rich_session_update, emit_session_config_options, models_from_config_options,
+    models_from_grok_update, store_richer_models,
+};
+use crate::features::agent::models::{AgentModelsEvent, AgentUsageEvent};
 use crate::features::agent::runtime::events::AgentEventEmitter;
 use crate::features::agent::runtime::gates::{AskUserGate, ElicitationGate, PermissionGate};
 use crate::features::agent::session::run::RunOnceContext;
@@ -83,6 +86,10 @@ pub(crate) struct WarmIdleHooks {
     pub agent_id: String,
     /// Captured `(used, size)` read by `warm_agent` when setup completes.
     pub usage: Arc<Mutex<Option<(u64, u64)>>>,
+    /// Latest model catalog pushed while the connection idles. Reading this at
+    /// setup end keeps the warm result from clobbering a richer
+    /// `config_option_update` that arrived after `session/new` (#638).
+    pub models: Arc<Mutex<Option<AgentModelsEvent>>>,
 }
 
 impl WarmIdleHooks {
@@ -104,6 +111,15 @@ impl WarmIdleHooks {
             emit_rich_session_update(&self.app, &self.session_id, &self.agent_id, notification);
         }
         if let SessionUpdate::ConfigOptionUpdate(upd) = &notification.update {
+            // Keep the warm result's catalog in sync with the pushed one so the
+            // result cannot overwrite it with a stale partial snapshot (#638).
+            if let Some(ev) =
+                models_from_config_options(&self.session_id, &self.agent_id, &upd.config_options)
+            {
+                if let Ok(mut g) = self.models.lock() {
+                    store_richer_models(&mut g, ev);
+                }
+            }
             emit_session_config_options(
                 &self.app,
                 &self.session_id,
@@ -112,20 +128,40 @@ impl WarmIdleHooks {
             );
         }
     }
+
+    /// Grok Build pushes its refreshed model catalog with a vendor
+    /// notification after `session/new`; keep the warm result and the Chat
+    /// picker on the pushed catalog instead of the stale session snapshot.
+    pub(crate) fn handle_grok_models_update(
+        &self,
+        params: &crate::features::agent::acp::grok_models::GrokModelsUpdateParams,
+    ) {
+        let Some(event) = models_from_grok_update(&self.session_id, &self.agent_id, params) else {
+            return;
+        };
+        if let Ok(mut g) = self.models.lock() {
+            store_richer_models(&mut g, event.clone());
+        }
+        let _ = self.app.emit("agent:models", event);
+    }
 }
 
 /// Permission decision for a live turn (policy → deny / allow / ask the user).
 pub(crate) async fn decide_permission(
     app: &AgentEventEmitter,
     session_id: &str,
+    host: Option<&str>,
     policy: &PermissionPolicy,
     gate: &PermissionGate,
+    user_wait: Option<&crate::features::agent::session::DelegateUserWait>,
     request: &RequestPermissionRequest,
 ) -> RequestPermissionResponse {
     match policy {
         PermissionPolicy::Restricted => permission_response(request, false),
         PermissionPolicy::Auto => permission_response(request, true),
-        PermissionPolicy::Ask => await_user_permission(app, gate, session_id, request).await,
+        PermissionPolicy::Ask => {
+            await_user_permission(app, gate, session_id, host, user_wait, request).await
+        }
     }
 }
 
@@ -162,6 +198,30 @@ macro_rules! agentero_turn_builder {
                 },
                 agent_client_protocol::on_receive_notification!(),
             )
+            .on_receive_notification(
+                {
+                    let registry = registry.clone();
+                    let idle = idle.clone();
+                    async move |update: $crate::features::agent::acp::grok_models::GrokModelsUpdate, _cx| {
+                        match $crate::features::agent::session::handlers::snapshot_turn(&registry)
+                        {
+                            Some(turn) => {
+                                $crate::features::agent::session::handlers::bump_activity(
+                                    &turn.activity,
+                                );
+                                turn.ctx.relay_grok_models_update(&update.0);
+                            }
+                            None => {
+                                if let Some(idle) = idle.as_ref() {
+                                    idle.handle_grok_models_update(&update.0);
+                                }
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
             .on_receive_request(
                 {
                     let registry = registry.clone();
@@ -171,8 +231,10 @@ macro_rules! agentero_turn_builder {
                                 $crate::features::agent::session::handlers::decide_permission(
                                     &turn.ctx.app,
                                     &turn.ctx.session_id,
+                                    turn.ctx.permission_host.as_deref(),
                                     &turn.permission_policy,
                                     &turn.permission_gate,
+                                    turn.ctx.user_wait.as_deref(),
                                     &request,
                                 )
                                 .await

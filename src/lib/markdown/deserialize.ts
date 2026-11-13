@@ -124,11 +124,60 @@ function escapeUnclosedBlockMath(source: string): string {
 }
 
 export function prepareMarkdownForDeserialize(source: string): string {
+	// Cheap applicability guards so a document that cannot contain the pattern
+	// skips the full line scan entirely (the common plain-note case).
+	let out = source;
+	if (COLLAPSIBLE_BLANK_SEQUENCE.test(out)) {
+		out = preserveExtraBlankLines(out);
+	}
+	if (out.includes("$$")) {
+		out = escapeUnclosedBlockMath(out);
+	}
 	// After the block-math pass so an already-repaired `\$` fence cannot
 	// desync the math tracking below.
-	return escapeStrayLessThan(
-		escapeUnclosedBlockMath(preserveExtraBlankLines(source)),
-	);
+	out = escapeStrayLessThan(out);
+	return escapeStrayMdxBraces(out);
+}
+
+/** Two blank-ish lines in a row: the only shape `preserveExtraBlankLines` rewrites. */
+const COLLAPSIBLE_BLANK_SEQUENCE = /\n[ \t\r]*\n/;
+
+/** `{` / `}` outside code and math, i.e. MDX expression-looking text. */
+const MDX_BRACE = /[{}]/;
+
+/**
+ * Escape `{` / `}` that `remarkMdx` would parse as a JS expression.
+ *
+ * LaTeX conventions in prose (`\(...\{x\}...\)`, `\max\{a,b\}`) make acorn
+ * throw on the first `{`. Plate then falls back to `splitIncompleteMdx`, which
+ * mistakes inline math such as `$\rho<1$` for an unclosed JSX tag and drops
+ * every following block — silent truncation of most of the note. Entities keep
+ * the braces literal (remark decodes them back) while MDX never sees them.
+ *
+ * The backslash of a LaTeX `\{` / `\}` is dropped: otherwise markdown escapes
+ * the `&` and the entity would show up verbatim. Code fences, `$$` math,
+ * inline code and inline math are left untouched.
+ */
+export function escapeStrayMdxBraces(source: string): string {
+	if (!MDX_BRACE.test(source)) return source;
+	const mask = buildLiteralMask(source);
+	// Quoted table attributes are directive syntax rather than prose MDX.
+	for (const match of source.matchAll(
+		/^ {0,3}::research-table\{[^}\r\n]*\}[ \t]*\r?$/gm,
+	)) {
+		mask.fill(1, match.index, match.index + match[0].length);
+	}
+	let out = "";
+	let last = 0;
+	for (let i = 0; i < source.length; i += 1) {
+		const char = source[i];
+		if ((char !== "{" && char !== "}") || mask[i]) continue;
+		const start = isEscaped(source, i) ? i - 1 : i;
+		out += source.slice(last, start);
+		out += char === "{" ? "&#123;" : "&#125;";
+		last = i + 1;
+	}
+	return last === 0 ? source : out + source.slice(last);
 }
 
 /** Characters allowed to start a JSX name (`remarkMdx` tag). */

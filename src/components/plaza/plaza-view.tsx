@@ -9,10 +9,11 @@
 
 import { useTranslation } from "react-i18next";
 import { PlazaArxivRecView } from "@/components/plaza/plaza-arxiv-rec-view";
+import { PlazaCcfDeadlinesView } from "@/components/plaza/plaza-ccf-deadlines-view";
 import { PlazaFeedsView } from "@/components/plaza/plaza-feeds-view";
 import { PlazaSkillsView } from "@/components/plaza/plaza-skills-view";
 import { PlazaWebFrame } from "@/components/plaza/plaza-web-frame";
-import { cn } from "@/lib/core/utils";
+import { EmptyState } from "@/components/ui/empty-state";
 import { plazaSourceForPath, plazaSourceLabel } from "@/lib/plaza";
 
 export function PlazaView({
@@ -37,11 +38,21 @@ export function PlazaView({
 		return <PlazaArxivRecView className={className} />;
 	}
 
+	if (source?.panel === "ccfDeadlines") {
+		return <PlazaCcfDeadlinesView className={className} />;
+	}
+
 	if (source?.url) {
 		return (
 			<PlazaWebFrame
 				homeUrl={source.url}
+				desktopWidth={source.desktopWidth}
 				embedOrigin={source.embedOrigin?.() ?? null}
+				lastPathStorageKey={
+					source.embedOrigin
+						? `agentero:plaza:${source.id}:last-path`
+						: undefined
+				}
 				title={plazaSourceLabel(source)}
 				className={className}
 			/>
@@ -50,14 +61,9 @@ export function PlazaView({
 
 	if (source) {
 		return (
-			<div
-				className={cn(
-					"flex h-full items-center justify-center p-6 text-center text-muted-foreground text-sm",
-					className,
-				)}
-			>
+			<EmptyState className={className}>
 				{t("plaza.comingSoonFor", { label: plazaSourceLabel(source) })}
-			</div>
+			</EmptyState>
 		);
 	}
 

@@ -1,15 +1,29 @@
+import { CodeBlockPlugin, CodeLinePlugin } from "@platejs/code-block/react";
 import { MarkdownPlugin } from "@platejs/markdown";
 import { BlockSelectionPlugin } from "@platejs/selection/react";
-import { createSlateEditor, type TElement } from "platejs";
+import {
+	createSlateEditor,
+	createSlatePlugin,
+	KEYS,
+	type TElement,
+} from "platejs";
 import { describe, expect, it } from "vitest";
 import { MarkdownKit } from "@/components/editor/plugins/markdown-kit";
 import {
+	blockChatSelectionInput,
 	isBlankParagraph,
 	isElementBlockSelected,
 	resolveHandleBlocks,
+	selectCurrentBlockThenAll,
 	selectElementAsBlocks,
+	selectedBlockIds,
 	serializeBlocksAsMarkdown,
 } from "@/lib/markdown/block-selection";
+
+const TestParagraphPlugin = createSlatePlugin({
+	key: KEYS.p,
+	node: { isElement: true },
+});
 
 describe("Markdown block selection serialize", () => {
 	it("serializes selected nodes as Markdown without Plate ids", () => {
@@ -80,6 +94,28 @@ describe("Markdown block selection serialize", () => {
 		).toBe(true);
 	});
 
+	it("builds an add-to-chat payload for a serialized block", () => {
+		expect(
+			blockChatSelectionInput("Hello block\n", "notes/a.md", {
+				lineFrom: 4,
+				lineTo: 6,
+			}),
+		).toEqual({
+			text: "Hello block",
+			sourcePath: "notes/a.md",
+			origin: "markdown",
+			lineFrom: 4,
+			lineTo: 6,
+		});
+		expect(blockChatSelectionInput("   ", "notes/a.md", null)).toBeNull();
+		expect(blockChatSelectionInput("Hello", "  ", null)).toBeNull();
+		expect(blockChatSelectionInput("Hello", "notes/a.md", null)).toEqual({
+			text: "Hello",
+			sourcePath: "notes/a.md",
+			origin: "markdown",
+		});
+	});
+
 	it("treats empty and whitespace paragraphs as blank lines, not content blocks", () => {
 		expect(isBlankParagraph({ type: "p", children: [{ text: "" }] })).toBe(
 			true,
@@ -108,6 +144,85 @@ describe("Markdown block selection serialize", () => {
 				],
 			}),
 		).toBe(false);
+	});
+
+	it("selects a Mermaid code block before the rest of the note", () => {
+		const editor = createSlateEditor({
+			plugins: [
+				TestParagraphPlugin,
+				CodeBlockPlugin,
+				CodeLinePlugin,
+				BlockSelectionPlugin,
+			],
+			value: [
+				{
+					id: "code",
+					type: KEYS.codeBlock,
+					lang: "mermaid",
+					children: [
+						{ type: KEYS.codeLine, children: [{ text: "graph TD" }] },
+						{ type: KEYS.codeLine, children: [{ text: "A-->B" }] },
+					],
+				},
+				{ id: "after", type: KEYS.p, children: [{ text: "After" }] },
+			],
+		});
+		editor.tf.select({
+			anchor: { path: [0, 1, 0], offset: 1 },
+			focus: { path: [0, 1, 0], offset: 1 },
+		});
+
+		expect(selectCurrentBlockThenAll(editor)).toBe(true);
+		const first = editor.api.string(editor.selection ?? []);
+		expect(first).toContain("graph TD");
+		expect(first).toContain("A-->B");
+		expect(first).not.toContain("After");
+		expect(selectedBlockIds(editor).size).toBe(0);
+
+		expect(selectCurrentBlockThenAll(editor)).toBe(true);
+		expect(selectedBlockIds(editor).has("code")).toBe(true);
+		expect(selectedBlockIds(editor).has("after")).toBe(true);
+	});
+
+	it("selects an empty paragraph before the rest of the note", () => {
+		const editor = createSlateEditor({
+			plugins: [TestParagraphPlugin, BlockSelectionPlugin],
+			value: [
+				{ id: "a", type: KEYS.p, children: [{ text: "Alpha" }] },
+				{ id: "empty", type: KEYS.p, children: [{ text: "" }] },
+				{ id: "b", type: KEYS.p, children: [{ text: "Beta" }] },
+			],
+		});
+		editor.tf.select({
+			anchor: { path: [1, 0], offset: 0 },
+			focus: { path: [1, 0], offset: 0 },
+		});
+
+		expect(selectCurrentBlockThenAll(editor)).toBe(true);
+		expect([...selectedBlockIds(editor)]).toEqual(["empty"]);
+
+		expect(selectCurrentBlockThenAll(editor)).toBe(true);
+		expect(selectedBlockIds(editor).has("a")).toBe(true);
+		expect(selectedBlockIds(editor).has("empty")).toBe(true);
+		expect(selectedBlockIds(editor).has("b")).toBe(true);
+	});
+
+	it("selects the current paragraph before every block", () => {
+		const editor = createSlateEditor({
+			plugins: [TestParagraphPlugin, BlockSelectionPlugin],
+			value: [
+				{ id: "a", type: KEYS.p, children: [{ text: "Alpha" }] },
+				{ id: "b", type: KEYS.p, children: [{ text: "Beta" }] },
+			],
+		});
+		editor.tf.select({
+			anchor: { path: [0, 0], offset: 1 },
+			focus: { path: [0, 0], offset: 1 },
+		});
+
+		expect(selectCurrentBlockThenAll(editor)).toBe(true);
+		expect(editor.api.string(editor.selection ?? [])).toBe("Alpha");
+		expect(selectedBlockIds(editor).size).toBe(0);
 	});
 
 	it("round-trips a document without writing block ids", () => {

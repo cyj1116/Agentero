@@ -6,7 +6,6 @@ import {
 	SettingsRow,
 	SettingsSectionLabel,
 } from "@/components/settings/settings-layout";
-import { useBuiltinProviderAvailable } from "@/components/settings/use-builtin-provider";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -21,10 +20,10 @@ import {
 	TooltipContent,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { isSecretMask } from "@/lib/core/secret-mask";
 import { cn } from "@/lib/core/utils";
 import { probeEmbedding } from "@/lib/recommend";
 import type { AppSettings, EmbeddingSettings } from "@/lib/settings";
-import { isTranslateApiKeyMask } from "@/lib/translate";
 
 export function AgentEmbeddingBlock({
 	settings,
@@ -34,7 +33,6 @@ export function AgentEmbeddingBlock({
 	patch: (p: Partial<AppSettings>) => void;
 }) {
 	const { t } = useTranslation("settings");
-	const builtinAvailable = useBuiltinProviderAvailable();
 	// Embedding endpoint (BYOK) — local draft, committed on blur. apiKey may be a
 	// host `*` mask on load; sending it back unchanged keeps the stored secret.
 	const embedding = settings.embedding;
@@ -50,6 +48,11 @@ export function AgentEmbeddingBlock({
 		},
 		[patch, settings.embedding],
 	);
+	// The built-in source stays implemented, but it is no longer offered here.
+	useEffect(() => {
+		if (embedding.source !== "builtin") return;
+		commitEmbedding({ source: "custom" });
+	}, [embedding.source, commitEmbedding]);
 	const [embProbeBusy, setEmbProbeBusy] = useState(false);
 	const [embProbeStatus, setEmbProbeStatus] = useState<
 		"idle" | "probing" | "ok" | "failed" | "unconfigured"
@@ -84,7 +87,7 @@ export function AgentEmbeddingBlock({
 			const apiKey = embDraft.apiKey.trim();
 			await probeEmbedding({
 				baseUrl,
-				apiKey: apiKey && !isTranslateApiKeyMask(apiKey) ? apiKey : undefined,
+				apiKey: apiKey && !isSecretMask(apiKey) ? apiKey : undefined,
 				model,
 			});
 			setEmbProbeStatus("ok");
@@ -169,7 +172,7 @@ export function AgentEmbeddingBlock({
 					<Select
 						value={embDraft.source}
 						onValueChange={(value) => {
-							if (value !== "builtin" && value !== "custom") return;
+							if (value !== "custom") return;
 							setEmbDraft((prev) => ({ ...prev, source: value }));
 							commitEmbedding({ source: value });
 						}}
@@ -182,11 +185,6 @@ export function AgentEmbeddingBlock({
 							<SelectValue />
 						</SelectTrigger>
 						<SelectContent>
-							{builtinAvailable || embDraft.source === "builtin" ? (
-								<SelectItem value="builtin" disabled={!builtinAvailable}>
-									{t("agent.embedding.source.builtin")}
-								</SelectItem>
-							) : null}
 							<SelectItem value="custom">
 								{t("agent.embedding.source.custom")}
 							</SelectItem>
@@ -233,7 +231,7 @@ export function AgentEmbeddingBlock({
 								}
 								onFocus={(e) => {
 									// Select the mask so the next keystroke replaces it entirely.
-									if (isTranslateApiKeyMask(embDraft.apiKey)) {
+									if (isSecretMask(embDraft.apiKey)) {
 										e.currentTarget.select();
 									}
 								}}

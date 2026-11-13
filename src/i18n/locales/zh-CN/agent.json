@@ -12,6 +12,7 @@
 	},
 	"permission": {
 		"title": "Agent 权限请求",
+		"remoteHost": "远程主机：{{host}}",
 		"deny": "拒绝",
 		"kind": {
 			"allowOnce": "本次允许",
@@ -19,6 +20,24 @@
 			"rejectOnce": "本次拒绝",
 			"rejectAlways": "始终拒绝"
 		}
+	},
+	"delegate": {
+		"targets": "远程库",
+		"result": "远程结果",
+		"cancel": "取消远程运行",
+		"run": "{{host}} · {{agent}} · {{status}}",
+		"status": {
+			"running": "运行中",
+			"completed": "已完成",
+			"failed": "失败",
+			"cancelled": "已取消"
+		}
+	},
+	"piTrust": {
+		"title": "Pi 未加载此 Vault 的项目资源",
+		"description": "Pi需要信任目录之后才能加载 skills",
+		"action": "信任此 Vault",
+		"dismiss": "关闭提示"
 	},
 	"switchAgent": "切换 ACP Agent",
 	"configBar": {
@@ -28,7 +47,11 @@
 		"summarizePaper": "总结当前论文",
 		"askLibrary": "就我的文献库提问",
 		"listClaims": "列出关键论点与证据",
-		"draftRelatedWork": "撰写相关工作（Related Work）"
+		"draftRelatedWork": "撰写相关工作（Related Work）",
+		"continueManuscript": "从稿件停下的地方续写，保持现在的 LaTeX 和语气。",
+		"tightenProse": "把我正在改的这一节写得更紧。论点和引用保留。",
+		"pressArgument": "指出论证里站不住的地方，并说明源文件该怎么改。",
+		"citeFromLibrary": "根据我文库里的论文，起草下一段并写上引用。"
 	},
 	"history": {
 		"aria": "打开对话历史",
@@ -37,6 +60,12 @@
 		"description": "此对话中最近的 ACP 会话。",
 		"empty": "暂无会话。",
 		"restoring": "正在恢复会话……",
+		"rename": "重命名",
+		"renameAria": "对话标题",
+		"delete": "删除",
+		"deleteConfirmTitle": "删除这段对话？",
+		"deleteFailed": "无法删除这段对话。",
+		"deleteAgentFailed": "已从这里隐藏。Agent 那边的记录没有删掉。",
 		"status": {
 			"running": "运行中",
 			"completed": "已完成",
@@ -56,7 +85,14 @@
 		"placeholder": "今天想做些什么？",
 		"queueLabel": "等待发送",
 		"queueRemove": "从队列移除",
-		"contextInstruction": "请在回答相关问题前读取以下知识库文件：",
+		"paperContext": {
+			"heading": "当前论文（供参考）：",
+			"title": "标题",
+			"authors": "作者",
+			"venue": "期刊/来源",
+			"year": "年份",
+			"abstract": "摘要"
+		},
 		"plazaContextInstruction": "以下是通过 @ 引用的广场条目（尚未入库）：",
 		"plazaEntryUnavailable": "条目元数据不可用（已不在广场缓存中），可请用户从广场重新引用。",
 		"plazaScratchInstruction": "全文已提供为 Vault 之外的只读临时副本，请直接读取上述文件；除非用户明确要求入库，不要下载论文或向 Vault 写入任何内容。",
@@ -64,15 +100,14 @@
 		"plazaCollectionInstruction": "以上是今日推荐论文的摘要目录。请第一步仅凭摘要完成筛选：只需筛选 / 对比即可回答时，直接给出最终报告；仅当必须深读才能回答时，在回复的第一行输出「NEED_FULLTEXT <arXiv id> …」（最多 {{max}} 篇）然后停止等待，系统会自动提供所选论文的全文；不要自行联网检索或下载这些论文。",
 		"plazaFulltextFollowup": "全文已取回（见上下文），请基于它们完成最终报告。",
 		"resizeHandle": "调整输入区高度",
+		"openMention": "打开 {{title}}",
 		"removeContext": "从上下文移除 {{path}}",
 		"removeSkill": "从上下文移除 ${{skill}}",
-		"removeSelection": "从上下文移除选中文本",
 		"selection": "选中文本",
 		"selectionChip": "{{title}}",
 		"selectionChipWithPage": "{{title}}:{{page}}页",
 		"selectionChipWithLine": "{{title}} {{from}}行",
 		"selectionChipWithLines": "{{title}} {{from}}-{{to}}行",
-		"removeVisualDraft": "从上下文移除视觉批注",
 		"visualAnnotation": "视觉批注",
 		"visualAnnotationPage": "第{{page}}页",
 		"visualAnnotationsTitle": "视觉批注（{{count}}）",
@@ -113,7 +148,20 @@
 	"empty": {
 		"title": "与你的知识库对话",
 		"description": "消息将发送给你的 ACP Agent。点击上方的 Agent 名称可切换后端。",
+		"writingDescription": "当前稿件已经附上。在源码或 PDF 里选中一段，就可以针对它提问。",
 		"waiting": "正在等待 Agent……"
+	},
+	"zhihuDiscussions": {
+		"noPaper": "打开一篇论文后，这里会显示知乎上的相关讨论。",
+		"noSecret": "尚未配置知乎 Access Secret，请在 设置 → Agent → 知乎 中填入。",
+		"loading": "正在检索知乎……",
+		"empty": "知乎上暂无与本文相关的讨论。",
+		"note": "按论文标题检索知乎，结果可能与本文无关。",
+		"retry": "重试",
+		"refresh": "换一批",
+		"answer": "回答",
+		"article": "文章",
+		"votes": "{{votes}} 赞同"
 	},
 	"thinking": "思考中……",
 	"working": "执行中……",
@@ -125,7 +173,9 @@
 		"starting": "启动 Agent 中…",
 		"waitingModel": "等待模型输出…",
 		"reconnecting": "上游重连中",
-		"elapsed": "{{count}}秒"
+		"elapsed": "{{count}}秒",
+		"expandProcess": "展开实时过程",
+		"collapseProcess": "收起实时过程"
 	},
 	"copy": "复制",
 	"copied": "已复制",
@@ -142,15 +192,54 @@
 		"defaultTitle": "工具",
 		"failed": "工具执行失败"
 	},
+	"uiBlock": {
+		"streaming": "正在生成 UI 块…",
+		"invalid": "该 UI 块使用了不支持的组件或参数，已显示源码。",
+		"tooLarge": "该 UI 块数据过大，无法安全渲染，已显示源码。",
+		"incomplete": "该 UI 块未完整结束，已显示源码。",
+		"empty": "该 UI 块没有可渲染的内容，已显示源码。",
+		"tableEmpty": "没有数据行。",
+		"chartEmpty": "没有数据。",
+		"chartAria": "柱状图：{{title}}",
+		"lineChartAria": "折线图：{{title}}",
+		"openPaper": "打开论文",
+		"openSource": "打开来源",
+		"page": "第 {{page}} 页",
+		"paperStatus": {
+			"unread": "未读",
+			"reading": "在读",
+			"read": "已读",
+			"queued": "待读"
+		},
+		"figureKind": {
+			"figure": "图",
+			"table": "表",
+			"formula": "公式",
+			"algorithm": "算法",
+			"section": "章节"
+		},
+		"claimStatus": {
+			"supports": "支持",
+			"contradicts": "矛盾",
+			"mixed": "混合",
+			"unclear": "不明确"
+		},
+		"stepsEmpty": "没有步骤。"
+	},
 	"askUserQuestion": {
 		"submit": "提交",
 		"submitted": "已提交",
 		"cancel": "取消",
 		"prev": "上一题",
 		"next": "下一题",
+		"skip": "跳过",
+		"answerRequired": "请选择答案或填写回复。",
 		"progress": "{{current}} / {{total}}",
 		"freeTextPlaceholder": "输入你的回答",
+		"other": "其他",
 		"pendingInComposer": "请在下方问卷中作答",
+		"noAnswer": "未作答",
+		"cancelled": "已取消",
 		"keyboardHint": "↑↓ 选项 · Space 勾选 · Enter 确认",
 		"keyboardHintMulti": "↑↓ 选项 · Space 勾选 · Enter 下一题 · ←→ 切题",
 		"collapse": "收起问卷",

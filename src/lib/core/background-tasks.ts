@@ -13,7 +13,11 @@ import i18n from "@/i18n";
 import type { JobKind } from "@/lib/core/bindings";
 
 /** Kinds of pure-frontend rows created by `runLocalActivity`. */
-export type LocalActivityKind = "paperRead" | "zoteroMigrate" | "layoutRun";
+export type LocalActivityKind =
+	| "paperRead"
+	| "zoteroMigrate"
+	| "layoutRun"
+	| "nodeInstall";
 
 /** Panel row identity: a projected JobCenter kind, or a local activity. */
 export type BackgroundTaskKind = JobKind | LocalActivityKind;
@@ -31,7 +35,8 @@ export type BackgroundTaskIcon =
 	| "plug"
 	| "scan"
 	| "fileCode"
-	| "list";
+	| "list"
+	| "translate";
 
 export type BackgroundTaskStatus =
 	| "queued"

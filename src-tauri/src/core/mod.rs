@@ -23,6 +23,7 @@ pub mod usage;
 
 pub use agentero_core::blocking;
 pub use agentero_core::cancel;
+pub use agentero_core::decision;
 pub use agentero_core::error;
 pub use agentero_core::frontmatter;
 pub use agentero_core::fs;
@@ -31,6 +32,7 @@ pub use agentero_core::install_dirs;
 pub use agentero_core::json;
 pub use agentero_core::log_util;
 pub use agentero_core::paths;
+pub use agentero_core::perf;
 pub use agentero_core::process;
 pub use agentero_core::remote;
 pub use agentero_core::sqlite;

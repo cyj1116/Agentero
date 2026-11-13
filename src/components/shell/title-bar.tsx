@@ -5,6 +5,7 @@ import { AgentLogo } from "@/components/agent/agent-logo";
 import { LayoutMenu } from "@/components/shell/layout-menu";
 import { TrafficLightSpacer } from "@/components/shell/traffic-light-spacer";
 import { UpdateIndicator } from "@/components/shell/update-indicator";
+import { WindowHeader } from "@/components/shell/window-header";
 import { Button } from "@/components/ui/button";
 import {
 	ContextMenu,
@@ -25,20 +26,13 @@ import {
 	TooltipProvider,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useShortcutLabel } from "@/hooks/use-shortcut-label";
 import { useAgentChromeStore } from "@/lib/agent/agent-chrome-store";
 import { cn } from "@/lib/core/utils";
 import { moveFeatureToWindow } from "@/lib/shell/leaf";
 import { openSettingsWindow } from "@/lib/shell/settings-window";
-import { formatShortcutById } from "@/lib/shell/shortcuts";
 import type { LayoutMode } from "@/lib/shell/ui-store";
 import { openPalette } from "@/lib/shell/ui-store";
-
-/** Platform-formatted shortcut chips for title bar tooltips (⌥⌘… on macOS, Ctrl+… elsewhere). */
-const SIDEBAR_SHORTCUT = formatShortcutById("toggleSidebar");
-const CHAT_SHORTCUT = formatShortcutById("toggleChat");
-const SETTINGS_SHORTCUT = formatShortcutById("settings");
-const QUICK_OPEN_SHORTCUT = formatShortcutById("quickOpen");
-const COMMAND_PALETTE_SHORTCUT = formatShortcutById("commandPalette");
 
 type TitleBarProps = {
 	isMacDesktop: boolean;
@@ -68,13 +62,15 @@ export const TitleBar = memo(function TitleBar({
 	onOpenSettings,
 }: TitleBarProps) {
 	const { t } = useTranslation(["app"]);
+	const SIDEBAR_SHORTCUT = useShortcutLabel("toggleSidebar");
+	const CHAT_SHORTCUT = useShortcutLabel("toggleChat");
+	const SETTINGS_SHORTCUT = useShortcutLabel("settings");
+	const QUICK_OPEN_SHORTCUT = useShortcutLabel("quickOpen");
+	const COMMAND_PALETTE_SHORTCUT = useShortcutLabel("commandPalette");
 	const agentTemplate = useAgentChromeStore((s) => s.template);
 
 	return (
-		<header
-			data-titlebar
-			className="flex h-8 shrink-0 items-center border-b border-border/50 bg-background/75 backdrop-blur-xl backdrop-saturate-150 supports-backdrop-blur:bg-background/65 select-none"
-		>
+		<WindowHeader>
 			{/* Collapses in native fullscreen, where macOS hides the lights. */}
 			{isMacDesktop ? (
 				<TrafficLightSpacer />
@@ -87,8 +83,10 @@ export const TitleBar = memo(function TitleBar({
 						<TooltipTrigger asChild>
 							<Button
 								variant="ghost"
-								size="icon-xs"
+								size="icon-sm"
 								data-tb-sidebar
+								data-hint
+								data-hint-priority="1"
 								aria-label={
 									sidebarCollapsed
 										? t("titlebar.showLeftSidebar")
@@ -123,8 +121,10 @@ export const TitleBar = memo(function TitleBar({
 									<Button
 										type="button"
 										variant="ghost"
-										size="icon-xs"
+										size="icon-sm"
 										data-tb-agent
+										data-hint
+										data-hint-priority="1"
 										aria-label={
 											rightSidebarOpen
 												? t("titlebar.hideRightSidebar")
@@ -179,7 +179,7 @@ export const TitleBar = memo(function TitleBar({
 										<Button
 											type="button"
 											variant="ghost"
-											size="icon-xs"
+											size="icon-sm"
 											aria-label={t("titlebar.settings")}
 										>
 											<Settings className="size-3.5" />
@@ -226,6 +226,6 @@ export const TitleBar = memo(function TitleBar({
 					) : null}
 				</div>
 			</TooltipProvider>
-		</header>
+		</WindowHeader>
 	);
 });

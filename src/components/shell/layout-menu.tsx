@@ -11,6 +11,7 @@ import {
 	DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import type { LayoutMode } from "@/lib/shell/ui-store";
+import { dockHandle } from "@/lib/workspace/dock-registry";
 
 type LayoutMenuProps = {
 	value: LayoutMode;
@@ -22,27 +23,51 @@ export function LayoutMenu({ value, onValueChange }: LayoutMenuProps) {
 	const { t } = useTranslation("app");
 	const [open, setOpen] = useState(false);
 	const closeTimer = useRef<number | undefined>(undefined);
-	const selected = value === "custom" ? "" : value;
+	/** Clicked open: hover-out must not dismiss it; outside click still does. */
+	const pinned = useRef(false);
+	const isReading =
+		value === "reading" || Boolean(dockHandle()?.isMaximizedPanel?.());
+	const selected = isReading ? "reading" : value === "custom" ? "" : value;
 
 	const cancelClose = () => window.clearTimeout(closeTimer.current);
 	const scheduleClose = () => {
 		cancelClose();
+		if (pinned.current) return;
 		closeTimer.current = window.setTimeout(() => setOpen(false), 150);
+	};
+
+	const handleOpenChange = (next: boolean) => {
+		if (!next) pinned.current = false;
+		setOpen(next);
 	};
 
 	useEffect(() => () => window.clearTimeout(closeTimer.current), []);
 
 	return (
-		<DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
+		<DropdownMenu open={open} onOpenChange={handleOpenChange} modal={false}>
 			<DropdownMenuTrigger asChild>
 				<Button
 					type="button"
 					variant="ghost"
-					size="icon-xs"
+					size="icon-sm"
 					aria-label={t("titlebar.layout")}
+					className="active:scale-95 data-[state=open]:bg-muted data-[state=open]:text-foreground"
+					onPointerDown={(event) => {
+						// Hover already opened the menu. Prevent Radix's trigger toggle
+						// from closing it, and pin it open instead.
+						if (open && !pinned.current) {
+							event.preventDefault();
+							pinned.current = true;
+						} else if (!open) {
+							pinned.current = true;
+						}
+					}}
 					onMouseEnter={() => {
 						cancelClose();
-						setOpen(true);
+						if (!open) {
+							pinned.current = false;
+							setOpen(true);
+						}
 					}}
 					onMouseLeave={scheduleClose}
 				>
@@ -56,21 +81,28 @@ export function LayoutMenu({ value, onValueChange }: LayoutMenuProps) {
 				onMouseLeave={scheduleClose}
 			>
 				<DropdownMenuLabel>{t("titlebar.layoutModes")}</DropdownMenuLabel>
-				<DropdownMenuRadioGroup
-					value={selected}
-					onValueChange={(next) => {
-						if (next === "agent" || next === "notes" || next === "reading") {
-							onValueChange(next);
-						}
-					}}
-				>
-					<DropdownMenuRadioItem value="agent">
+				{/*
+				 * Use `onSelect` rather than the group's `onValueChange`: the
+				 * controlled value is empty in custom mode, so re-selecting the
+				 * current preset (or toggling Reading off) must still fire.
+				 */}
+				<DropdownMenuRadioGroup value={selected}>
+					<DropdownMenuRadioItem
+						value="agent"
+						onSelect={() => onValueChange("agent")}
+					>
 						{t("titlebar.layoutAgent")}
 					</DropdownMenuRadioItem>
-					<DropdownMenuRadioItem value="notes">
+					<DropdownMenuRadioItem
+						value="notes"
+						onSelect={() => onValueChange("notes")}
+					>
 						{t("titlebar.layoutNotes")}
 					</DropdownMenuRadioItem>
-					<DropdownMenuRadioItem value="reading">
+					<DropdownMenuRadioItem
+						value="reading"
+						onSelect={() => onValueChange("reading")}
+					>
 						{t("titlebar.layoutReading")}
 					</DropdownMenuRadioItem>
 				</DropdownMenuRadioGroup>

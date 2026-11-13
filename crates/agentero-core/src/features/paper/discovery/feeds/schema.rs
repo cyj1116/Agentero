@@ -2,11 +2,12 @@
 
 use crate::error::AppError;
 use crate::paths;
+use crate::sqlite::MigrationStep;
 use rusqlite::Connection;
 use std::fs;
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 pub const ITEMS_PER_FEED: i64 = 200;
 
 const DDL_V1: &str = r#"
@@ -73,75 +74,64 @@ pub fn ensure_feeds_at(db_path: &Path) -> Result<Connection, AppError> {
     Ok(conn)
 }
 
+/// Migration ladder, applied by [`crate::sqlite::run_migrations`] (per-step
+/// version re-read, stamping, `newer than app` guard).
+const MIGRATION_STEPS: [MigrationStep; 5] = [
+    MigrationStep::batch(1, DDL_V1),
+    // SQLite ADD COLUMN is not fully batch-safe across existing cols; run
+    // one-by-one ignore dupes.
+    MigrationStep::script_tolerant(2, MIGRATE_V1_TO_V2),
+    MigrationStep::custom(3, migrate_v3),
+    // Article→Markdown math conversion changed (env unwrapping, HTML
+    // artifact cleanup, placeholder restore fix); cached bodies from
+    // older versions may show broken math. Re-resolve on next open.
+    MigrationStep::batch(4, "UPDATE items SET body_markdown = NULL"),
+    // v5 is an ADD COLUMN. The desktop app and CLI (or two cron jobs) can race
+    // the migration: both read v4, both run the ALTER, and the loser gets
+    // `duplicate column name` after waiting for the writer. Tolerate the replay
+    // like v2's legacy ADD COLUMN ladder, then let the normal version stamp run.
+    MigrationStep::script_tolerant(5, "ALTER TABLE items ADD COLUMN read_at TEXT"),
+];
+
 fn migrate(conn: &Connection) -> Result<(), AppError> {
-    let version = schema_version(conn).unwrap_or(0);
-    if version > SCHEMA_VERSION {
-        return Err(AppError::message(format!(
-            "feeds schema version {version} is newer than this app supports ({SCHEMA_VERSION})"
-        )));
-    }
-    if version < 1 {
-        conn.execute_batch(DDL_V1)
-            .map_err(|e| AppError::message(format!("feeds migrate v1: {e}")))?;
-        set_schema_version(conn, 1)?;
-    }
-    let version = schema_version(conn).unwrap_or(0);
-    if version < 2 {
-        for stmt in MIGRATE_V1_TO_V2.split(';') {
-            let s = stmt.trim();
-            if s.is_empty() {
-                continue;
-            }
-            match conn.execute_batch(&format!("{s};")) {
-                Ok(()) => {}
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("duplicate column name") {
-                        continue;
-                    }
-                    return Err(AppError::message(format!("feeds migrate v2: {e}")));
-                }
-            }
-        }
-        set_schema_version(conn, 2)?;
-    }
-    let version = schema_version(conn).unwrap_or(0);
-    if version < 3 {
-        // Data-only: rewrite legacy timestamp values to canonical millis form.
-        // Idempotent — canonical values pass through, unparseable ones are kept.
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| AppError::message(format!("feeds migrate v3 tx: {e}")))?;
-        crate::time::normalize_timestamp_columns(
-            &tx,
-            "subscriptions",
-            "id",
-            &["added_at", "pinned_at", "last_fetched_at"],
-        )
-        .map_err(|e| AppError::message(format!("feeds migrate v3 subs: {e}")))?;
-        crate::time::normalize_timestamp_columns(
-            &tx,
-            "items",
-            "id",
-            &["first_seen_at", "imported_at", "published_at"],
-        )
-        .map_err(|e| AppError::message(format!("feeds migrate v3 items: {e}")))?;
-        tx.commit()
-            .map_err(|e| AppError::message(format!("feeds migrate v3 commit: {e}")))?;
-        set_schema_version(conn, 3)?;
-    }
-    let version = schema_version(conn).unwrap_or(0);
-    if version < 4 {
-        // Article→Markdown math conversion changed (env unwrapping, HTML
-        // artifact cleanup, placeholder restore fix); cached bodies from
-        // older versions may show broken math. Re-resolve on next open.
-        conn.execute("UPDATE items SET body_markdown = NULL", [])
-            .map_err(|e| AppError::message(format!("feeds migrate v4: {e}")))?;
-        set_schema_version(conn, 4)?;
-    }
+    crate::sqlite::run_migrations(
+        conn,
+        crate::sqlite::DbMsgs::FEEDS,
+        SCHEMA_VERSION,
+        &MIGRATION_STEPS,
+        set_schema_version,
+    )
+}
+
+/// v3: data-only migration inside one transaction — rewrite legacy timestamp
+/// values to canonical millis form. Idempotent: canonical values pass through,
+/// unparseable ones are kept.
+fn migrate_v3(conn: &Connection) -> Result<(), AppError> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| AppError::message(format!("feeds migrate v3 tx: {e}")))?;
+    crate::time::normalize_timestamp_columns(
+        &tx,
+        "subscriptions",
+        "id",
+        &["added_at", "pinned_at", "last_fetched_at"],
+    )
+    .map_err(|e| AppError::message(format!("feeds migrate v3 subs: {e}")))?;
+    crate::time::normalize_timestamp_columns(
+        &tx,
+        "items",
+        "id",
+        &["first_seen_at", "imported_at", "published_at"],
+    )
+    .map_err(|e| AppError::message(format!("feeds migrate v3 items: {e}")))?;
+    tx.commit()
+        .map_err(|e| AppError::message(format!("feeds migrate v3 commit: {e}")))?;
     Ok(())
 }
 
+/// Test-only accessor: the ladder reads the version through
+/// [`crate::sqlite::run_migrations`] itself.
+#[cfg(test)]
 fn schema_version(conn: &Connection) -> Result<i32, AppError> {
     crate::sqlite::read_schema_version(conn, crate::sqlite::DbMsgs::FEEDS)
 }
@@ -153,6 +143,44 @@ fn set_schema_version(conn: &Connection, version: i32) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_v4_preserving_cached_body_and_import_state() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(DDL_V1).unwrap();
+        conn.execute_batch(MIGRATE_V1_TO_V2).unwrap();
+        set_schema_version(&conn, 4).unwrap();
+        conn.execute_batch("INSERT INTO subscriptions (id, url, title, added_at) VALUES ('s', 'https://example.com/feed', 'Feed', '2026-10-27T00:00:00.000Z');
+            INSERT INTO items (id, subscription_id, guid, title, first_seen_at, body_markdown, imported_at)
+            VALUES ('i', 's', 'g', 'Title', '2026-10-27T00:00:00.000Z', '# Saved body', '2026-10-27T00:00:00.000Z');").unwrap();
+        migrate(&conn).unwrap();
+        let (body, imported, read): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT body_markdown, imported_at, read_at FROM items WHERE id = 'i'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(body, "# Saved body");
+        assert!(imported.is_some());
+        assert!(read.is_none());
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrates_v5_tolerates_replayed_add_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(DDL_V1).unwrap();
+        conn.execute_batch(MIGRATE_V1_TO_V2).unwrap();
+        set_schema_version(&conn, 4).unwrap();
+        // Another process won the v4→v5 race and already added the column;
+        // this process still read v4 and re-runs the migration step.
+        conn.execute_batch("ALTER TABLE items ADD COLUMN read_at TEXT;")
+            .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
 
     #[test]
     fn creates_schema() {
@@ -240,6 +268,8 @@ mod tests {
                  ('i2', 's1', 'g2', 'two', 'garbage-date', '2026-08-03T11:00:00.500Z', '2026-08-03T12:00:00Z');",
             )
             .unwrap();
+            conn.execute_batch("ALTER TABLE items DROP COLUMN read_at")
+                .unwrap();
             conn.execute(
                 "UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'",
                 [],
@@ -247,7 +277,7 @@ mod tests {
             .unwrap();
         }
         let conn = ensure_feeds_at(&db).expect("migrate v3");
-        assert_eq!(schema_version(&conn).unwrap(), 4);
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
 
         let sub: (String, Option<String>) = conn
             .query_row(
@@ -307,15 +337,9 @@ mod tests {
         };
         assert_eq!(order, vec!["i2", "i1"]);
 
-        // Idempotent re-run.
-        conn.execute(
-            "UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-        let conn = ensure_feeds_at(&db).expect("re-migrate");
-        assert_eq!(schema_version(&conn).unwrap(), 4);
+        // Timestamp normalization itself remains idempotent.
+        migrate_v3(&conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
         let added: String = conn
             .query_row(
                 "SELECT added_at FROM subscriptions WHERE id = 's1'",
@@ -349,6 +373,8 @@ mod tests {
                  VALUES ('i1', 's1', 'g1', 'one', '2026-08-03T10:00:01.000Z', '# old body', 'https://doi.org/10.1/x');",
             )
             .unwrap();
+            conn.execute_batch("ALTER TABLE items DROP COLUMN read_at")
+                .unwrap();
             conn.execute(
                 "UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'",
                 [],
@@ -356,7 +382,7 @@ mod tests {
             .unwrap();
         }
         let conn = ensure_feeds_at(&db).expect("migrate v4");
-        assert_eq!(schema_version(&conn).unwrap(), 4);
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
         let (body, paper_url): (Option<String>, Option<String>) = conn
             .query_row(
                 "SELECT body_markdown, paper_url FROM items WHERE id = 'i1'",

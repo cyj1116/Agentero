@@ -13,6 +13,7 @@ import { useTranslation } from "react-i18next";
 import {
 	chooseZoteroFolder,
 	loadStoredOpts,
+	Toggle,
 	useZoteroDirDetect,
 } from "@/components/dialogs/zotero-dialog-shared";
 import { Button } from "@/components/ui/button";
@@ -258,6 +259,16 @@ export function ZoteroMigrateDialog({
 			return it.collections.includes(collFilter);
 		});
 	}, [scan, query, collFilter, collectionInfo]);
+	// A paper unit has one physical folder. Count the entries that would be
+	// visible in more than one Zotero collection so the user can make an
+	// informed choice before recreating the collection tree as folders.
+	const multiCollectionCount = useMemo(
+		() =>
+			scan?.items.filter(
+				(item) => item.itemType !== "note" && item.collections.length > 1,
+			).length ?? 0,
+		[scan],
+	);
 
 	const allFilteredSelected =
 		filtered.length > 0 && filtered.every((it) => selectedItems.has(it.id));
@@ -376,6 +387,13 @@ export function ZoteroMigrateDialog({
 										})}
 									</li>
 								) : null}
+								{result.standaloneNotes > 0 ? (
+									<li>
+										{t("sidebar:zoteroMigrate.summaryStandaloneNotes", {
+											count: result.standaloneNotes,
+										})}
+									</li>
+								) : null}
 								{result.relocated > 0 ? (
 									<li>
 										{t("sidebar:zoteroMigrate.summaryRelocated", {
@@ -401,6 +419,13 @@ export function ZoteroMigrateDialog({
 									<li>
 										{t("sidebar:zoteroMigrate.summarySkipped", {
 											count: result.skipped,
+										})}
+									</li>
+								) : null}
+								{result.ignoredUnsupported > 0 ? (
+									<li>
+										{t("sidebar:zoteroMigrate.summaryIgnoredUnsupported", {
+											count: result.ignoredUnsupported,
 										})}
 									</li>
 								) : null}
@@ -517,6 +542,14 @@ export function ZoteroMigrateDialog({
 											label={t("sidebar:zoteroMigrate.migrateAnnotations")}
 										/>
 									</div>
+
+									{preserveCollections && multiCollectionCount > 0 ? (
+										<div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-amber-950 text-xs dark:text-amber-200">
+											{t("sidebar:zoteroMigrate.multiCollectionWarning", {
+												count: multiCollectionCount,
+											})}
+										</div>
+									) : null}
 
 									<div className="space-y-1.5">
 										<div className="flex items-center justify-between">
@@ -710,34 +743,5 @@ export function ZoteroMigrateDialog({
 				</DialogFooter>
 			</DialogContent>
 		</Dialog>
-	);
-}
-
-/** A checkbox + label option row. */
-function Toggle({
-	id,
-	checked,
-	onChange,
-	disabled,
-	label,
-}: {
-	id: string;
-	checked: boolean;
-	onChange: (v: boolean) => void;
-	disabled?: boolean;
-	label: string;
-}) {
-	return (
-		<div className="flex items-center gap-2">
-			<Checkbox
-				id={id}
-				checked={checked}
-				onCheckedChange={(v) => onChange(v === true)}
-				disabled={disabled}
-			/>
-			<label htmlFor={id} className="cursor-pointer text-sm">
-				{label}
-			</label>
-		</div>
 	);
 }

@@ -6,11 +6,12 @@ import {
 	Loader2,
 	RefreshCw,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { PaneHeader } from "@/components/shell/pane-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { QuietIconButton } from "@/components/ui/quiet-icon-button";
 import {
 	Tooltip,
 	TooltipContent,
@@ -18,6 +19,12 @@ import {
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { CitationImportPopover } from "@/components/viewer/citation-import-menu";
+import {
+	PanelCard,
+	PanelCardActions,
+	PanelCardButton,
+	PanelEmptyState,
+} from "@/components/viewer/panels/panel-primitives";
 import { useCitationImport } from "@/hooks/use-citation-import";
 import { usePaperRefsSidecar } from "@/hooks/use-paper-refs-sidecar";
 import { errorText } from "@/lib/core/error";
@@ -42,9 +49,13 @@ type ReferencesPanelProps = {
 	compact?: boolean;
 };
 
-function citationMatchesFilter(citation: Citation, needle: string): boolean {
+/**
+ * Lowercase filter haystack for one citation. Joins `citation.raw` (the full
+ * BibTeX/bbl source), so build it once per sidecar instead of per keystroke.
+ */
+function citationFilterHaystack(citation: Citation): string {
 	const m = citation.metadata;
-	const haystack = [
+	return [
 		citation.display,
 		citation.rawKey,
 		citation.raw,
@@ -58,7 +69,6 @@ function citationMatchesFilter(citation: Citation, needle: string): boolean {
 		.filter(Boolean)
 		.join(" ")
 		.toLowerCase();
-	return haystack.includes(needle);
 }
 
 /**
@@ -119,17 +129,27 @@ export function ReferencesPanel({
 
 	const citations = sidecar?.citations ?? [];
 	const needle = filter.trim().toLowerCase();
+	// Haystacks / ordinals only change with the sidecar; typing in the filter
+	// reuses them and just runs `includes` over the precomputed strings.
+	const haystacks = useMemo(
+		() => citations.map(citationFilterHaystack),
+		[citations],
+	);
 	// Ordinal comes from the unfiltered list, so carry it through the filter.
-	const rows = citations.map((citation, index) => ({
-		citation,
-		ordinal: index + 1,
-	}));
+	const rows = useMemo(
+		() =>
+			citations.map((citation, index) => ({ citation, ordinal: index + 1 })),
+		[citations],
+	);
 	const visible = needle
-		? rows.filter((row) => citationMatchesFilter(row.citation, needle))
+		? rows.filter((_, index) => haystacks[index].includes(needle))
 		: rows;
 
 	const listBody = !paperPath ? (
-		<EmptyState text={t("references.noPaper")} />
+		<PanelEmptyState
+			icon={<BookMarked className="size-5" aria-hidden />}
+			text={t("references.noPaper")}
+		/>
 	) : loading ? (
 		<div className="flex min-h-0 flex-1 items-center justify-center">
 			<Loader2
@@ -138,7 +158,8 @@ export function ReferencesPanel({
 			/>
 		</div>
 	) : !sidecar || citations.length === 0 ? (
-		<EmptyState
+		<PanelEmptyState
+			icon={<BookMarked className="size-5" aria-hidden />}
 			text={sidecar ? t("references.emptyParsed") : t("references.empty")}
 		>
 			<Button
@@ -153,7 +174,7 @@ export function ReferencesPanel({
 				) : null}
 				{t("references.parse")}
 			</Button>
-		</EmptyState>
+		</PanelEmptyState>
 	) : (
 		<>
 			{compact ? null : (
@@ -228,26 +249,6 @@ export function ReferencesPanel({
 
 			{listBody}
 		</section>
-	);
-}
-
-function EmptyState({
-	text,
-	children,
-}: {
-	text: string;
-	children?: React.ReactNode;
-}) {
-	return (
-		<div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-8 text-center">
-			<div className="flex size-12 items-center justify-center rounded-2xl bg-muted/70 text-muted-foreground">
-				<BookMarked className="size-5" aria-hidden />
-			</div>
-			<p className="max-w-[15rem] text-muted-foreground text-xs leading-relaxed">
-				{text}
-			</p>
-			{children}
-		</div>
 	);
 }
 
@@ -332,29 +333,17 @@ function CitationCard({
 	};
 
 	return (
-		<div className="group relative rounded-lg border border-transparent px-3 py-2.5 transition-colors hover:border-border/60 hover:bg-muted/40">
+		<PanelCard>
 			{matched ? (
-				// biome-ignore lint/a11y/useSemanticElements: role=button wrapper for card activation
-				<div
-					role="button"
-					tabIndex={0}
-					className="block w-full cursor-pointer rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-					onClick={activate}
-					onKeyDown={(e) => {
-						if (e.key === "Enter" || e.key === " ") {
-							e.preventDefault();
-							activate();
-						}
-					}}
-				>
+				<PanelCardButton onActivate={activate}>
 					<ReferenceCardBody citation={citation} ordinal={ordinal} />
-				</div>
+				</PanelCardButton>
 			) : (
 				<div className="block w-full rounded-md text-left">
 					<ReferenceCardBody citation={citation} ordinal={ordinal} />
 				</div>
 			)}
-			<div className="absolute top-2 right-2 flex items-center gap-0.5 rounded-lg bg-background/80 p-0.5 opacity-0 shadow-sm ring-1 ring-border/60 backdrop-blur-sm transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100">
+			<PanelCardActions>
 				{importable ? (
 					<CitationImportPopover
 						citationId={citation.id}
@@ -363,11 +352,7 @@ function CitationCard({
 						importing={importing}
 						onImport={(folder) => onImport(citation, folder)}
 					>
-						<Button
-							type="button"
-							variant="ghost"
-							size="icon-xs"
-							className="size-6 text-muted-foreground hover:text-foreground"
+						<QuietIconButton
 							aria-label={t("references.import")}
 							disabled={importing}
 						>
@@ -376,23 +361,19 @@ function CitationCard({
 							) : (
 								<Import className="size-3.5" />
 							)}
-						</Button>
+						</QuietIconButton>
 					</CitationImportPopover>
 				) : null}
 				{link ? (
 					<TooltipProvider delayDuration={250}>
 						<Tooltip>
 							<TooltipTrigger asChild>
-								<Button
-									type="button"
-									variant="ghost"
-									size="icon-xs"
-									className="size-6 text-muted-foreground hover:text-foreground"
+								<QuietIconButton
 									aria-label={t("references.openLink")}
 									onClick={() => openExternalUrl(link)}
 								>
 									<ArrowUpRight className="size-3.5" />
-								</Button>
+								</QuietIconButton>
 							</TooltipTrigger>
 							<TooltipContent side="bottom">
 								{t("references.openLink")}
@@ -400,7 +381,7 @@ function CitationCard({
 						</Tooltip>
 					</TooltipProvider>
 				) : null}
-			</div>
-		</div>
+			</PanelCardActions>
+		</PanelCard>
 	);
 }

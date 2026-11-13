@@ -3,7 +3,7 @@
 use super::import::{
     import_connector_item_remote_with_cookies, import_connector_item_with_cookies,
     import_standalone_attachment, save_attachment_from_resolver, session_has_attachment_resolvers,
-    write_snapshot_html, write_snapshot_html_remote,
+    spawn_layout_after_connector_pdf, write_snapshot_html, write_snapshot_html_remote,
 };
 use super::state::{ConnectorController, ConnectorItemSaved, ProgressAttachment, ProgressItem};
 use crate::core::error::AppError;
@@ -35,6 +35,7 @@ pub async fn serve(
 ) -> Result<(), AppError> {
     let state = AppState { ctrl };
     let app = Router::new()
+        .route("/integration/macWordCommand", get(mac_word_command))
         .route("/connector/ping", get(ping_get).post(ping_post))
         .route("/connector/saveItems", post(save_items))
         .route("/connector/saveSnapshot", post(save_snapshot))
@@ -911,6 +912,9 @@ async fn save_attachment(
             "{write_error}; finalizer: {finalize_error}"
         ))),
     };
+    if result.is_ok() {
+        spawn_layout_after_connector_pdf(&state.ctrl, &session_id, parent_item_id.as_deref());
+    }
 
     match result {
         Ok(path) => json_response(StatusCode::CREATED, json!({ "path": path })),
@@ -1170,6 +1174,9 @@ async fn save_attachment_from_resolver_handler(
             "{save_error}; finalizer: {finalize_error}"
         ))),
     };
+    if result.is_ok() {
+        spawn_layout_after_connector_pdf(&state.ctrl, &session_id, Some(item_id.as_str()));
+    }
 
     match result {
         Ok(title) => text_response(StatusCode::CREATED, "text/plain", &title),
@@ -1260,4 +1267,44 @@ async fn delay_sync(headers: HeaderMap) -> Response {
     *res.status_mut() = StatusCode::NO_CONTENT;
     add_zotero_headers(res.headers_mut());
     res
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MacWordCommand {
+    agent: String,
+    command: String,
+    document: String,
+    template_version: String,
+}
+
+async fn mac_word_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<MacWordCommand>,
+) -> StatusCode {
+    let host = format!("127.0.0.1:{}", state.ctrl.status().port);
+    if headers.get(header::HOST).and_then(|h| h.to_str().ok()) != Some(host.as_str())
+        || headers.contains_key(header::ORIGIN)
+        || headers.contains_key("sec-fetch-site")
+        || !matches!(query.agent.as_str(), "MacWord16" | "MacWord2016")
+        || query.template_version != "2"
+        || query.document.len() > 4096
+        || !query
+            .document
+            .trim_end_matches('/')
+            .ends_with("Microsoft Word.app")
+        || query.command.len() > 64
+    {
+        return StatusCode::FORBIDDEN;
+    }
+    // The path is only a protocol sanity check. The driver always addresses
+    // Word by bundle ID, never executes or opens the caller-supplied path.
+    let Some(app) = state.ctrl.app_handle() else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    match crate::integration::word::accept(app, query.command) {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::CONFLICT,
+    }
 }

@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useHostNodeStatus } from "@/hooks/use-host-node-status";
 import i18n from "@/i18n";
 import {
 	type CatalogEntry,
@@ -7,13 +8,20 @@ import {
 	runToolLifecycle as runAgentToolLifecycle,
 	type ToolLifecycleAction,
 } from "@/lib/agent";
-import { lifecycleErrorMessage } from "@/lib/agent/lifecycle-error";
+import {
+	isNpmMissingError,
+	lifecycleErrorMessage,
+} from "@/lib/agent/lifecycle-error";
 import { BACKGROUND_TASK_CANCELLED_MESSAGE } from "@/lib/core/background-tasks";
 import { commands, events } from "@/lib/core/bindings";
 import { errorText } from "@/lib/core/error";
 import { notifyError, notifySuccess } from "@/lib/core/notify";
 import { isTauri } from "@/lib/core/tauri";
 import { listenEventSafe } from "@/lib/core/tauri-events";
+import {
+	isLifecycleNodeBlocked,
+	lifecycleNeedsNode,
+} from "@/lib/doctor/node-guidance";
 import { ensureVault } from "@/lib/vault";
 import { getVaultPath } from "@/lib/vault/store";
 
@@ -78,12 +86,50 @@ export function useAgentToolLifecycle(opts: {
 		[t],
 	);
 
+	/** After a successful Node install, refresh catalog badges (bundled adapter / npm CLIs). */
+	const rescanAfterNodeInstall = useCallback(async () => {
+		const scan = await scanOnce();
+		if (scan && probeInstalled) await probeInstalled(scan, false);
+		if (refreshVersions) await refreshVersions();
+	}, [scanOnce, probeInstalled, refreshVersions]);
+
+	/**
+	 * Local Node.js/npm readiness: drives the Agent pane notice, and lets the
+	 * npm/bundled-adapter lifecycle actions guide the user to install Node
+	 * instead of starting a doomed background install (Fix #786).
+	 */
+	const hostNode = useHostNodeStatus({ onInstalled: rescanAfterNodeInstall });
+	const { checkNodeGap, installNode } = hostNode;
+
 	const runToolLifecycle = useCallback(
 		async (
 			entry: CatalogEntry,
 			action: ToolLifecycleAction,
 		): Promise<boolean> => {
 			if (!isTauri()) return false;
+			// npm / bundled-JS adapter actions cannot run without Node.js/npm:
+			// guide the user to install it instead of failing silently in the
+			// background task. Wait for the mount probe so a click that lands
+			// before its first result cannot bypass this guard.
+			const needsNode = lifecycleNeedsNode(entry, action);
+			const nodeGap = needsNode ? await checkNodeGap() : null;
+			if (needsNode && isLifecycleNodeBlocked(entry, action, nodeGap)) {
+				const canInstall =
+					nodeGap?.nodeMissing === true || nodeGap?.npmMissing === true;
+				const message = canInstall
+					? t("agent.nodeRequired")
+					: t("agent.nodeUnusable");
+				onError?.(message);
+				notifyError(message, {
+					action: canInstall
+						? {
+								label: t("doctor.host.install.button"),
+								onClick: installNode,
+							}
+						: undefined,
+				});
+				return false;
+			}
 			setLifecycleBusyIds((prev) => {
 				const next = new Map(prev);
 				next.set(entry.templateId, action);
@@ -151,7 +197,18 @@ export function useAgentToolLifecycle(opts: {
 				// User-initiated cancel is not an error: no toast, no red banner.
 				if (message !== BACKGROUND_TASK_CANCELLED_MESSAGE) {
 					onError?.(message);
-					notifyError(message);
+					if (isNpmMissingError(message)) {
+						// npm missing on PATH: offer a one-click Node.js install
+						// (npm ships with Node) as a background task.
+						notifyError(message, {
+							action: {
+								label: t("doctor.host.install.button"),
+								onClick: installNode,
+							},
+						});
+					} else {
+						notifyError(message);
+					}
 				}
 				return false;
 			} finally {
@@ -166,7 +223,9 @@ export function useAgentToolLifecycle(opts: {
 			}
 		},
 		[
+			checkNodeGap,
 			clearLifecycleProgress,
+			installNode,
 			lifecyclePhaseLabel,
 			onError,
 			patchLifecycleProgress,
@@ -192,5 +251,7 @@ export function useAgentToolLifecycle(opts: {
 		lifecycleProgress,
 		runToolLifecycle,
 		cancelToolLifecycle,
+		/** Local Node.js/npm readiness — the Agent pane renders the install notice from it. */
+		hostNode,
 	};
 }

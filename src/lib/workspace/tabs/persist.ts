@@ -1,3 +1,4 @@
+import { perfActive } from "@/lib/core/perf";
 import {
 	readJsonStorage,
 	removeStorageKey,
@@ -11,23 +12,9 @@ import type {
 	PersistedTab,
 	PersistedTabs,
 } from "@/lib/workspace/tabs/types";
-import type { CenterViewMode } from "@/lib/workspace/viewer";
+import { isCenterViewMode } from "@/lib/workspace/viewer";
 
 const TABS_STORAGE_KEY = "agentero-open-tabs";
-
-const VALID_MODES = new Set<CenterViewMode>([
-	"markdown",
-	"pdf",
-	"html",
-	"image",
-	"translation",
-	"excalidraw",
-	"text",
-]);
-
-function isCenterViewMode(v: unknown): v is CenterViewMode {
-	return typeof v === "string" && VALID_MODES.has(v as CenterViewMode);
-}
 
 export function panelPersistParams(tab: DocTab): PanelPersistParams {
 	return {
@@ -35,6 +22,8 @@ export function panelPersistParams(tab: DocTab): PanelPersistParams {
 		path: tab.path,
 		mode: tab.mode,
 		title: tab.title,
+		...(tab.texLive ? { texLive: true } : {}),
+		...(tab.texRoot ? { texRoot: tab.texRoot } : {}),
 	};
 }
 
@@ -45,6 +34,8 @@ type LayoutPanelState = {
 		path?: string;
 		mode?: string;
 		title?: string;
+		texLive?: boolean;
+		texRoot?: string;
 	};
 };
 
@@ -122,7 +113,17 @@ export function extractTabsFromLayout(layout: unknown): {
 				: undefined;
 		if (seen.has(panelId)) continue;
 		seen.add(panelId);
-		tabs.push({ id: panelId, path, mode, title });
+		tabs.push({
+			id: panelId,
+			path,
+			mode,
+			title,
+			...(panel.params?.texLive === true ? { texLive: true } : {}),
+			...(typeof panel.params?.texRoot === "string" &&
+			panel.params.texRoot.trim()
+				? { texRoot: panel.params.texRoot }
+				: {}),
+		});
 	}
 	const activeId = findActivePanelIdInLayout(l);
 	return {
@@ -188,6 +189,9 @@ export function loadPersistedTabs(): PersistedTabs | null {
  * Empty / missing layout clears storage.
  */
 export function savePersistedTabs(layout: unknown | null): void {
+	// A perf run shares WebView storage with the daily app. Do not replace
+	// the user's open tabs, and do not clear them when this process starts empty.
+	if (perfActive()) return;
 	if (layout == null || typeof layout !== "object") {
 		removeStorageKey(TABS_STORAGE_KEY);
 		return;

@@ -7,6 +7,15 @@
  * Parsing lives here so both the listener hook and tests share one guard.
  */
 
+import type { SelectionDraftScreen } from "@/lib/agent/selection-chat-store";
+import type { SelectionSide } from "@/lib/agent/selection-side";
+
+/** Keyboard state forwarded for authoritative matching against live settings. */
+export type WebBridgeKeyEvent = Pick<
+	KeyboardEvent,
+	"key" | "code" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey"
+>;
+
 /** Selection rect in the frame's viewport (CSS px). */
 export type WebBridgeRect = {
 	x: number;
@@ -21,9 +30,15 @@ export type WebBridgeMessage =
 			text: string;
 			rect: WebBridgeRect | null;
 			url: string;
+			/** Side of the selection where the frame gesture ended. */
+			side?: SelectionSide;
+			/** Frame-viewport x of the gesture endpoint. */
+			cursorX?: number;
 	  }
 	| { type: "scroll" }
-	| { type: "shortcut"; id: "quickChat" | "addToChat" }
+	| { type: "ready" }
+	| { type: "escape" }
+	| { type: "shortcut"; event: WebBridgeKeyEvent }
 	| { type: "external"; url: string };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -50,14 +65,43 @@ export function parseWebBridgeMessage(data: unknown): WebBridgeMessage | null {
 					rect = { x, y, width, height };
 				}
 			}
-			return { type: "selection", text: data.text, rect, url: data.url };
+			const side =
+				data.side === "above" || data.side === "below" ? data.side : undefined;
+			const cursorX =
+				typeof data.cursorX === "number" ? data.cursorX : undefined;
+			return {
+				type: "selection",
+				text: data.text,
+				rect,
+				url: data.url,
+				side,
+				cursorX,
+			};
 		}
+		case "ready":
+			return { type: "ready" };
 		case "scroll":
 			return { type: "scroll" };
-		case "shortcut":
-			return data.id === "quickChat" || data.id === "addToChat"
-				? { type: "shortcut", id: data.id }
-				: null;
+		case "escape":
+			return { type: "escape" };
+		case "shortcut": {
+			const event = data.event;
+			if (
+				!isRecord(event) ||
+				typeof event.key !== "string" ||
+				typeof event.code !== "string" ||
+				typeof event.metaKey !== "boolean" ||
+				typeof event.ctrlKey !== "boolean" ||
+				typeof event.altKey !== "boolean" ||
+				typeof event.shiftKey !== "boolean"
+			)
+				return null;
+			const { key, code, metaKey, ctrlKey, altKey, shiftKey } = event;
+			return {
+				type: "shortcut",
+				event: { key, code, metaKey, ctrlKey, altKey, shiftKey },
+			};
+		}
 		case "external":
 			return typeof data.url === "string"
 				? { type: "external", url: data.url }
@@ -69,30 +113,24 @@ export function parseWebBridgeMessage(data: unknown): WebBridgeMessage | null {
 
 /**
  * Anchor point (top-center of the selection) in app viewport coordinates:
- * frame-viewport rect + the iframe element's offset in the page.
+ * frame-viewport rect + the iframe element's offset in the page. The returned
+ * bounds let floating cards open outside the selected lines.
  */
 export function bridgeSelectionScreen(
 	rect: WebBridgeRect,
 	iframeRect: { x: number; y: number },
-): { x: number; y: number } {
+	side?: SelectionSide,
+	cursorX?: number,
+): SelectionDraftScreen {
+	const left = iframeRect.x + rect.x;
+	const top = iframeRect.y + rect.y;
+	const right = left + rect.width;
+	const bottom = top + rect.height;
 	return {
-		x: iframeRect.x + rect.x + rect.width / 2,
-		y: iframeRect.y + rect.y,
-	};
-}
-
-/**
- * Bottom-right corner of the selection in app viewport coordinates. Translate
- * cards anchor here so they open below-right of the selected text instead of
- * on top of its first lines (a cross-paragraph selection's bounding rect
- * reaches far down the page, making a top anchor cover body text).
- */
-export function bridgeSelectionBottomRight(
-	rect: WebBridgeRect,
-	iframeRect: { x: number; y: number },
-): { x: number; y: number } {
-	return {
-		x: iframeRect.x + rect.x + rect.width,
-		y: iframeRect.y + rect.y + rect.height,
+		x: (left + right) / 2,
+		y: top,
+		side,
+		cursorX: cursorX != null ? iframeRect.x + cursorX : undefined,
+		selectionBounds: { left, top, right, bottom },
 	};
 }

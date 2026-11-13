@@ -4,10 +4,12 @@ import {
 	type LucideIcon,
 	Settings2,
 	SquareTerminal,
+	Table,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { buildPaperSearchText } from "@/components/library/library-row-utils";
 import {
 	Command,
 	CommandDialog,
@@ -17,9 +19,19 @@ import {
 	CommandList,
 } from "@/components/ui/command";
 import type { PaperMetadata } from "@/lib/paper";
+import { paperDirFromPath } from "@/lib/paper/detect";
+import { editablePaperTags } from "@/lib/paper/tags";
+import { isResearchTablePath } from "@/lib/research-table/model";
 import { filterByFuzzy } from "@/lib/shell/commands/match";
-import type { AppCommand, PaletteMode } from "@/lib/shell/commands/types";
+import { listCommands } from "@/lib/shell/commands/registry";
+import {
+	type AppCommand,
+	commandCategory,
+	commandTitle,
+	type PaletteMode,
+} from "@/lib/shell/commands/types";
 import { type SearchHit, searchVault } from "@/lib/vault/search";
+import { searchWikiLinks, type WikiSearchCandidate } from "@/lib/wiki/api";
 
 type CommandPaletteProps = {
 	open: boolean;
@@ -29,7 +41,11 @@ type CommandPaletteProps = {
 	vaultPath: string | null;
 	/** In-memory catalog rows for instant title/author quick-open. */
 	papers: PaperMetadata[];
-	/** Commands for ⇧⌘P / `>` mode */
+	/**
+	 * Commands for ⇧⌘P / `>` mode. While the palette is open this component
+	 * re-reads the registry, so a registration after the parent rendered
+	 * still shows up on the next palette render.
+	 */
 	commands: AppCommand[];
 	/** Open a paper by its vault-relative folder (e.g. papers/x). */
 	onOpenPaper: (paperRel: string) => void;
@@ -38,6 +54,12 @@ type CommandPaletteProps = {
 };
 
 const PAPER_LIMIT = 8;
+const ALIAS_LIMIT = 8;
+
+/** User-facing tag names for a catalog row (system projections hidden). */
+function tagNames(paper: PaperMetadata): string[] {
+	return editablePaperTags(paper.tags).map((tag) => tag.name);
+}
 
 /**
  * Global palette: Go (⌘P) = papers + vault search;
@@ -58,6 +80,10 @@ export function CommandPalette({
 	const [hits, setHits] = useState<SearchHit[]>([]);
 	const [loading, setLoading] = useState(false);
 	const genRef = useRef(0);
+	// Alias matches come from the Wiki index (frontmatter `aliases`); separate
+	// generation counter so the two async searches never clobber each other.
+	const [aliasHits, setAliasHits] = useState<WikiSearchCandidate[]>([]);
+	const aliasGenRef = useRef(0);
 
 	// Reset query when opening or when mode changes while open.
 	useEffect(() => {
@@ -83,32 +109,49 @@ export function CommandPalette({
 			: query;
 	}, [query, effectiveMode]);
 
+	const resolvedCommands = open ? listCommands() : commands;
+	const translate = useCallback(
+		(key: string) => t(key as "commandPalette.title"),
+		[t],
+	);
+
 	const visibleCommands = useMemo(() => {
-		const available = commands.filter((c) => (c.when ? c.when() : true));
+		const available = resolvedCommands.filter((c) =>
+			c.when ? c.when() : true,
+		);
 		return filterByFuzzy(available, commandQuery, (c) => {
-			const title = t(c.titleKey as "commandPalette.title");
-			const cat = c.categoryKey
-				? t(c.categoryKey as "commandPalette.title")
-				: "";
+			const title = commandTitle(c, translate);
+			const cat = commandCategory(c, translate);
 			const kw = c.keywords?.join(" ") ?? "";
 			return `${cat} ${title} ${kw} ${c.id}`;
 		});
-	}, [commands, commandQuery, t]);
+	}, [resolvedCommands, commandQuery, translate]);
 
-	// Instant, in-memory paper matches (title / authors / id). Empty query → recents.
+	// PERF: precompute each paper's haystack once per catalog snapshot
+	// (buildPaperSearchText — same source as the library table filter) so
+	// per-keystroke filtering only runs `includes` on cached strings.
+	const searchRows = useMemo(() => {
+		const rows: { paper: PaperMetadata; hay: string }[] = [];
+		for (const p of papers) {
+			if (!p.path) continue;
+			rows.push({ paper: p, hay: buildPaperSearchText(p) });
+		}
+		return rows;
+	}, [papers]);
+
+	// Instant, in-memory paper matches (searchText: title / identifiers /
+	// path / authors / tags). Empty query → recents.
 	const paperMatches = useMemo(() => {
 		if (effectiveMode !== "go") return [];
-		const withPath = papers.filter((p) => p.path);
 		const terms = goQuery.toLowerCase().split(/\s+/).filter(Boolean);
-		if (!terms.length) return withPath.slice(0, PAPER_LIMIT);
-		return withPath
-			.filter((p) => {
-				const hay =
-					`${p.title} ${p.authors?.join(" ") ?? ""} ${p.id}`.toLowerCase();
-				return terms.every((term) => hay.includes(term));
-			})
-			.slice(0, PAPER_LIMIT);
-	}, [papers, goQuery, effectiveMode]);
+		if (!terms.length) {
+			return searchRows.slice(0, PAPER_LIMIT).map((r) => r.paper);
+		}
+		return searchRows
+			.filter((r) => terms.every((term) => r.hay.includes(term)))
+			.slice(0, PAPER_LIMIT)
+			.map((r) => r.paper);
+	}, [searchRows, goQuery, effectiveMode]);
 
 	// Debounced backend full-text search over Vault Markdown.
 	useEffect(() => {
@@ -140,6 +183,49 @@ export function CommandPalette({
 		return () => clearTimeout(timer);
 	}, [goQuery, open, vaultPath, effectiveMode]);
 
+	// Debounced frontmatter-alias search over Vault Markdown (Wiki index). Only
+	// alias rows are kept — path/heading/block matches would duplicate the other
+	// tiers, and alias rows are exactly what the paper/content tiers can't see.
+	useEffect(() => {
+		if (!open || !vaultPath || effectiveMode !== "go") {
+			setAliasHits([]);
+			return;
+		}
+		const q = goQuery.trim();
+		if (!q) {
+			setAliasHits([]);
+			return;
+		}
+		const gen = ++aliasGenRef.current;
+		const timer = setTimeout(() => {
+			searchWikiLinks(vaultPath, q, { kind: "file" })
+				.then((r) => {
+					if (gen !== aliasGenRef.current) return;
+					setAliasHits(r.filter((c) => c.alias).slice(0, ALIAS_LIMIT));
+				})
+				.catch(() => {
+					if (gen === aliasGenRef.current) setAliasHits([]);
+				});
+		}, 200);
+		return () => clearTimeout(timer);
+	}, [goQuery, open, vaultPath, effectiveMode]);
+
+	// Drop aliases already shown as a paper row (the paper tier wins), and drop
+	// content hits whose file is already shown as an alias row.
+	const aliasRows = useMemo(() => {
+		const paperPaths = new Set(paperMatches.map((p) => p.path as string));
+		return aliasHits.filter((c) => {
+			const paperRel = paperDirFromPath(c.path);
+			return !(paperRel && paperPaths.has(paperRel));
+		});
+	}, [aliasHits, paperMatches]);
+
+	const contentHits = useMemo(() => {
+		if (!aliasHits.length) return hits;
+		const aliasPaths = new Set(aliasHits.map((c) => c.path));
+		return hits.filter((hit) => !aliasPaths.has(hit.path));
+	}, [hits, aliasHits]);
+
 	const choosePaper = (rel: string) => {
 		onOpenPaper(rel);
 		onOpenChange(false);
@@ -149,12 +235,19 @@ export function CommandPalette({
 		else onOpenVaultRel(hit.path);
 		onOpenChange(false);
 	};
+	const chooseAlias = (candidate: WikiSearchCandidate) => {
+		const paperRel = paperDirFromPath(candidate.path);
+		if (paperRel) onOpenPaper(paperRel);
+		else onOpenVaultRel(candidate.path);
+		onOpenChange(false);
+	};
 	const runCommand = (cmd: AppCommand) => {
 		onOpenChange(false);
 		void Promise.resolve(cmd.run()).catch(() => undefined);
 	};
 
-	const hasGoResults = paperMatches.length > 0 || hits.length > 0;
+	const hasGoResults =
+		paperMatches.length > 0 || aliasRows.length > 0 || contentHits.length > 0;
 	const hasCmdResults = visibleCommands.length > 0;
 
 	const placeholder =
@@ -186,10 +279,8 @@ export function CommandPalette({
 						hasCmdResults ? (
 							<CommandGroup heading={t("commandPalette.commands")}>
 								{visibleCommands.map((cmd) => {
-									const titleText = t(cmd.titleKey as "commandPalette.title");
-									const catText = cmd.categoryKey
-										? t(cmd.categoryKey as "commandPalette.title")
-										: "";
+									const titleText = commandTitle(cmd, translate);
+									const catText = commandCategory(cmd, translate);
 									return (
 										<CommandItem
 											key={cmd.id}
@@ -232,36 +323,69 @@ export function CommandPalette({
 											: t("commandPalette.recent")
 									}
 								>
-									{paperMatches.map((p) => (
+									{paperMatches.map((p) => {
+										const tags = tagNames(p);
+										const meta = [
+											p.authors?.join(", "),
+											p.year ? String(p.year) : null,
+											tags.length ? tags.join(", ") : null,
+										]
+											.filter(Boolean)
+											.join(" · ");
+										return (
+											<CommandItem
+												key={p.path}
+												value={`paper:${p.path}`}
+												onSelect={() => choosePaper(p.path as string)}
+											>
+												<FileText className="text-muted-foreground" />
+												<div className="flex min-w-0 flex-col">
+													<span className="truncate">{p.title || p.id}</span>
+													{meta ? (
+														<span className="truncate text-muted-foreground text-xs">
+															{meta}
+														</span>
+													) : null}
+												</div>
+											</CommandItem>
+										);
+									})}
+								</CommandGroup>
+							) : null}
+
+							{aliasRows.length ? (
+								<CommandGroup heading={t("commandPalette.aliases")}>
+									{aliasRows.map((candidate) => (
 										<CommandItem
-											key={p.path}
-											value={`paper:${p.path}`}
-											onSelect={() => choosePaper(p.path as string)}
+											key={`alias:${candidate.path}:${candidate.label}`}
+											value={`alias:${candidate.path}:${candidate.label}`}
+											onSelect={() => chooseAlias(candidate)}
 										>
 											<FileText className="text-muted-foreground" />
 											<div className="flex min-w-0 flex-col">
-												<span className="truncate">{p.title || p.id}</span>
-												{p.authors?.length ? (
-													<span className="truncate text-muted-foreground text-xs">
-														{p.authors.join(", ")}
-														{p.year ? ` · ${p.year}` : ""}
-													</span>
-												) : null}
+												<span className="truncate">{candidate.label}</span>
+												<span className="truncate text-muted-foreground text-xs">
+													{candidate.path}
+												</span>
 											</div>
 										</CommandItem>
 									))}
 								</CommandGroup>
 							) : null}
 
-							{hits.length ? (
+							{contentHits.length ? (
 								<CommandGroup heading={t("commandPalette.contents")}>
-									{hits.map((hit) => (
+									{contentHits.map((hit) => (
 										<CommandItem
 											key={hit.path}
 											value={`hit:${hit.path}`}
 											onSelect={() => chooseHit(hit)}
 										>
-											<FileText className="text-muted-foreground" />
+											{isResearchTablePath(hit.path) ? (
+												<Table className="text-muted-foreground" />
+											) : (
+												<FileText className="text-muted-foreground" />
+											)}
 											<div className="flex min-w-0 flex-col">
 												<span className="truncate">{hit.title}</span>
 												<span className="truncate text-muted-foreground text-xs">

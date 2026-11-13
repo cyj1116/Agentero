@@ -2,10 +2,13 @@ import { getVersion } from "@tauri-apps/api/app";
 import { appLogDir } from "@tauri-apps/api/path";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import {
+	ArrowRight,
 	Download,
+	ExternalLink,
 	FolderOpen,
+	Info,
+	Languages,
 	LoaderCircle,
-	MousePointerClick,
 	RefreshCw,
 	Star,
 	Telescope,
@@ -14,13 +17,19 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import agenteroAppIcon from "@/assets/agentero-app-icon.svg";
-import { CompactCodeBlock } from "@/components/ai-elements/code-block";
+import { CompactCodeBlock } from "@/components/agent/rendering/code-block";
+import { AboutFeedback } from "@/components/settings/panes/about-feedback";
 import {
 	PageTitle,
 	SettingsGroup,
 	SettingsRow,
 } from "@/components/settings/settings-layout";
 import { Button } from "@/components/ui/button";
+import {
+	Tooltip,
+	TooltipContent,
+	TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { lifecycleErrorMessage } from "@/lib/agent/lifecycle-error";
 import {
 	plazaScratchClear,
@@ -28,21 +37,24 @@ import {
 } from "@/lib/agent/plaza-scratch";
 import {
 	type CliInstallStatus,
-	type FinderServiceStatus,
 	fetchCliInstallStatus,
-	fetchFinderServiceStatus,
 	installCliCommand,
-	installFinderService,
 	uninstallCliCommand,
-	uninstallFinderService,
 } from "@/lib/cli/api";
 import { errorText } from "@/lib/core/error";
 import { clearLogs } from "@/lib/core/logger";
 import { notifyError, notifySuccess } from "@/lib/core/notify";
 import { openExternalUrl } from "@/lib/core/open-external";
-import { isMacOS, isTauri, isWindows } from "@/lib/core/tauri";
+import { isMacOS, isMobileApp, isTauri, isWindows } from "@/lib/core/tauri";
+import {
+	clearReflowCaches,
+	openReflowCacheFolder,
+	reflowCacheUsage,
+} from "@/lib/pdf/reflow/cache-manage";
+import { notifyReleaseDownloadError } from "@/lib/settings/download-error";
 import {
 	checkForUpdate,
+	getUpdateReleaseUrl,
 	getUpdateSnapshot,
 	installAvailableUpdate,
 	subscribeUpdate,
@@ -62,16 +74,20 @@ export function AboutPane() {
 	const [cli, setCli] = useState<CliInstallStatus | null>(null);
 	const [cliBusy, setCliBusy] = useState(false);
 	const [cliLoading, setCliLoading] = useState(false);
-	const [finder, setFinder] = useState<FinderServiceStatus | null>(null);
-	const [finderBusy, setFinderBusy] = useState(false);
 	const [logsBusy, setLogsBusy] = useState(false);
 	const [scratchStats, setScratchStats] = useState<{
 		papers: number;
 		bytes: number;
 	} | null>(null);
 	const [scratchBusy, setScratchBusy] = useState(false);
+	const [reflowUsage, setReflowUsage] = useState<{
+		papers: number;
+		bytes: number;
+	} | null>(null);
+	const [reflowBusy, setReflowBusy] = useState(false);
 	const isMac = useMemo(() => isMacOS(), []);
 	const isWin = useMemo(() => isWindows(), []);
+	const showFeedback = isTauri() && !isMobileApp();
 
 	const refreshCli = useCallback(async () => {
 		if (!isTauri()) return;
@@ -86,15 +102,6 @@ export function AboutPane() {
 		}
 	}, [t]);
 
-	const refreshFinder = useCallback(async () => {
-		if (!isTauri() || !isMac) return;
-		try {
-			setFinder(await fetchFinderServiceStatus());
-		} catch {
-			setFinder(null);
-		}
-	}, [isMac]);
-
 	useEffect(() => {
 		void getVersion()
 			.then(setVersion)
@@ -104,9 +111,6 @@ export function AboutPane() {
 	useEffect(() => {
 		void refreshCli();
 	}, [refreshCli]);
-	useEffect(() => {
-		void refreshFinder();
-	}, [refreshFinder]);
 
 	const checking = update.phase === "checking";
 	const installing =
@@ -115,11 +119,7 @@ export function AboutPane() {
 		void checkForUpdate();
 	};
 	const onInstall = () => {
-		void installAvailableUpdate().then((next) => {
-			if (next.phase === "error") {
-				notifyError(t("about.update.installFailed"));
-			}
-		});
+		void installAvailableUpdate();
 	};
 	const installErrorText = (err: unknown) =>
 		lifecycleErrorMessage(errorText(err), (key, options) =>
@@ -140,9 +140,11 @@ export function AboutPane() {
 			// Surface the Host error text: silent failures here are exactly what
 			// makes users guess at causes (e.g. "64-bit not supported").
 			.catch((err) =>
-				notifyError(t("about.cli.installFailed"), {
-					description: installErrorText(err),
-				}),
+				notifyReleaseDownloadError(
+					t("about.cli.installFailed"),
+					err,
+					installErrorText(err),
+				),
 			)
 			.finally(() => setCliBusy(false));
 	};
@@ -156,40 +158,10 @@ export function AboutPane() {
 			})
 			.catch((err) =>
 				notifyError(t("about.cli.uninstallFailed"), {
-					description: err instanceof Error ? err.message : String(err),
+					description: errorText(err),
 				}),
 			)
 			.finally(() => setCliBusy(false));
-	};
-	const onInstallFinder = () => {
-		setFinderBusy(true);
-		void installFinderService()
-			.then(async (status) => {
-				setFinder(status);
-				await refreshFinder();
-				notifySuccess(t("about.finder.installSuccess"));
-			})
-			.catch((err) =>
-				notifyError(t("about.finder.installFailed"), {
-					description: installErrorText(err),
-				}),
-			)
-			.finally(() => setFinderBusy(false));
-	};
-	const onUninstallFinder = () => {
-		setFinderBusy(true);
-		void uninstallFinderService()
-			.then(async (status) => {
-				setFinder(status);
-				await refreshFinder();
-				notifySuccess(t("about.finder.uninstallSuccess"));
-			})
-			.catch((err) =>
-				notifyError(t("about.finder.uninstallFailed"), {
-					description: err instanceof Error ? err.message : String(err),
-				}),
-			)
-			.finally(() => setFinderBusy(false));
 	};
 	const onOpenCliRelease = () => {
 		const url = cli?.releasePageUrl;
@@ -204,7 +176,7 @@ export function AboutPane() {
 			.catch((err) => {
 				console.error("open log folder failed", err);
 				notifyError(t("about.logs.openFailed"), {
-					description: err instanceof Error ? err.message : String(err),
+					description: errorText(err),
 				});
 			});
 	};
@@ -214,7 +186,7 @@ export function AboutPane() {
 			.then(() => notifySuccess(t("about.logs.clearDone")))
 			.catch((err) =>
 				notifyError(t("about.logs.clearFailed"), {
-					description: err instanceof Error ? err.message : String(err),
+					description: errorText(err),
 				}),
 			)
 			.finally(() => setLogsBusy(false));
@@ -231,6 +203,41 @@ export function AboutPane() {
 		refreshScratchStats();
 	}, [refreshScratchStats]);
 
+	const refreshReflowUsage = useCallback(() => {
+		if (!isTauri()) return;
+		void reflowCacheUsage()
+			.then(setReflowUsage)
+			.catch(() => setReflowUsage(null));
+	}, []);
+
+	useEffect(() => {
+		refreshReflowUsage();
+	}, [refreshReflowUsage]);
+
+	const onClearReflowCache = () => {
+		setReflowBusy(true);
+		void clearReflowCaches()
+			.then(async () => {
+				notifySuccess(t("about.reflowCache.clearDone"));
+				refreshReflowUsage();
+			})
+			.catch((err) =>
+				notifyError(t("about.reflowCache.clearFailed"), {
+					description: errorText(err),
+				}),
+			)
+			.finally(() => setReflowBusy(false));
+	};
+
+	const onOpenReflowCacheFolder = () => {
+		void openReflowCacheFolder().catch((err) => {
+			console.error("open reflow cache folder failed", err);
+			notifyError(t("about.reflowCache.openFailed"), {
+				description: errorText(err),
+			});
+		});
+	};
+
 	const onClearScratch = () => {
 		setScratchBusy(true);
 		void plazaScratchClear()
@@ -240,7 +247,7 @@ export function AboutPane() {
 			})
 			.catch((err) =>
 				notifyError(t("about.scratch.clearFailed"), {
-					description: err instanceof Error ? err.message : String(err),
+					description: errorText(err),
 				}),
 			)
 			.finally(() => setScratchBusy(false));
@@ -278,15 +285,6 @@ export function AboutPane() {
 			? `call "${cli.installPath.replaceAll('"', '""')}" --version`
 			: `${cli?.commandName ?? "agentero-cli"} --version`;
 
-	const showFinderRow = isMac && isTauri() && finder?.supported !== false;
-	const needsFinderUpdate = Boolean(finder?.installed && !finder.current);
-	const finderDescription = (() => {
-		if (!finder) return "…";
-		if (finder.installed && !finder.current) return t("about.finder.stale");
-		if (finder.installed) return t("about.finder.descriptionInstalled");
-		return t("about.finder.description");
-	})();
-
 	return (
 		<>
 			<PageTitle
@@ -303,7 +301,7 @@ export function AboutPane() {
 				}
 			/>
 			<SettingsGroup>
-				<div className="flex items-center justify-between gap-4 px-3.5 py-4">
+				<div className="flex flex-wrap items-center justify-between gap-4 px-3.5 py-4">
 					<div className="flex min-w-0 items-center gap-3">
 						<img
 							src={agenteroAppIcon}
@@ -316,13 +314,33 @@ export function AboutPane() {
 								Agentero
 							</p>
 							{version && (
-								<p className="text-muted-foreground text-xs">
-									{t("about.version", { version })}
+								<p className="flex flex-wrap items-center gap-1.5 text-muted-foreground text-xs">
+									<span>{t("about.version", { version })}</span>
+									{update.availableVersion && (
+										<span className="inline-flex items-center gap-0.5 font-medium text-emerald-600 dark:text-emerald-400">
+											<ArrowRight aria-hidden className="size-3" />
+											{`v${update.availableVersion}`}
+										</span>
+									)}
 								</p>
 							)}
 						</div>
 					</div>
-					<div className="flex shrink-0 items-center">
+					<div className="flex shrink-0 items-center gap-2">
+						{update.availableVersion && (
+							<Button variant="link" size="sm" asChild>
+								<a
+									href={getUpdateReleaseUrl(update.availableVersion)}
+									onClick={(event) => {
+										event.preventDefault();
+										openExternalUrl(event.currentTarget.href);
+									}}
+								>
+									{t("about.update.releaseNotes")}
+									<ExternalLink data-icon="inline-end" />
+								</a>
+							</Button>
+						)}
 						{update.phase === "available" ? (
 							<Button size="sm" onClick={onInstall}>
 								<Download data-icon="inline-start" />
@@ -354,6 +372,7 @@ export function AboutPane() {
 					</div>
 				) : null}
 			</SettingsGroup>
+			{showFeedback ? <AboutFeedback /> : null}
 			{isTauri() ? (
 				<SettingsGroup>
 					<SettingsRow
@@ -456,60 +475,6 @@ export function AboutPane() {
 					) : null}
 				</SettingsGroup>
 			) : null}
-			{showFinderRow ? (
-				<SettingsGroup>
-					<SettingsRow
-						label={
-							<span className="inline-flex items-center gap-1.5">
-								<MousePointerClick
-									className="size-3.5 shrink-0 text-muted-foreground"
-									aria-hidden
-								/>
-								{t("about.finder.label")}
-							</span>
-						}
-						description={finderDescription}
-					>
-						<div className="flex flex-wrap items-center justify-end gap-2">
-							{finder?.installed ? (
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={finderBusy}
-									onClick={onUninstallFinder}
-								>
-									{finderBusy ? (
-										<LoaderCircle
-											data-icon="inline-start"
-											className="animate-spin"
-										/>
-									) : null}
-									{t("about.finder.uninstall")}
-								</Button>
-							) : null}
-							{!finder?.installed || needsFinderUpdate ? (
-								<Button
-									size="sm"
-									disabled={finderBusy || !finder}
-									onClick={onInstallFinder}
-								>
-									{finderBusy ? (
-										<LoaderCircle
-											data-icon="inline-start"
-											className="animate-spin"
-										/>
-									) : (
-										<Download data-icon="inline-start" />
-									)}
-									{needsFinderUpdate
-										? t("about.finder.update")
-										: t("about.finder.install")}
-								</Button>
-							) : null}
-						</div>
-					</SettingsRow>
-				</SettingsGroup>
-			) : null}
 			{isTauri() ? (
 				<SettingsGroup>
 					<SettingsRow
@@ -583,6 +548,62 @@ export function AboutPane() {
 									/>
 								) : null}
 								{t("about.scratch.clear")}
+							</Button>
+						</div>
+					</SettingsRow>
+				</SettingsGroup>
+			) : null}
+			{isTauri() ? (
+				<SettingsGroup>
+					<SettingsRow
+						label={
+							<span className="inline-flex items-center gap-1.5">
+								<Languages
+									className="size-3.5 shrink-0 text-muted-foreground"
+									aria-hidden
+								/>
+								{t("about.reflowCache.label")}
+								<Tooltip>
+									<TooltipTrigger asChild>
+										<Info
+											className="size-3.5 shrink-0 text-muted-foreground"
+											aria-hidden
+										/>
+									</TooltipTrigger>
+									<TooltipContent>{t("about.reflowCache.tip")}</TooltipContent>
+								</Tooltip>
+							</span>
+						}
+						description={
+							reflowUsage?.bytes
+								? t("about.reflowCache.summary", {
+										size: `${(reflowUsage.bytes / 1024 / 1024).toFixed(1)} MB`,
+									})
+								: undefined
+						}
+					>
+						<div className="flex items-center gap-2">
+							<Button
+								variant="outline"
+								size="sm"
+								disabled={reflowBusy}
+								onClick={onOpenReflowCacheFolder}
+							>
+								{t("about.reflowCache.open")}
+							</Button>
+							<Button
+								variant="outline"
+								size="sm"
+								disabled={reflowBusy || !reflowUsage?.bytes}
+								onClick={onClearReflowCache}
+							>
+								{reflowBusy ? (
+									<LoaderCircle
+										data-icon="inline-start"
+										className="animate-spin"
+									/>
+								) : null}
+								{t("about.reflowCache.clear")}
 							</Button>
 						</div>
 					</SettingsRow>

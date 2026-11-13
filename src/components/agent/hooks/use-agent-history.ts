@@ -1,25 +1,25 @@
 /**
- * Session history: provider session listing (resume support), opening a
- * history row (local hydrate vs remote session/load), and the cross-window
- * agent-session open request (visual-trace rebuild + fallback).
+ * Session history: provider session listing (resume support) and opening a
+ * history row (local hydrate vs remote session/load).
  */
 import {
 	type Dispatch,
 	type SetStateAction,
 	useCallback,
 	useEffect,
-	useRef,
 	useState,
 } from "react";
 import type {
 	AgentPanelRefs,
 	AgentPanelT,
 } from "@/components/agent/hooks/use-agent-panel-context";
-import { useUiStore } from "@/hooks/use-app-stores";
 import { formatLocaleTimestamp } from "@/i18n";
 import {
+	type AcpDeleteSessionResult,
 	type AcpLoadSessionResult,
 	type AcpSessionInfo,
+	cancelAgentRun,
+	deleteSession,
 	listSessions,
 	loadSession,
 } from "@/lib/agent";
@@ -39,9 +39,20 @@ import {
 	providerSessionIdForHistoryLoad,
 } from "@/lib/agent/chat-state";
 import {
+	hasTranscriptChips,
+	inlineMarkupToPlain,
+} from "@/lib/agent/composer-inline-tokens";
+import {
 	applyCachedHistoryTitles,
+	forgetEmptyAcpSession,
 	getCachedHistoryTitle,
+	getOverriddenHistoryTitle,
+	isDismissedAcpSession,
+	isEmptyAcpSession,
+	rememberDismissedAcpSession,
+	rememberEmptyAcpSession,
 	setCachedHistoryTitle,
+	setUserHistoryTitle,
 } from "@/lib/agent/history-title-cache";
 import {
 	displayHistoryTitle,
@@ -49,12 +60,7 @@ import {
 } from "@/lib/agent/prompt-display";
 import { isTauri } from "@/lib/core/tauri";
 import { mapLimit } from "@/lib/core/utils";
-import {
-	buildVisualTraceHistoryItem,
-	visualTraceHistoryId,
-} from "@/lib/pdf/agent-trace/open-session";
-import { nextLineId, nextPartId } from "@/lib/pdf-visual/ids";
-import { clearAgentSessionOpenRequest } from "@/lib/shell/ui-store";
+import { nextLineId } from "@/lib/pdf-visual/ids";
 
 /** Strip Host/Codex machine envelopes so Chat never shows system preamble. */
 export const sanitizeChatLines = (raw: ChatLine[]): ChatLine[] =>
@@ -64,7 +70,8 @@ export const sanitizeChatLines = (raw: ChatLine[]): ChatLine[] =>
 			const text = stripPromptEnvelopeForDisplay(line.text);
 			const hasVisual = Boolean(line.visualAnnotations?.length);
 			const hasImages = Boolean(line.images?.length);
-			if (!text && !hasVisual && !hasImages) return null;
+			const hasChips = Boolean(line.markup && hasTranscriptChips(line.markup));
+			if (!text && !hasVisual && !hasImages && !hasChips) return null;
 			return {
 				...line,
 				text: text || "",
@@ -90,8 +97,12 @@ export function titleFromSessionLines(
 	lines: AgentSessionRecord["lines"],
 ): string {
 	const firstUser = lines.find((line) => line.kind === "user");
-	if (!firstUser) return "";
-	return displayHistoryTitle(firstUser.text, "");
+	if (firstUser?.kind !== "user") return "";
+	const source =
+		firstUser.markup && hasTranscriptChips(firstUser.markup)
+			? inlineMarkupToPlain(firstUser.markup)
+			: firstUser.text;
+	return displayHistoryTitle(source, "");
 }
 
 /**
@@ -152,7 +163,7 @@ export async function hydrateSessionTitles(
 			if (cached) {
 				setSessionHistory((prev) =>
 					prev.map((s) =>
-						s.id === item.id && s.agentId === item.agentId
+						s.id === item.id && s.agentId === item.agentId && !s.titleLocked
 							? { ...s, title: cached }
 							: s,
 					),
@@ -167,22 +178,31 @@ export async function hydrateSessionTitles(
 			});
 			if (generation !== historyGenRef.current) return;
 
-			const title = titleFromLoadedHistory(history);
-			const hasContent = history.lines.length > 0;
-			if (!title && !hasContent) {
-				// Drop ACP sessions that have neither a title nor any replayable
-				// content so the history drawer doesn't list empty rows.
+			if (history.lines.length === 0) {
+				// A title with no transcript is still an empty warm session.
+				// Remember it so the next list does not bring the row back.
+				rememberEmptyAcpSession(selectedAgentId, providerSessionId);
 				setSessionHistory((prev) =>
-					prev.filter((s) => !(s.id === item.id && s.agentId === item.agentId)),
+					prev.filter(
+						(s) =>
+							!(
+								s.id === item.id &&
+								s.agentId === item.agentId &&
+								s.lines.length === 0
+							),
+					),
 				);
 				return;
 			}
+			const title = titleFromLoadedHistory(history);
 			if (!title) return;
 
 			setCachedHistoryTitle(selectedAgentId, providerSessionId, title);
 			setSessionHistory((prev) =>
 				prev.map((s) =>
-					s.id === item.id && s.agentId === item.agentId ? { ...s, title } : s,
+					s.id === item.id && s.agentId === item.agentId && !s.titleLocked
+						? { ...s, title }
+						: s,
 				),
 			);
 		} catch {
@@ -198,6 +218,7 @@ export function sessionsNeedingTitleHydration(
 ): AgentSessionRecord[] {
 	return sessions.filter((session) => {
 		if (session.agentId !== agentId) return false;
+		if (session.titleLocked) return false;
 		if (session.lines.length > 0 && titleFromSessionLines(session.lines)) {
 			return false;
 		}
@@ -209,6 +230,81 @@ export function sessionsNeedingTitleHydration(
 			isSessionIdPrefixTitle(title, providerId)
 		);
 	});
+}
+
+/** Rename a history row and persist the title as a user override (#710). */
+export function renameHistorySessionTitle(
+	item: Pick<
+		AgentSessionRecord,
+		"id" | "agentId" | "providerSessionId" | "title"
+	>,
+	nextTitle: string,
+): string | null {
+	const cleaned = nextTitle.trim();
+	if (!cleaned) return null;
+	const title = displayHistoryTitle(cleaned, "");
+	if (!title) return null;
+	setUserHistoryTitle(item.agentId, item.id, title, item.providerSessionId);
+	agentSessionStore
+		.getState()
+		.setSessions((prev) =>
+			prev.map((session) =>
+				session.id === item.id && session.agentId === item.agentId
+					? { ...session, title, titleLocked: true }
+					: session,
+			),
+		);
+	return title;
+}
+
+/**
+ * Hide a history row and ask the agent to delete it when it can.
+ *
+ * The host records the id before `session/delete`, so a later list cannot
+ * bring the row back. A running turn is cancelled first. Deleting the open
+ * conversation returns to a blank draft.
+ */
+export async function deleteHistorySession(
+	item: Pick<
+		AgentSessionRecord,
+		"id" | "agentId" | "providerSessionId" | "status"
+	>,
+	vaultPath: string | null,
+): Promise<AcpDeleteSessionResult> {
+	const providerId = item.providerSessionId?.trim() || item.id;
+	if (item.status === "running") {
+		try {
+			await cancelAgentRun(item.id);
+		} catch {
+			// The turn may already have finished. Still hide the row.
+		}
+	}
+	const result = await deleteSession({
+		agentId: item.agentId,
+		sessionId: providerId,
+		vaultPath: vaultPath ?? undefined,
+	});
+	rememberDismissedAcpSession(item.agentId, providerId);
+	if (item.id !== providerId) {
+		rememberDismissedAcpSession(item.agentId, item.id);
+	}
+	const state = agentSessionStore.getState();
+	const removed =
+		state.activeTabId === item.id || state.activeTabId === providerId;
+	state.setSessions((prev) =>
+		prev.filter(
+			(session) =>
+				!(
+					session.agentId === item.agentId &&
+					(session.id === item.id ||
+						session.id === providerId ||
+						session.providerSessionId === providerId ||
+						session.providerSessionId === item.id)
+				),
+		),
+	);
+	if (removed) agentSessionStore.getState().startDraft();
+	return result;
 }
 
 type MergeImportedSessionsResult = {
@@ -240,7 +336,21 @@ export function mergeImportedSessions(
 
 	const hydrationCandidates: AgentSessionRecord[] = [];
 
-	const imported = chatSessions.map((session) => {
+	const listed = chatSessions.filter((session) => {
+		if (isDismissedAcpSession(selectedAgentId, session.sessionId)) {
+			return false;
+		}
+		const current =
+			existingById.get(session.sessionId) ??
+			existingByProvider.get(session.sessionId);
+		if (current && current.lines.length > 0) {
+			forgetEmptyAcpSession(selectedAgentId, session.sessionId);
+			return true;
+		}
+		return !isEmptyAcpSession(selectedAgentId, session.sessionId);
+	});
+
+	const imported = listed.map((session) => {
 		const current =
 			existingById.get(session.sessionId) ??
 			existingByProvider.get(session.sessionId);
@@ -252,15 +362,27 @@ export function mergeImportedSessions(
 		// Never seed with the session-id prefix: that blocks HistorySessionList's
 		// user-prompt fallback (#484) because displayHistoryTitle treats any
 		// non-empty string as a real title.
+		// User renames (#710) always win via titleLocked / override cache.
 		const fromLines = current ? titleFromSessionLines(current.lines) : "";
 		const priorTitle = current?.title?.trim() ?? "";
 		const priorIsIdPlaceholder =
 			Boolean(priorTitle) &&
 			(isSessionIdPrefixTitle(priorTitle, session.sessionId) ||
 				(current != null && isSessionIdPrefixTitle(priorTitle, current.id)));
-		const title = acpTitle
-			? displayHistoryTitle(acpTitle, "")
-			: fromLines || (priorTitle && !priorIsIdPlaceholder ? priorTitle : "");
+		const overridden =
+			getOverriddenHistoryTitle(
+				selectedAgentId,
+				current?.id ?? session.sessionId,
+				session.sessionId,
+			) ||
+			(current?.titleLocked && priorTitle && !priorIsIdPlaceholder
+				? priorTitle
+				: null);
+		const title = overridden
+			? overridden
+			: acpTitle
+				? displayHistoryTitle(acpTitle, "")
+				: fromLines || (priorTitle && !priorIsIdPlaceholder ? priorTitle : "");
 
 		if (current) {
 			const record: AgentSessionRecord = {
@@ -271,6 +393,7 @@ export function mergeImportedSessions(
 						: ("external" as const),
 				agentName,
 				title,
+				titleLocked: Boolean(overridden) || current.titleLocked,
 				startedAt: current.startedAt || startedAt,
 				providerSessionId: session.sessionId,
 			};
@@ -285,28 +408,34 @@ export function mergeImportedSessions(
 			agentId: selectedAgentId,
 			source: "external" as const,
 			title,
+			...(overridden ? { titleLocked: true as const } : {}),
 			agentName,
 			startedAt,
 			lines: [],
 			status: "completed" as const,
 			providerSessionId: session.sessionId,
 		};
-		if (!acpTitle) {
+		if (!acpTitle && !overridden) {
 			hydrationCandidates.push(record);
 		}
 		return record;
 	});
 
-	const importedIds = new Set(chatSessions.map((session) => session.sessionId));
-	const localOnly = prev.filter(
-		(item) =>
+	const importedIds = new Set(listed.map((session) => session.sessionId));
+	const localOnly = prev.filter((item) => {
+		const providerId = item.providerSessionId?.trim() ?? "";
+		return (
 			item.agentId === selectedAgentId &&
+			!isDismissedAcpSession(selectedAgentId, item.id) &&
+			(providerId === "" ||
+				!isDismissedAcpSession(selectedAgentId, providerId)) &&
 			!importedIds.has(item.id) &&
-			!importedIds.has(item.providerSessionId?.trim() ?? "") &&
+			!importedIds.has(providerId) &&
 			!isBackgroundWorkflowHistoryTitle(item.title) &&
 			(item.status === "running" ||
-				(item.source === "local" && item.lines.length > 0)),
-	);
+				(item.source === "local" && item.lines.length > 0))
+		);
+	});
 
 	return {
 		sessions: [...localOnly, ...imported],
@@ -330,7 +459,6 @@ export type UseAgentHistoryOptions = {
 	i18nLanguage: string;
 	vaultPath: string | null;
 	selectedAgentId: string | null;
-	setSelectedAgentId: Dispatch<SetStateAction<string | null>>;
 	selected: AgentOption | undefined;
 	setSessionHistory: (
 		update:
@@ -353,6 +481,9 @@ export type UseAgentHistoryOptions = {
 
 export type AgentHistory = {
 	openHistorySession: (item: ChatSessionHistoryItem) => void;
+	removeHistorySession: (
+		item: ChatSessionHistoryItem,
+	) => Promise<AcpDeleteSessionResult>;
 };
 
 export function useAgentHistory({
@@ -370,7 +501,6 @@ export function useAgentHistory({
 	i18nLanguage,
 	vaultPath,
 	selectedAgentId,
-	setSelectedAgentId,
 	selected,
 	setSessionHistory,
 	setLines,
@@ -483,8 +613,6 @@ export function useAgentHistory({
 		historyGenRef,
 		sessionHistoryRef,
 	]);
-
-	const agentSessionOpenRequest = useUiStore((s) => s.agentSessionOpenRequest);
 
 	const openHistorySession = (item: ChatSessionHistoryItem) => {
 		if (submittingRef.current) return;
@@ -640,154 +768,39 @@ export function useAgentHistory({
 		})();
 	};
 
-	const openHistorySessionRef = useRef(openHistorySession);
-	openHistorySessionRef.current = openHistorySession;
-
-	useEffect(() => {
-		const request = agentSessionOpenRequest;
-		if (!request) return;
-		if (request.agentId && request.agentId !== selectedAgentId) {
-			setSelectedAgentId(request.agentId);
-			// Wait for history reload after agent switch.
-			return;
-		}
-		if (!historyLoaded) return;
-
-		const vt = request.visualTrace;
-		// Prefer stable visual-trace history id so multi-turn pin opens one session.
-		const stableId = vt?.traceId
-			? visualTraceHistoryId(vt.traceId)
-			: request.runtimeSessionId;
-
-		const match = sessionHistoryRef.current.find(
-			(item) =>
-				item.id === stableId ||
-				item.id === request.runtimeSessionId ||
-				item.providerSessionId === request.runtimeSessionId ||
-				(request.providerSessionId != null &&
-					(item.id === request.providerSessionId ||
-						item.providerSessionId === request.providerSessionId)),
-		);
-
-		if (vt) {
-			// Always rebuild lines from mark transcript (full multi-turn + image chip).
-			const rebuilt = buildVisualTraceHistoryItem({
-				trace: {
-					id: vt.traceId,
-					page: vt.page,
-					comment: vt.comment,
-					paperPath: vt.paperPath ?? "",
-					image: vt.image,
-					agent: {
-						agentId: request.agentId,
-						runtimeSessionId: request.runtimeSessionId,
-						messageId: request.messageId ?? "pending",
-						providerSessionId: request.providerSessionId ?? undefined,
-						status: vt.status ?? "completed",
-						messages: vt.messages,
-						answerSnapshot: request.answerSnapshot,
-					},
-				},
-				messages: vt.messages,
-				title:
-					request.title?.trim() ||
-					request.prompt?.trim() ||
-					t("composer.visualAnnotation"),
-				agentName: selected?.name ?? t("defaultName"),
-				startedAt:
-					match?.startedAt || formatLocaleTimestamp(new Date(), i18nLanguage),
-				emptyFallback: t("composer.visualAnnotation"),
-				paperAbsPath: request.paperAbsPath,
-			});
-			// Merge into existing slot if present; drop duplicate runtime-id entries.
-			setSessionHistory((prev) => {
-				const withoutDupes = prev.filter(
-					(item) =>
-						item.id !== rebuilt.id &&
-						item.id !== request.runtimeSessionId &&
-						!(
-							request.providerSessionId &&
-							(item.id === request.providerSessionId ||
-								item.providerSessionId === request.providerSessionId)
-						),
-				);
-				return [rebuilt, ...withoutDupes];
-			});
-			openHistorySessionRef.current(rebuilt);
-			clearAgentSessionOpenRequest();
-			return;
-		}
-
-		if (match) {
-			openHistorySessionRef.current(match);
-			clearAgentSessionOpenRequest();
-			return;
-		}
-
-		const snapshot = request.answerSnapshot?.trim();
-		const fallbackLines: ChatLine[] = [
-			{
-				id: nextLineId("user"),
-				kind: "user",
-				text:
-					request.prompt?.trim() ||
-					request.title?.trim() ||
-					t("composer.visualAnnotation"),
-			},
-		];
-		if (snapshot) {
-			fallbackLines.push({
-				id: nextLineId("agent"),
-				kind: "agent",
-				parts: [
-					{
-						type: "text",
-						id: nextPartId("text"),
-						text: snapshot,
-					},
-				],
-				streaming: false,
-			});
-		} else {
-			fallbackLines.push({
-				id: nextLineId("sys"),
-				kind: "system",
-				text: t("messages.sessionUnavailable"),
-			});
-		}
-		const fallback: ChatSessionHistoryItem = {
-			id: stableId,
-			agentId: request.agentId,
-			source: "local",
-			title:
-				request.title?.trim() ||
-				request.prompt?.trim() ||
-				t("composer.visualAnnotation"),
-			agentName: selected?.name ?? t("defaultName"),
-			startedAt: formatLocaleTimestamp(new Date(), i18nLanguage),
-			lines: fallbackLines,
-			status: snapshot ? "completed" : "failed",
-			providerSessionId: request.providerSessionId ?? null,
-		};
-		setSessionHistory((prev) => [
-			fallback,
-			...prev.filter((item) => item.id !== fallback.id),
-		]);
-		openHistorySessionRef.current(fallback);
-		clearAgentSessionOpenRequest();
-	}, [
-		agentSessionOpenRequest,
-		historyLoaded,
-		i18nLanguage,
-		selected?.name,
-		selectedAgentId,
-		t,
-		setSessionHistory,
-		setSelectedAgentId,
-		sessionHistoryRef,
-	]);
+	const removeHistorySession = useCallback(
+		async (item: ChatSessionHistoryItem) => {
+			const providerId = item.providerSessionId?.trim() || item.id;
+			const active =
+				activeTabRef.current === item.id ||
+				activeTabRef.current === providerId ||
+				agentSessionStore.getState().activeTabId === item.id ||
+				agentSessionStore.getState().activeTabId === providerId;
+			// Drop the continue target before the RPC returns so a queued send
+			// cannot resume the conversation being removed. The visible tab
+			// stays until the delete succeeds.
+			if (active) {
+				activeConversationRef.current = null;
+				clearMessageQueue();
+			}
+			const result = await deleteHistorySession(item, vaultPathRef.current);
+			if (active) {
+				activeTabRef.current = "draft";
+				activateComposerSession("draft");
+			}
+			return result;
+		},
+		[
+			activateComposerSession,
+			activeConversationRef,
+			activeTabRef,
+			clearMessageQueue,
+			vaultPathRef,
+		],
+	);
 
 	return {
 		openHistorySession,
+		removeHistorySession,
 	};
 }

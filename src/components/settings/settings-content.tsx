@@ -2,14 +2,17 @@ import {
 	Bot,
 	CloudUpload,
 	Compass,
+	FlaskConical,
 	Info,
 	Keyboard,
 	Languages,
 	LayoutTemplate,
-	MonitorSmartphone,
 	Paintbrush,
+	Puzzle,
 	SlidersHorizontal,
+	Smartphone,
 	Stethoscope,
+	UserRound,
 	Wand2,
 	X,
 } from "lucide-react";
@@ -32,14 +35,15 @@ import type {
 	SettingsSection,
 } from "@/components/settings/types";
 import { Button } from "@/components/ui/button";
+import { accountSurfaceEnabled } from "@/features/account/visibility";
 import { scrollBehavior } from "@/lib/core/motion";
 import { cn } from "@/lib/core/utils";
 import {
 	broadcastOnboardingRequest,
 	broadcastTourRequest,
 } from "@/lib/onboarding/api";
+import { pluginsSurfaceEnabled } from "@/lib/plugins/visibility";
 import type { AppSettings } from "@/lib/settings";
-import { patchSettings } from "@/lib/settings/react-store";
 import { closeSettingsWindow } from "@/lib/shell/settings-window";
 import {
 	getRemoteSessionMeta,
@@ -53,11 +57,14 @@ import {
 // the shell (see `preloadSettingsPane`), so only the sections you actually visit
 // pay for a chunk — a lazy default pane would just move the stall after render.
 const PANE_LOADERS = {
+	account: () => import("@/components/settings/panes/account-pane"),
+	plugins: () => import("@/components/settings/panes/plugins-pane"),
 	general: () => import("@/components/settings/panes/general-pane"),
 	appearance: () => import("@/components/settings/panes/appearance-pane"),
 	agent: () => import("@/components/settings/panes/agent-pane"),
 	translate: () => import("@/components/settings/panes/translate-pane"),
 	layout: () => import("@/components/settings/panes/layout-pane"),
+	experimental: () => import("@/components/settings/panes/experimental-pane"),
 	doctor: () => import("@/components/settings/panes/doctor-pane"),
 	keyboard: () => import("@/components/settings/panes/keyboard-pane"),
 	"remote-access": () =>
@@ -70,13 +77,29 @@ const PANE_LOADERS = {
  * Warm the chunk for `section` before the shell renders. Module promises are
  * cached, so the matching `lazy()` below resolves without a second request.
  */
+function sectionVisible(id: SettingsSection): boolean {
+	if (!pluginsSurfaceEnabled && id === "plugins") return false;
+	if (!accountSurfaceEnabled && id === "account") return false;
+	return true;
+}
+
 export function preloadSettingsPane(section: string): Promise<unknown> {
-	const load = PANE_LOADERS[section as SettingsSection] ?? PANE_LOADERS.general;
+	const requested = sectionVisible(section as SettingsSection)
+		? section
+		: "general";
+	const load =
+		PANE_LOADERS[requested as SettingsSection] ?? PANE_LOADERS.general;
 	return load();
 }
 
 // memo(): visited panes stay mounted across section switches; without this
 // every switch re-rendered ALL mounted panes (agent pane is ~1.5k lines).
+const PluginsPane = memo(
+	lazy(() => PANE_LOADERS.plugins().then((m) => ({ default: m.PluginsPane }))),
+);
+const AccountPane = memo(
+	lazy(() => PANE_LOADERS.account().then((m) => ({ default: m.AccountPane }))),
+);
 const GeneralPane = memo(
 	lazy(() => PANE_LOADERS.general().then((m) => ({ default: m.GeneralPane }))),
 );
@@ -100,6 +123,13 @@ const TranslatePane = memo(
 );
 const LayoutPane = memo(
 	lazy(() => PANE_LOADERS.layout().then((m) => ({ default: m.LayoutPane }))),
+);
+const ExperimentalPane = memo(
+	lazy(() =>
+		PANE_LOADERS.experimental().then((m) => ({
+			default: m.ExperimentalPane,
+		})),
+	),
 );
 const DoctorPane = memo(
 	lazy(() => PANE_LOADERS.doctor().then((m) => ({ default: m.DoctorPane }))),
@@ -128,13 +158,16 @@ const NAV: {
 	icon: typeof Bot;
 	dividerBefore?: boolean;
 }[] = [
+	{ id: "account", icon: UserRound },
 	{ id: "general", icon: SlidersHorizontal },
 	{ id: "appearance", icon: Paintbrush },
 	{ id: "agent", icon: Bot, dividerBefore: true },
 	{ id: "translate", icon: Languages },
 	{ id: "layout", icon: LayoutTemplate },
-	{ id: "remote-access", icon: MonitorSmartphone },
+	{ id: "remote-access", icon: Smartphone },
 	{ id: "sync", icon: CloudUpload },
+	{ id: "plugins", icon: Puzzle },
+	{ id: "experimental", icon: FlaskConical },
 	{ id: "doctor", icon: Stethoscope, dividerBefore: true },
 	{ id: "keyboard", icon: Keyboard },
 	{ id: "about", icon: Info },
@@ -171,19 +204,29 @@ export function SettingsContent({
 	const { t } = useTranslation(["settings", "common"]);
 	const fallbackTitleId = useId();
 	const headingId = titleId ?? fallbackTitleId;
+	const navItems = useMemo(
+		() => NAV.filter((item) => sectionVisible(item.id)),
+		[],
+	);
+	const activeSection =
+		sectionVisible(section) && section in PANE_LOADERS ? section : "general";
+
+	useEffect(() => {
+		if (activeSection !== section) onSectionChange(activeSection);
+	}, [activeSection, onSectionChange, section]);
 
 	// Keep visited panes mounted (hidden when inactive) so switching sections
 	// doesn't unmount/remount them — avoids re-running their load effects
 	// (agent list, connector status, cache stats, dynamic imports) and makes
 	// section switches instant instead of re-fetching on every visit.
 	const [visitedSections, setVisitedSections] = useState<SettingsSection[]>([
-		section,
+		activeSection,
 	]);
 	useEffect(() => {
 		setVisitedSections((prev) =>
-			prev.includes(section) ? prev : [...prev, section],
+			prev.includes(activeSection) ? prev : [...prev, activeSection],
 		);
-	}, [section]);
+	}, [activeSection]);
 
 	// Warm every pane chunk in the background shortly after the window opens.
 	// Only the initial section is preloaded at boot; without this, the FIRST
@@ -193,7 +236,9 @@ export function SettingsContent({
 	// contends with the main window.
 	useEffect(() => {
 		let cancelled = false;
-		const sections = Object.keys(PANE_LOADERS) as SettingsSection[];
+		const sections = (Object.keys(PANE_LOADERS) as SettingsSection[]).filter(
+			(id) => sectionVisible(id),
+		);
 		let i = 0;
 		let timer: ReturnType<typeof setTimeout> | null = null;
 		const warmNext = () => {
@@ -222,12 +267,12 @@ export function SettingsContent({
 	// biome-ignore lint/correctness/useExhaustiveDependencies: section intentionally triggers a scroll-to-top on switch
 	useEffect(() => {
 		contentScrollRef.current?.scrollTo({ top: 0, behavior: scrollBehavior() });
-	}, [section]);
+	}, [activeSection]);
 
 	// Slide the sidebar highlight to the active item (motion-17).
 	const measureNavIndicator = useCallback(() => {
 		const list = navListRef.current;
-		const btn = navItemRefs.current[section];
+		const btn = navItemRefs.current[activeSection];
 		if (!list || !btn) return;
 		const listRect = list.getBoundingClientRect();
 		const btnRect = btn.getBoundingClientRect();
@@ -235,7 +280,7 @@ export function SettingsContent({
 			top: btnRect.top - listRect.top + list.scrollTop,
 			height: btnRect.height,
 		});
-	}, [section]);
+	}, [activeSection]);
 
 	useEffect(() => {
 		measureNavIndicator();
@@ -297,7 +342,7 @@ export function SettingsContent({
 			event: ReactKeyboardEvent<HTMLButtonElement>,
 			current: SettingsSection,
 		) => {
-			const ids = NAV.map((item) => item.id);
+			const ids = navItems.map((item) => item.id);
 			const index = ids.indexOf(current);
 			if (index < 0) return;
 			let next = index;
@@ -318,7 +363,7 @@ export function SettingsContent({
 			selectSection(id);
 			navItemRefs.current[id]?.focus();
 		},
-		[selectSection],
+		[navItems, selectSection],
 	);
 
 	return (
@@ -326,7 +371,7 @@ export function SettingsContent({
 			{/* Sidebar — macOS System Settings weight (heavier material). */}
 			<nav
 				data-settings-sidebar
-				className="flex w-[11.5rem] shrink-0 select-none flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground"
+				className="flex w-12 sm:w-[11.5rem] shrink-0 select-none flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground"
 				aria-label={t("title")}
 			>
 				{/* Modal fallback only: native window already shows the title in its title bar. */}
@@ -357,16 +402,16 @@ export function SettingsContent({
 					{navIndicator ? (
 						<span
 							aria-hidden
-							className="pointer-events-none absolute inset-x-2 top-0 z-0 rounded-md bg-sidebar-primary shadow-sm transition-[transform,height] duration-[var(--motion-duration-fast)] ease-[var(--motion-ease-out)] motion-reduce:transition-none will-change-transform"
+							className="pointer-events-none absolute inset-x-2 top-0 z-0 rounded-md bg-sidebar-primary transition-[transform,height] duration-[var(--motion-duration-fast)] ease-[var(--motion-ease-out)] motion-reduce:transition-none will-change-transform"
 							style={{
 								height: navIndicator.height,
 								transform: `translate3d(0, ${navIndicator.top}px, 0)`,
 							}}
 						/>
 					) : null}
-					{NAV.map((item) => {
+					{navItems.map((item) => {
 						const Icon = item.icon;
-						const active = section === item.id;
+						const active = activeSection === item.id;
 						return (
 							<Fragment key={item.id}>
 								{item.dividerBefore ? (
@@ -403,7 +448,9 @@ export function SettingsContent({
 											)}
 											aria-hidden
 										/>
-										<span className="truncate">{t(`nav.${item.id}`)}</span>
+										<span className="truncate max-sm:sr-only">
+											{t(`nav.${item.id}`)}
+										</span>
 									</button>
 								</li>
 							</Fragment>
@@ -419,13 +466,12 @@ export function SettingsContent({
 						size="sm"
 						className="w-full border-sidebar-border bg-sidebar/40 hover:bg-sidebar-accent"
 						onClick={() => {
-							patchSettings({ onboardingDone: false });
 							broadcastOnboardingRequest();
 							closeSettingsWindow();
 						}}
 					>
 						<Wand2 data-icon="inline-start" />
-						{t("nav.quickSetup")}
+						<span className="max-sm:sr-only">{t("nav.quickSetup")}</span>
 					</Button>
 					<Button
 						type="button"
@@ -438,7 +484,7 @@ export function SettingsContent({
 						}}
 					>
 						<Compass data-icon="inline-start" />
-						{t("nav.featureTour")}
+						<span className="max-sm:sr-only">{t("nav.featureTour")}</span>
 					</Button>
 				</div>
 			</nav>
@@ -449,14 +495,14 @@ export function SettingsContent({
 				data-settings-content
 				className="agentero-scroll min-w-0 flex-1 overscroll-y-contain bg-background"
 			>
-				<div className="px-6 py-5">
+				<div className="px-3 py-5 sm:px-6">
 					{/* One boundary per pane: a section still loading must not blank out
 					    the panes already visited and kept mounted next to it. */}
 					{visitedSections.includes("general") && (
 						<div
 							data-settings-pane
-							data-active={section === "general" ? "true" : "false"}
-							hidden={section !== "general"}
+							data-active={activeSection === "general" ? "true" : "false"}
+							hidden={activeSection !== "general"}
 						>
 							<Suspense fallback={<PaneFallback />}>
 								<GeneralPane
@@ -471,8 +517,8 @@ export function SettingsContent({
 					{visitedSections.includes("appearance") && (
 						<div
 							data-settings-pane
-							data-active={section === "appearance" ? "true" : "false"}
-							hidden={section !== "appearance"}
+							data-active={activeSection === "appearance" ? "true" : "false"}
+							hidden={activeSection !== "appearance"}
 						>
 							<Suspense fallback={<PaneFallback />}>
 								<AppearancePane
@@ -480,12 +526,15 @@ export function SettingsContent({
 									uiTheme={settings.uiTheme}
 									locale={settings.locale}
 									uiScale={settings.uiScale}
+									soundEnabled={settings.soundEnabled}
 									editorFontSize={settings.editorFontSize}
 									interfaceFontFamily={settings.interfaceFontFamily}
 									textFontFamily={settings.textFontFamily}
 									monoFontFamily={settings.monoFontFamily}
 									editorLineHeight={settings.editorLineHeight}
 									showEditorToolbar={settings.showEditorToolbar}
+									wikiEmbedFontSize={settings.wikiEmbedFontSize}
+									markdownMaxWidth={settings.markdownMaxWidth}
 									patch={patch}
 								/>
 							</Suspense>
@@ -494,8 +543,8 @@ export function SettingsContent({
 					{visitedSections.includes("agent") && (
 						<div
 							data-settings-pane
-							data-active={section === "agent" ? "true" : "false"}
-							hidden={section !== "agent"}
+							data-active={activeSection === "agent" ? "true" : "false"}
+							hidden={activeSection !== "agent"}
 						>
 							<Suspense fallback={<PaneFallback />}>
 								{hostContext.kind === "remote" ? (
@@ -505,7 +554,11 @@ export function SettingsContent({
 										hostContext={hostContext}
 									/>
 								) : (
-									<AgentPane settings={settings} patch={patch} />
+									<AgentPane
+										settings={settings}
+										patch={patch}
+										onOpenDiagnostics={() => onSectionChange("doctor")}
+									/>
 								)}
 							</Suspense>
 						</div>
@@ -513,8 +566,8 @@ export function SettingsContent({
 					{visitedSections.includes("translate") && (
 						<div
 							data-settings-pane
-							data-active={section === "translate" ? "true" : "false"}
-							hidden={section !== "translate"}
+							data-active={activeSection === "translate" ? "true" : "false"}
+							hidden={activeSection !== "translate"}
 						>
 							<Suspense fallback={<PaneFallback />}>
 								<TranslatePane
@@ -528,8 +581,8 @@ export function SettingsContent({
 					{visitedSections.includes("layout") && (
 						<div
 							data-settings-pane
-							data-active={section === "layout" ? "true" : "false"}
-							hidden={section !== "layout"}
+							data-active={activeSection === "layout" ? "true" : "false"}
+							hidden={activeSection !== "layout"}
 						>
 							<Suspense fallback={<PaneFallback />}>
 								<LayoutPane
@@ -544,30 +597,34 @@ export function SettingsContent({
 					{visitedSections.includes("doctor") && (
 						<div
 							data-settings-pane
-							data-active={section === "doctor" ? "true" : "false"}
-							hidden={section !== "doctor"}
+							data-active={activeSection === "doctor" ? "true" : "false"}
+							hidden={activeSection !== "doctor"}
 						>
 							<Suspense fallback={<PaneFallback />}>
 								<DoctorPane vaultPath={vaultPath} hostContext={hostContext} />
 							</Suspense>
 						</div>
 					)}
-					{visitedSections.includes("keyboard") && (
+					{activeSection === "keyboard" && (
 						<div
 							data-settings-pane
-							data-active={section === "keyboard" ? "true" : "false"}
-							hidden={section !== "keyboard"}
+							data-active={activeSection === "keyboard" ? "true" : "false"}
+							hidden={activeSection !== "keyboard"}
 						>
 							<Suspense fallback={<PaneFallback />}>
-								<KeyboardPane />
+								<KeyboardPane
+									settings={settings}
+									shortcutOverrides={settings.shortcutOverrides}
+									patch={patch}
+								/>
 							</Suspense>
 						</div>
 					)}
 					{visitedSections.includes("remote-access") && (
 						<div
 							data-settings-pane
-							data-active={section === "remote-access" ? "true" : "false"}
-							hidden={section !== "remote-access"}
+							data-active={activeSection === "remote-access" ? "true" : "false"}
+							hidden={activeSection !== "remote-access"}
 						>
 							<Suspense fallback={<PaneFallback />}>
 								<RemoteAccessPane vaultPath={vaultPath} />
@@ -577,19 +634,52 @@ export function SettingsContent({
 					{visitedSections.includes("sync") && (
 						<div
 							data-settings-pane
-							data-active={section === "sync" ? "true" : "false"}
-							hidden={section !== "sync"}
+							data-active={activeSection === "sync" ? "true" : "false"}
+							hidden={activeSection !== "sync"}
 						>
 							<Suspense fallback={<PaneFallback />}>
 								<SyncPane vaultPath={vaultPath} />
 							</Suspense>
 						</div>
 					)}
+					{pluginsSurfaceEnabled && visitedSections.includes("plugins") && (
+						<div
+							data-settings-pane
+							data-active={activeSection === "plugins" ? "true" : "false"}
+							hidden={activeSection !== "plugins"}
+						>
+							<Suspense fallback={<PaneFallback />}>
+								<PluginsPane vaultPath={vaultPath} />
+							</Suspense>
+						</div>
+					)}
+					{visitedSections.includes("experimental") && (
+						<div
+							data-settings-pane
+							data-active={activeSection === "experimental" ? "true" : "false"}
+							hidden={activeSection !== "experimental"}
+						>
+							<Suspense fallback={<PaneFallback />}>
+								<ExperimentalPane settings={settings} patch={patch} />
+							</Suspense>
+						</div>
+					)}
+					{visitedSections.includes("account") && (
+						<div
+							data-settings-pane
+							data-active={activeSection === "account" ? "true" : "false"}
+							hidden={activeSection !== "account"}
+						>
+							<Suspense fallback={<PaneFallback />}>
+								<AccountPane />
+							</Suspense>
+						</div>
+					)}
 					{visitedSections.includes("about") && (
 						<div
 							data-settings-pane
-							data-active={section === "about" ? "true" : "false"}
-							hidden={section !== "about"}
+							data-active={activeSection === "about" ? "true" : "false"}
+							hidden={activeSection !== "about"}
 						>
 							<Suspense fallback={<PaneFallback />}>
 								<AboutPane />

@@ -15,7 +15,6 @@ import {
 } from "@/lib/shell/layout-persist";
 import {
 	type LayoutPresetMode,
-	layoutModeLeftCollapsed,
 	layoutModeRightCollapsed,
 } from "@/lib/shell/layout-presets";
 
@@ -24,48 +23,6 @@ export type RightSidebarTab = "agent" | "annotations";
 export type FeatureViewType = RightSidebarTab;
 /** Layout presets plus the free-form arrangement after any manual change. */
 export type LayoutMode = LayoutPresetMode | "custom";
-
-/** Crop + multi-turn payload when opening a visual-trace pin in Agent. */
-export type AgentSessionOpenVisualTrace = {
-	/** Stable mark id (product session key). */
-	traceId: string;
-	page: number;
-	comment: string;
-	paperPath?: string;
-	image?: { data: string; mimeType: string };
-	messages: Array<{
-		id: string;
-		role: "user" | "assistant";
-		content: string;
-		createdAt: string;
-		agentSessionId?: string;
-	}>;
-	status?: "running" | "completed" | "failed";
-};
-
-/** One-shot request to open a specific Agent session from PDF pins. */
-export type AgentSessionOpenRequest = {
-	/** Monotonic id so identical payloads still re-trigger. */
-	nonce: number;
-	agentId: string;
-	/** Agentero runtime/event session id from runOnce. */
-	runtimeSessionId: string;
-	/** ACP provider session id when available. */
-	providerSessionId?: string;
-	messageId?: string;
-	title?: string;
-	/** Original user prompt / display text. */
-	prompt?: string;
-	/** Local answer fallback when provider history cannot be loaded. */
-	answerSnapshot?: string;
-	/**
-	 * Full visual-trace transcript for Open in Agent.
-	 * Prefer this over prompt+answerSnapshot alone (multi-turn + image chip).
-	 */
-	visualTrace?: AgentSessionOpenVisualTrace;
-	/** Absolute paper path for mark finalizers on follow-up turns. */
-	paperAbsPath?: string;
-};
 
 /** A title-search result set awaiting the user's pick, plus its destination. */
 export type PaperSearchDraftGroup = PaperSearchGroup & {
@@ -103,11 +60,15 @@ type UiStore = {
 	commandOpen: boolean;
 	commandMode: PaletteMode;
 	settingsOpen: boolean;
+	/**
+	 * Vault-relative path of the retained Library preview (null = none).
+	 * The left Paper Info panel previews this paper so users can inspect it
+	 * without opening the row. Cleared when its Library context changes.
+	 */
+	hoveredPaperPath: string | null;
 	skillImportDraft: SkillDiscovery[] | null;
 	/** Title-search candidates queued for the picker; the head is shown first. */
 	paperSearchDraft: PaperSearchDraftGroup[] | null;
-	/** PDF visual-trace → Agent session open (consumed once). */
-	agentSessionOpenRequest: AgentSessionOpenRequest | null;
 };
 
 export const uiStore = createStore<UiStore>(() => ({
@@ -124,16 +85,16 @@ export const uiStore = createStore<UiStore>(() => ({
 	commandOpen: false,
 	commandMode: "go",
 	settingsOpen: false,
+	hoveredPaperPath: null,
 	skillImportDraft: null,
 	paperSearchDraft: null,
-	agentSessionOpenRequest: null,
 }));
 
 export function setSidebarCollapsedState(collapsed: boolean): void {
 	const prev = uiStore.getState().sidebarCollapsed;
 	uiStore.setState({ sidebarCollapsed: collapsed });
-	// The free-form arrangement is part of the persisted custom layout.
-	if (prev !== collapsed && uiStore.getState().layoutMode === "custom") {
+	// Persist the left sidebar's state unless temporarily collapsed by Reading mode.
+	if (prev !== collapsed && uiStore.getState().layoutMode !== "reading") {
 		saveCustomRails({
 			leftCollapsed: collapsed,
 			rightOpen: uiStore.getState().rightSidebarOpen,
@@ -183,10 +144,17 @@ export function initShellLayoutFromPrefs(): void {
 	const prefs = getShellLayoutPrefs();
 	if (prefs.lastMode !== "custom") {
 		const mode = prefs.lastMode;
+		// Reading is a transient maximize over the previous preset; it has no
+		// width slot of its own (#764).
+		const previousPreset =
+			prefs.lastPreset && prefs.lastPreset !== "reading"
+				? prefs.lastPreset
+				: null;
 		uiStore.setState({
 			layoutMode: mode,
-			lastAppliedPreset: mode,
-			sidebarCollapsed: layoutModeLeftCollapsed(mode),
+			lastAppliedPreset: mode === "reading" ? previousPreset : mode,
+			sidebarCollapsed:
+				mode === "reading" ? true : (prefs.customRails?.leftCollapsed ?? false),
 			rightSidebarOpen: !layoutModeRightCollapsed(mode),
 		});
 		return;
@@ -234,6 +202,12 @@ export function openPalette(mode: PaletteMode): void {
 
 export function setSettingsOpenState(open: boolean): void {
 	uiStore.setState({ settingsOpen: open });
+}
+
+/** Retain the last intentionally hovered Library row for Paper Info. */
+export function setHoveredPaperPath(path: string | null): void {
+	if (uiStore.getState().hoveredPaperPath === path) return;
+	uiStore.setState({ hoveredPaperPath: path });
 }
 
 export function setSkillImportDraft(draft: SkillDiscovery[] | null): void {
@@ -310,8 +284,6 @@ export function layout(): LayoutController | null {
 
 export function toggleSidebar(): void {
 	const { sidebarCollapsed } = uiStore.getState();
-	// React state is source of truth — isCollapsed() can lag at 0px.
-	setLayoutMode("custom");
 	layout()?.setLeftCollapsed(!sidebarCollapsed);
 }
 
@@ -339,11 +311,6 @@ export function setFeaturePoppedOut(
 	}));
 }
 
-export function clearAgentSessionOpenRequest(): void {
-	if (!uiStore.getState().agentSessionOpenRequest) return;
-	uiStore.setState({ agentSessionOpenRequest: null });
-}
-
 /**
  * Close dialogs and drop one-shot requests that reference the vault being
  * closed. Deliberately narrow: user chrome (rail state), live window truth
@@ -354,9 +321,9 @@ export function clearUiVaultState(): void {
 	uiStore.setState({
 		skillImportDraft: null,
 		paperSearchDraft: null,
+		hoveredPaperPath: null,
 		zoteroOpen: false,
 		zoteroSyncOpen: false,
 		commandOpen: false,
-		agentSessionOpenRequest: null,
 	});
 }

@@ -4,13 +4,17 @@
 //! like jobs/agent/watcher). The flat aliases below are kept for the headless
 //! CLI and migrated code; the desktop Host calls the semantic paths directly.
 
+pub mod context;
 pub mod lifecycle;
 pub mod markdown;
 pub mod open_request;
 pub mod paper;
 pub mod pdf;
+pub mod research_table;
+pub mod sync;
 pub mod translate;
 pub mod vault;
+pub mod zhihu;
 
 // Stable historical `features::` paths, backed by the semantic module tree.
 pub use markdown::wiki;

@@ -1,22 +1,35 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	deleteHistorySession,
 	hydrateSessionTitles,
 	isSessionIdPrefixTitle,
 	mergeImportedSessions,
+	renameHistorySessionTitle,
 	sanitizeChatLines,
 	sessionsNeedingTitleHydration,
 	titleFromLoadedHistory,
 } from "@/components/agent/hooks/use-agent-history";
 import * as agentApi from "@/lib/agent";
-import type { AgentSessionRecord } from "@/lib/agent/agent-session-store";
+import {
+	type AgentSessionRecord,
+	agentSessionStore,
+} from "@/lib/agent/agent-session-store";
 import type { AcpSessionInfo } from "@/lib/agent/api";
+import { encodeMentionToken } from "@/lib/agent/composer-inline-tokens";
 import * as titleCache from "@/lib/agent/history-title-cache";
+import {
+	isDismissedAcpSession,
+	rememberDismissedAcpSession,
+	rememberEmptyAcpSession,
+} from "@/lib/agent/history-title-cache";
 
 vi.mock("@/lib/agent", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("@/lib/agent")>();
 	return {
 		...actual,
 		loadSession: vi.fn(),
+		deleteSession: vi.fn(),
+		cancelAgentRun: vi.fn(),
 	};
 });
 
@@ -72,6 +85,20 @@ describe("sanitizeChatLines", () => {
 		expect(out[0]?.visualAnnotations).toHaveLength(1);
 		expect(out[0]?.visualAnnotations?.[0]?.id).toBe("v1");
 		expect(out[0]?.images).toHaveLength(1);
+	});
+
+	it("keeps a chip-only user turn and its markup", () => {
+		const lines = [
+			{
+				id: "l1",
+				kind: "user" as const,
+				text: "",
+				markup: encodeMentionToken("notes/论文关系图.md"),
+			},
+		];
+		const out = sanitizeChatLines(lines);
+		expect(out).toHaveLength(1);
+		expect(out[0]?.kind === "user" && out[0].markup).toContain("{{m:");
 	});
 
 	it("drops empty user turns that have no text, visuals, or images", () => {
@@ -147,6 +174,67 @@ describe("titleFromLoadedHistory", () => {
 });
 
 describe("mergeImportedSessions", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it("omits sessions already known to have no transcript", () => {
+		const storage = new Map<string, string>();
+		vi.stubGlobal("localStorage", {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => {
+				storage.set(key, value);
+			},
+			removeItem: (key: string) => {
+				storage.delete(key);
+			},
+		});
+		rememberEmptyAcpSession("agent-1", "s1");
+
+		const { sessions } = mergeImportedSessions(
+			[],
+			[makeAcpSession({ sessionId: "s1", title: "New chat" })],
+			"agent-1",
+			"Agent",
+			"zh-CN",
+		);
+
+		expect(sessions).toHaveLength(0);
+	});
+
+	it("omits sessions the user deleted, including a local running row", () => {
+		const storage = new Map<string, string>();
+		vi.stubGlobal("localStorage", {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => {
+				storage.set(key, value);
+			},
+			removeItem: (key: string) => {
+				storage.delete(key);
+			},
+		});
+		rememberDismissedAcpSession("agent-1", "prov");
+
+		const { sessions } = mergeImportedSessions(
+			[
+				makeRecord({
+					id: "runtime",
+					providerSessionId: "prov",
+					source: "local",
+					status: "running",
+					lines: [{ id: "u1", kind: "user" as const, text: "hello" }],
+				}),
+			],
+			[makeAcpSession({ sessionId: "prov", title: "Kept" })],
+			"agent-1",
+			"Agent",
+			"zh-CN",
+		);
+
+		expect(sessions).toHaveLength(0);
+		expect(isDismissedAcpSession("agent-1", "prov")).toBe(true);
+	});
+
 	it("flags untitled external sessions as hydration candidates", () => {
 		const prev: AgentSessionRecord[] = [];
 		const chatSessions = [makeAcpSession({ sessionId: "s1", title: null })];
@@ -264,6 +352,38 @@ describe("mergeImportedSessions", () => {
 		expect(sessions[0].title).toBe("Earlier hydrated title");
 		expect(hydrationCandidates).toHaveLength(0);
 	});
+
+	it("keeps a user-renamed title over a newer ACP title (#710)", () => {
+		vi.spyOn(titleCache, "getOverriddenHistoryTitle").mockReturnValue(
+			"My rename",
+		);
+		const prev = [
+			makeRecord({
+				id: "s1",
+				source: "external",
+				title: "My rename",
+				titleLocked: true,
+				lines: [],
+				providerSessionId: "s1",
+			}),
+		];
+		const chatSessions = [
+			makeAcpSession({ sessionId: "s1", title: "ACP pushed title" }),
+		];
+
+		const { sessions, hydrationCandidates } = mergeImportedSessions(
+			prev,
+			chatSessions,
+			"agent-1",
+			"Agent",
+			"zh-CN",
+		);
+
+		expect(sessions[0].title).toBe("My rename");
+		expect(sessions[0].titleLocked).toBe(true);
+		expect(hydrationCandidates).toHaveLength(0);
+		vi.mocked(titleCache.getOverriddenHistoryTitle).mockRestore();
+	});
 });
 
 describe("sessionsNeedingTitleHydration", () => {
@@ -281,9 +401,38 @@ describe("sessionsNeedingTitleHydration", () => {
 				lines: [{ id: "l1", kind: "user" as const, text: "hello" }],
 			}),
 			makeRecord({ id: "d", title: "Real title" }),
+			makeRecord({ id: "e", title: "", titleLocked: true }),
 		];
 		const need = sessionsNeedingTitleHydration(sessions, "agent-1");
 		expect(need.map((s) => s.id)).toEqual(["a", "ses_abcdxxxx"]);
+	});
+});
+
+describe("renameHistorySessionTitle", () => {
+	it("locks the title in the session store and writes an override (#710)", () => {
+		const setUser = vi
+			.spyOn(titleCache, "setUserHistoryTitle")
+			.mockImplementation(() => {});
+		const item = makeRecord({
+			id: "s1",
+			title: "Old",
+			providerSessionId: "prov-1",
+		});
+		agentSessionStore.setState({ sessions: [item], activeTabId: "s1" });
+
+		expect(renameHistorySessionTitle(item, "  New title  ")).toBe("New title");
+		expect(setUser).toHaveBeenCalledWith(
+			"agent-1",
+			"s1",
+			"New title",
+			"prov-1",
+		);
+		const updated = agentSessionStore
+			.getState()
+			.sessions.find((session) => session.id === "s1");
+		expect(updated?.title).toBe("New title");
+		expect(updated?.titleLocked).toBe(true);
+		setUser.mockRestore();
 	});
 });
 
@@ -373,6 +522,39 @@ describe("hydrateSessionTitles", () => {
 		expect(setSessionHistory).not.toHaveBeenCalled();
 	});
 
+	it("drops a loaded session that has no transcript", async () => {
+		const mockedLoadSession = vi.mocked(agentApi.loadSession);
+		mockedLoadSession.mockResolvedValue({
+			sessionId: "s1",
+			title: "New chat",
+			lines: [],
+		});
+		vi.spyOn(titleCache, "rememberEmptyAcpSession").mockImplementation(
+			() => {},
+		);
+
+		const setSessionHistory = vi.fn();
+		const historyGenRef = { current: 1 };
+		const items = [makeRecord({ id: "s1", providerSessionId: "s1" })];
+
+		await hydrateSessionTitles(items, {
+			generation: 1,
+			historyGenRef,
+			selectedAgentId: "agent-1",
+			vaultPath: "/vault",
+			setSessionHistory,
+		});
+
+		expect(titleCache.rememberEmptyAcpSession).toHaveBeenCalledWith(
+			"agent-1",
+			"s1",
+		);
+		const updater = setSessionHistory.mock.calls[0][0] as (
+			prev: AgentSessionRecord[],
+		) => AgentSessionRecord[];
+		expect(updater(items)).toEqual([]);
+	});
+
 	it("ignores failed loads silently", async () => {
 		const mockedLoadSession = vi.mocked(agentApi.loadSession);
 		mockedLoadSession.mockRejectedValue(new Error("network"));
@@ -390,5 +572,65 @@ describe("hydrateSessionTitles", () => {
 
 		expect(mockedLoadSession).toHaveBeenCalledTimes(1);
 		expect(setSessionHistory).not.toHaveBeenCalled();
+	});
+});
+
+describe("deleteHistorySession", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		agentSessionStore.getState().setSessions([]);
+		agentSessionStore.getState().startDraft();
+	});
+
+	function stubStorage() {
+		const storage = new Map<string, string>();
+		vi.stubGlobal("localStorage", {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => {
+				storage.set(key, value);
+			},
+			removeItem: (key: string) => {
+				storage.delete(key);
+			},
+		});
+	}
+
+	it("cancels a running turn, hides the provider id, and leaves the open draft", async () => {
+		stubStorage();
+		vi.mocked(agentApi.cancelAgentRun).mockResolvedValue(undefined);
+		vi.mocked(agentApi.deleteSession).mockResolvedValue({
+			sessionId: "prov",
+			deletedOnAgent: false,
+			agentError: null,
+		});
+		agentSessionStore.getState().setSessions([
+			makeRecord({
+				id: "runtime",
+				providerSessionId: "prov",
+				status: "running",
+			}),
+		]);
+		agentSessionStore.getState().setActiveTabId("runtime");
+
+		const result = await deleteHistorySession(
+			makeRecord({
+				id: "runtime",
+				providerSessionId: "prov",
+				status: "running",
+			}),
+			"/vault",
+		);
+
+		expect(agentApi.cancelAgentRun).toHaveBeenCalledWith("runtime");
+		expect(agentApi.deleteSession).toHaveBeenCalledWith({
+			agentId: "agent-1",
+			sessionId: "prov",
+			vaultPath: "/vault",
+		});
+		expect(result.deletedOnAgent).toBe(false);
+		expect(agentSessionStore.getState().sessions).toEqual([]);
+		expect(agentSessionStore.getState().activeTabId).toBe("draft");
+		expect(isDismissedAcpSession("agent-1", "prov")).toBe(true);
+		expect(isDismissedAcpSession("agent-1", "runtime")).toBe(true);
 	});
 });

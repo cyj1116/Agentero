@@ -14,7 +14,13 @@
 			"!dist",
 			"!tmp",
 			"!target",
-			"!src/lib/core/bindings.ts"
+			"!agentero",
+			"!src/lib/writing/templates/vendor",
+			"!src/lib/core/bindings.ts",
+			"!src/lib/agent/openui/generated",
+			"!test/fixtures/openui-catalog.snapshot.json",
+			"!scripts/templates/openui-blocks.SKILL.md",
+			"!templates/vault/.agents/skills/openui-blocks/SKILL.md"
 		]
 	},
 	"formatter": {
@@ -55,9 +61,7 @@
 		{
 			"includes": [
 				"src/components/ai-elements/**",
-				"src/components/ui/button-group.tsx",
-				"src/components/ui/input-group.tsx",
-				"src/components/ui/carousel.tsx"
+				"src/components/ui/input-group.tsx"
 			],
 			"linter": {
 				"rules": {

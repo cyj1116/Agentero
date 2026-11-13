@@ -1,6 +1,7 @@
 //! Active remote vault sessions (SSH/SFTP or local-sim for tests).
 
 use super::catalog_mirror::CatalogMirror;
+use super::catalog_snapshot::CatalogSource;
 use crate::core::error::AppError;
 use crate::core::fs::{FsCaps, LocalFs, VaultFs};
 use serde::Serialize;
@@ -29,6 +30,9 @@ pub struct RemoteSessionInfo {
 pub struct RemoteSession {
     pub id: String,
     pub host: String,
+    /// SSH destination shared with SFTP (`user@host` or a config alias).
+    /// Agent stdio must use this, not [`Self::host`], which can omit the user.
+    pub destination: String,
     pub remote_path: String,
     pub display_name: String,
     pub kind: String,
@@ -50,6 +54,15 @@ impl RemoteSession {
             vault_handle: format!("remote:{}", self.id),
         }
     }
+
+    /// Publish the work-mirror catalog to the remote authority (SFTP PUT).
+    /// The single push hook for the remote paper command family: shared use
+    /// cases run against `work_root`, then commit through this; disconnect
+    /// reuses it for its best-effort flush.
+    pub async fn push_catalog(&self) -> Result<(), AppError> {
+        let mut cat = self.catalog.lock().await;
+        cat.push(self.fs.clone()).await
+    }
 }
 
 pub struct RemoteRegistry {
@@ -69,6 +82,10 @@ impl RemoteRegistry {
         }
     }
 
+    pub async fn list(&self) -> Vec<Arc<RemoteSession>> {
+        self.inner.lock().await.values().cloned().collect()
+    }
+
     pub async fn get(&self, session_id: &str) -> Result<Arc<RemoteSession>, AppError> {
         self.inner
             .lock()
@@ -79,18 +96,27 @@ impl RemoteRegistry {
     }
 
     pub async fn disconnect(&self, session_id: &str) -> Result<(), AppError> {
-        let session = {
-            let mut map = self.inner.lock().await;
-            map.remove(session_id).ok_or_else(|| {
-                AppError::message(format!("remote session not found: {session_id}"))
-            })?
-        };
-        // Best-effort catalog push before drop
-        {
-            let mut cat = session.catalog.lock().await;
-            let _ = cat.push(session.fs.clone()).await;
+        let session = self.get(session_id).await?;
+        // Keep the session and staged files available when publishing fails;
+        // a later push/disconnect retries the same import instead of losing it.
+        session
+            .catalog
+            .lock()
+            .await
+            .push_for_disconnect(session.fs.clone())
+            .await?;
+        self.inner.lock().await.remove(session_id);
+        // The work catalog stays open in the process-wide connection cache.
+        // Windows refuses to delete that file (and therefore `work_root`) until
+        // the handle is dropped.
+        crate::features::paper::catalog::evict_catalog_conn(&session.work_root);
+        if let Err(e) = std::fs::remove_dir_all(&session.work_root) {
+            log::warn!(
+                target: "agentero::op",
+                "remote disconnect: could not remove {}: {e}",
+                session.work_root.display()
+            );
         }
-        let _ = std::fs::remove_dir_all(&session.work_root);
         // Keep blob cache for LRU reuse; optional cleanup of empty parent
         Ok(())
     }
@@ -107,57 +133,67 @@ impl RemoteRegistry {
             return Err(AppError::message("host and remotePath are required"));
         }
 
-        let (kind, fs, display_name): (String, Arc<dyn VaultFs>, String) = if host == LOCAL_SIM_HOST
-        {
-            let root = PathBuf::from(remote_path);
-            if !root.is_dir() {
-                return Err(AppError::message(format!(
-                    "local-sim path is not a directory: {}",
-                    root.display()
-                )));
-            }
-            let display = format!("local-sim:{}", root.display());
-            ("local-sim".into(), Arc::new(LocalFs::new(root)), display)
-        } else {
-            #[cfg(unix)]
-            {
-                use super::sftp_fs::SftpFs;
-                let destination = match user.map(str::trim).filter(|s| !s.is_empty()) {
-                    Some(u) => format!("{u}@{host}"),
-                    None => host.to_string(),
-                };
-                let sftp = SftpFs::connect(&destination, remote_path).await?;
-                let display = format!("{destination}:{remote_path}");
-                ("ssh".into(), Arc::new(sftp) as Arc<dyn VaultFs>, display)
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = user;
-                return Err(AppError::message(
-                    "Remote vault over SSH is not supported on Windows yet \
-                     (openssh/SFTP client is Unix-only). Open a local vault, \
-                     or use Agentero on macOS/Linux for remote vaults.",
-                ));
-            }
-        };
+        let source;
+        let (kind, fs, display_name, destination): (String, Arc<dyn VaultFs>, String, String) =
+            if host == LOCAL_SIM_HOST {
+                let root = PathBuf::from(remote_path);
+                if !root.is_dir() {
+                    return Err(AppError::message(format!(
+                        "local-sim path is not a directory: {}",
+                        root.display()
+                    )));
+                }
+                let display = format!("local-sim:{}", root.display());
+                source = CatalogSource::Local(root.clone());
+                (
+                    "local-sim".into(),
+                    Arc::new(LocalFs::new(root)),
+                    display,
+                    host.to_string(),
+                )
+            } else {
+                #[cfg(unix)]
+                {
+                    use super::sftp_fs::SftpFs;
+                    let ssh_destination = format_ssh_destination(host, user);
+                    let sftp = SftpFs::connect(&ssh_destination, remote_path).await?;
+                    let display = format!("{ssh_destination}:{remote_path}");
+                    source = CatalogSource::Ssh {
+                        destination: ssh_destination.clone(),
+                        root: remote_path.to_string(),
+                    };
+                    (
+                        "ssh".into(),
+                        Arc::new(sftp) as Arc<dyn VaultFs>,
+                        display,
+                        ssh_destination,
+                    )
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = user;
+                    return Err(AppError::message(
+                        "Remote vault over SSH is not supported on Windows yet \
+                         (openssh/SFTP client is Unix-only). Open a local vault, \
+                         or use Agentero on macOS/Linux for remote vaults.",
+                    ));
+                }
+            };
 
         let session_id = uuid::Uuid::new_v4().to_string();
         let cache_key = hex::encode(Sha256::digest(format!("{host}\0{remote_path}").as_bytes()));
-        let base_cache = dirs::cache_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("agentero")
-            .join("remote")
-            .join(&cache_key);
+        let base_cache = super::blob_cache::remote_cache_base().join(&cache_key);
         let work_root = base_cache.join("work").join(&session_id);
         let blob_root = base_cache.join("blobs");
         std::fs::create_dir_all(&work_root)?;
         std::fs::create_dir_all(&blob_root)?;
 
-        let catalog = CatalogMirror::checkout(fs.clone(), &work_root).await?;
+        let catalog = CatalogMirror::checkout(fs.clone(), &work_root, source).await?;
 
         let session = Arc::new(RemoteSession {
             id: session_id.clone(),
             host: host.to_string(),
+            destination,
             remote_path: remote_path.to_string(),
             display_name,
             kind,
@@ -170,6 +206,14 @@ impl RemoteRegistry {
         let info = session.info();
         self.inner.lock().await.insert(session_id, session);
         Ok(info)
+    }
+}
+
+/// `user@host` when `user` is set, otherwise `host` unchanged (it may already be `user@host` or an ssh config alias).
+pub fn format_ssh_destination(host: &str, user: Option<&str>) -> String {
+    match user.map(str::trim).filter(|user| !user.is_empty()) {
+        Some(user) => format!("{user}@{host}"),
+        None => host.to_string(),
     }
 }
 
@@ -193,6 +237,31 @@ mod tests {
         std::fs::write(p.join("AGENTS.md"), "# agents\n").unwrap();
         std::fs::write(p.join("papers/demo/NOTES.md"), "# Demo paper\n\nhello\n").unwrap();
         p
+    }
+
+    #[test]
+    fn ssh_destination_joins_a_user_and_keeps_an_alias() {
+        assert_eq!(format_ssh_destination("gpu01", None), "gpu01");
+        assert_eq!(format_ssh_destination("gpu01", Some(" ")), "gpu01");
+        assert_eq!(format_ssh_destination("gpu01", Some("me")), "me@gpu01");
+        assert_eq!(format_ssh_destination("me@gpu01", None), "me@gpu01");
+    }
+
+    #[tokio::test]
+    async fn local_sim_lists_one_delegate_target() {
+        use crate::features::agent::remote_host::RemoteAgentHosts;
+        let root = tmp_vault();
+        let reg = RemoteRegistry::new();
+        let info = reg
+            .connect(LOCAL_SIM_HOST, None, &root.to_string_lossy())
+            .await
+            .expect("connect");
+        let targets = RemoteAgentHosts::list_targets(&reg).await.expect("targets");
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].local_sim);
+        assert_eq!(targets[0].destination, LOCAL_SIM_HOST);
+        assert_eq!(targets[0].remote_path, root.to_string_lossy());
+        assert_eq!(targets[0].session_id, info.session_id);
     }
 
     #[tokio::test]
@@ -375,6 +444,8 @@ mod tests {
             pdf_url: None,
             html_url: None,
             source_url: None,
+            code_repo: None,
+            openreview_url: None,
             body_source: None,
             body_quality: None,
             bibtex_key: None,
@@ -387,6 +458,7 @@ mod tests {
             is_read: false,
             zotero_item_id: None,
             zotero_last_synced: None,
+            custom_props: Default::default(),
             added_at: now.clone(),
             updated_at: now,
         };
@@ -414,7 +486,6 @@ mod tests {
             "claude",
             "codex",
             "opencode",
-            "openclaw",
             "hermes",
             "claude-agent-acp",
             "grok",
@@ -574,6 +645,8 @@ mod tests {
                 pdf_url: None,
                 html_url: None,
                 source_url: None,
+                code_repo: None,
+                openreview_url: None,
                 body_source: None,
                 body_quality: None,
                 bibtex_key: None,
@@ -586,6 +659,7 @@ mod tests {
                 is_read: false,
                 zotero_item_id: None,
                 zotero_last_synced: None,
+                custom_props: Default::default(),
                 added_at: now.clone(),
                 updated_at: now.clone(),
             };
@@ -648,9 +722,16 @@ mod tests {
         let pull_root =
             std::env::temp_dir().join(format!("agentero-live-pull-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&pull_root).unwrap();
-        let _mirror = CatalogMirror::checkout(session.fs.clone(), &pull_root)
-            .await
-            .expect("re-checkout catalog from remote");
+        let _mirror = CatalogMirror::checkout(
+            session.fs.clone(),
+            &pull_root,
+            CatalogSource::Ssh {
+                destination: host.clone(),
+                root: path.clone(),
+            },
+        )
+        .await
+        .expect("re-checkout catalog from remote");
         let pulled = papers::get_by_path(&pull_root, "papers/attention-is-all-you-need")
             .expect("get after pull");
         check!(
@@ -1007,7 +1088,7 @@ mod tests {
             // 4) Download assets for local-pdf paper if any
             if let Ok(list) = crate::features::paper::catalog::papers::list_all(&session.work_root)
             {
-                if let Some(p) = list.first() {
+                if let Some(p) = list.iter().find(|paper| paper.arxiv_id.is_none()) {
                     match import_bridge::download_paper_assets_remote(
                         session.clone(),
                         PaperDownloadAssetsArgs {

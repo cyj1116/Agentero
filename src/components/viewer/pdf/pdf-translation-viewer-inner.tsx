@@ -1,22 +1,45 @@
 /**
- * Slim dual-pane translation companion. Mounts only scroll / zoom / raster
- * plugins (no selection, annotation, search, or ONNX layout), so capability
- * hooks that throw on missing plugins are never called here.
+ * Slim dual-pane translation companion. It keeps selection, annotation, and
+ * ONNX layout unmounted; find searches the generated translated PDF instead
+ * of the source text layer.
  */
 
+import type { PdfLinkAnnoObject } from "@embedpdf/models";
+import { useDocumentManagerCapability } from "@embedpdf/plugin-document-manager/react";
 import {
 	GlobalPointerProvider,
 	useInteractionManagerCapability,
 } from "@embedpdf/plugin-interaction-manager/react";
-import { type PageLayout, Scroller } from "@embedpdf/plugin-scroll/react";
+import { type PageLayout, useScroll } from "@embedpdf/plugin-scroll/react";
+import { useSearch } from "@embedpdf/plugin-search/react";
 import { useZoom, ZoomGestureWrapper } from "@embedpdf/plugin-zoom/react";
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import {
+	useCallback,
+	useEffect,
+	useMemo,
+	useRef,
+	useSyncExternalStore,
+} from "react";
+import { createPortal } from "react-dom";
+import { PdfCitationPreview } from "@/components/viewer/pdf/cards/citation-preview";
+import { PdfCrossrefPreview } from "@/components/viewer/pdf/cards/crossref-preview";
+import { PdfLinkUrlTip } from "@/components/viewer/pdf/cards/link-url-tip";
+import { PdfFindBar } from "@/components/viewer/pdf/chrome/pdf-find-bar";
+import { PdfTranslateProgressChip } from "@/components/viewer/pdf/chrome/pdf-translate-progress";
 import { EMPTY_LAYOUT_REGIONS_BY_PAGE } from "@/components/viewer/pdf/constants";
+import { usePdfEngineContext } from "@/components/viewer/pdf/engine-provider";
+import { usePdfCitations } from "@/components/viewer/pdf/hooks/use-pdf-citations";
+import { usePdfCrossrefPreview } from "@/components/viewer/pdf/hooks/use-pdf-crossref-preview";
+import { usePdfFind } from "@/components/viewer/pdf/hooks/use-pdf-find";
 import { usePdfLayoutRegions } from "@/components/viewer/pdf/hooks/use-pdf-layout-regions";
 import { usePdfLayoutTranslate } from "@/components/viewer/pdf/hooks/use-pdf-layout-translate";
+import { usePdfLinkUrlTip } from "@/components/viewer/pdf/hooks/use-pdf-link-url-tip";
 import { usePdfPaperTone } from "@/components/viewer/pdf/hooks/use-pdf-paper-tone";
+import { usePdfReadingMode } from "@/components/viewer/pdf/hooks/use-pdf-reading-mode";
 import { usePdfScrollSync } from "@/components/viewer/pdf/hooks/use-pdf-scroll-sync";
 import { usePdfZoomControls } from "@/components/viewer/pdf/hooks/use-pdf-zoom-controls";
+import { useReflowDisplayDocument } from "@/components/viewer/pdf/hooks/use-reflow-display-document";
+import { getLinkDestination } from "@/components/viewer/pdf/layers/citation-links";
 import {
 	type PdfPageHandlers,
 	PdfPageLayers,
@@ -24,10 +47,31 @@ import {
 	type PdfPageMarksSlice,
 	type PdfPageModeSlice,
 } from "@/components/viewer/pdf/layers/page-layers";
-import type { PdfViewerInnerProps } from "@/components/viewer/pdf/types";
+import type {
+	PdfViewerInnerProps,
+	ScreenPoint,
+} from "@/components/viewer/pdf/types";
 import { DockviewViewport } from "@/components/viewer/pdf/viewport/dockview-viewport";
+import { KeyboardScrollHandler } from "@/components/viewer/pdf/viewport/keyboard-scroll-handler";
 import { PanDragHandler } from "@/components/viewer/pdf/viewport/pan-handler";
+import { PdfScroller } from "@/components/viewer/pdf/viewport/pdf-scroller";
+import { PdfVimKeyHandler } from "@/components/viewer/pdf/viewport/pdf-vim-key-handler";
 import { WheelZoomHandler } from "@/components/viewer/pdf/viewport/wheel-zoom-handler";
+import { openExternalUrl } from "@/lib/core/open-external";
+import { destinationInPageBox } from "@/lib/pdf/citation-dest-keys";
+import {
+	mirrorLayoutResultToTranslation,
+	translationSourceKey,
+} from "@/lib/pdf/layout";
+import {
+	getTranslatedLinkSource,
+	subscribeTranslatedLinkSource,
+} from "@/lib/pdf/layout/translated-link-source";
+import {
+	linkPreviewDragActive,
+	subscribeLinkPreviewDrag,
+} from "@/lib/pdf/link-preview-drag";
+import { pickPdfSearchDocumentId } from "@/lib/pdf/search-target";
 
 const EMPTY_PAGE_MAP = new Map();
 
@@ -49,6 +93,9 @@ const EMPTY_MARKS: PdfPageMarksSlice = {
 	activeCardId: null,
 	hoveredCommentId: null,
 	selectionCommentDraft: null,
+	translateHighlightsByPage: EMPTY_PAGE_MAP,
+	highlightQuotesByPage: EMPTY_PAGE_MAP,
+	translatedHighlightsByPage: EMPTY_PAGE_MAP,
 };
 
 const NOOP = () => undefined;
@@ -92,10 +139,21 @@ export function PdfTranslationViewerInner({
 	paperAbsPath = null,
 	paperRelPath = null,
 	vaultPath = null,
+	sourceBytes = null,
+	pdfCacheBytes = null,
+	isRemotePaper = false,
+	importIdentifier,
 	isActive = true,
 	onHandle,
 }: PdfViewerInnerProps) {
 	usePdfScrollSync(docId);
+	usePdfReadingMode(docId);
+	const { provides: scroll } = useScroll(docId);
+	const scrollRef = useRef(scroll);
+	scrollRef.current = scroll;
+	const { provides: docCap } = useDocumentManagerCapability();
+	const docCapRef = useRef(docCap);
+	docCapRef.current = docCap;
 	// Interaction manager is registered; keep the capability subscribed so
 	// GlobalPointerProvider / pan-zoom gestures stay wired.
 	useInteractionManagerCapability();
@@ -104,6 +162,9 @@ export function PdfTranslationViewerInner({
 	const zoomLevel = zoomState.currentZoomLevel || 1;
 	const { zoomRef } = usePdfZoomControls(zoomLevel);
 	const hostRef = useRef<HTMLDivElement>(null);
+	const { engine } = usePdfEngineContext();
+	const engineRef = useRef(engine);
+	engineRef.current = engine;
 	const { pdfTone } = usePdfPaperTone();
 	const paperKey = paperRelPath || paperAbsPath || null;
 
@@ -113,9 +174,21 @@ export function PdfTranslationViewerInner({
 		layoutTranslatePageStateByPage,
 		layoutTranslateActive,
 		layoutTranslateRunning,
+		layoutTranslatePreparing,
+		layoutTranslateWaiting,
+		layoutTranslateQueued,
+		layoutTranslateProgress,
+		layoutTranslatePageCounts,
+		layoutTranslatePartial,
+		reflowOutput,
 		toggleLayoutTranslate,
 		togglePageLayoutTranslate,
 	} = usePdfLayoutTranslate({
+		reflowContext: () => {
+			const engine = engineRef.current,
+				document = docCapRef.current?.getDocument(docId);
+			return engine && document ? { engine, document } : null;
+		},
 		docId,
 		layoutRawRegions,
 		translationPane: true,
@@ -123,7 +196,56 @@ export function PdfTranslationViewerInner({
 		paperRelPath,
 		paperKey,
 		vaultPath,
+		pdfBytes: pdfCacheBytes ?? sourceBytes,
 	});
+
+	const reflowDisplayDocument = useReflowDisplayDocument(
+		docCap,
+		reflowOutput,
+		docId,
+	);
+	const searchDocumentId = pickPdfSearchDocumentId({
+		sourceDocumentId: docId,
+		translatedDocumentId: reflowDisplayDocument?.id,
+		translationVisible: layoutTranslatePageStateByPage.size > 0,
+	});
+	const { state: searchState, provides: search } = useSearch(searchDocumentId);
+	const searchScale = searchDocumentId === docId ? undefined : zoomLevel;
+	const {
+		findOpen,
+		findQuery,
+		setFindQuery,
+		findInputRef,
+		findTotal,
+		findActiveIndex,
+		findNext,
+		findPrev,
+		closeFind,
+	} = usePdfFind({ hostRef, search, searchState, scroll });
+	const findNextRef = useRef(findNext);
+	findNextRef.current = findNext;
+	const handleFindNext = useCallback(() => {
+		findNextRef.current();
+	}, []);
+	const findPrevRef = useRef(findPrev);
+	findPrevRef.current = findPrev;
+	const handleFindPrev = useCallback(() => {
+		findPrevRef.current();
+	}, []);
+	const closeFindRef = useRef(closeFind);
+	closeFindRef.current = closeFind;
+	const handleCloseFind = useCallback(() => {
+		closeFindRef.current();
+	}, []);
+
+	// `openTranslationTab` seeds a snapshot at open time; if layout analysis was
+	// still running then, mirror the source result when it lands so the
+	// auto-start below can fire.
+	useEffect(() => {
+		const sourceKey = translationSourceKey(docId);
+		if (!sourceKey) return;
+		return mirrorLayoutResultToTranslation(docId, sourceKey);
+	}, [docId]);
 
 	const translationAutoStartedRef = useRef(false);
 	const hadLayoutRegionsRef = useRef(false);
@@ -140,8 +262,17 @@ export function PdfTranslationViewerInner({
 			translationAutoStartedRef.current = false;
 			hadLayoutRegionsRef.current = false;
 		}
-		if (!hasRegions) return;
 		if (translationAutoStartedRef.current) return;
+		if (!hasRegions) {
+			// Layout is not ready yet. Park the job on the shared analysis queue
+			// so the user sees the "queued — waiting for layout analysis" toast
+			// (with a cancel action) instead of a silent empty pane. The hook
+			// starts the job once regions land; the mirror above delivers them
+			// even when the source pane finishes after this pane opened.
+			translationAutoStartedRef.current = true;
+			toggleLayoutTranslate();
+			return;
+		}
 		if (layoutTranslateActive || layoutTranslateRunning) {
 			translationAutoStartedRef.current = true;
 			return;
@@ -171,6 +302,24 @@ export function PdfTranslationViewerInner({
 		return () => onHandle?.(null);
 	}, [onHandle]);
 
+	const sourceKey = translationSourceKey(docId);
+	const linkSource = useSyncExternalStore(
+		subscribeTranslatedLinkSource,
+		() => getTranslatedLinkSource(sourceKey),
+		() => getTranslatedLinkSource(sourceKey),
+	);
+	const linkInkByKey = linkSource.inkByKey;
+	const glyphRunsByPage = linkSource.glyphRunsByPage;
+
+	const pageMarks = useMemo<PdfPageMarksSlice>(
+		() => ({
+			...EMPTY_MARKS,
+			citationLinks: linkSource.citationLinks,
+			textLinks: linkSource.textLinks,
+		}),
+		[linkSource],
+	);
+
 	const pageLayout = useMemo<PdfPageLayoutSlice>(
 		() => ({
 			hoverableRegionsByPage: EMPTY_LAYOUT_REGIONS_BY_PAGE,
@@ -178,20 +327,191 @@ export function PdfTranslationViewerInner({
 			layoutOverlayVisible: false,
 			layoutTranslateItemsByPage,
 			layoutTranslatePageStateByPage,
+			linkInkByKey,
+			glyphRunsByPage,
 		}),
 		[
 			rawRegionsByPage,
 			layoutTranslateItemsByPage,
 			layoutTranslatePageStateByPage,
+			linkInkByKey,
+			glyphRunsByPage,
 		],
+	);
+
+	const activateCitation = useCallback(
+		(link: PdfLinkAnnoObject) => {
+			const raw = getLinkDestination(link.target);
+			if (!raw) return;
+			// PDFium reports user space. EmbedPDF page size is the visible box,
+			// so a CropBox that does not start at (0, 0) has to be subtracted
+			// before the top-left conversion.
+			const destination = destinationInPageBox(raw, linkSource.pageOrigins);
+			const page =
+				docCapRef.current?.getDocument(docId)?.pages[destination.pageIndex];
+			const height = page?.size.height ?? 0;
+			const width = page?.size.width ?? 0;
+			const anchored = destination.pdfY > 0 || destination.pdfX != null;
+			scrollRef.current?.scrollToPage({
+				pageNumber: destination.pageIndex + 1,
+				behavior: "instant",
+				...(anchored && height > 0
+					? {
+							pageCoordinates: {
+								x:
+									destination.pdfX != null && width > 0
+										? Math.max(0, destination.pdfX)
+										: 0,
+								y: Math.max(0, height - destination.pdfY),
+							},
+							alignX: 0,
+							alignY: 18,
+						}
+					: {}),
+			});
+		},
+		[docId, linkSource.pageOrigins],
+	);
+
+	// Sibling clears so citation, crossref, and URL tips dismiss each other.
+	const clearCrossrefPreviewRef = useRef<() => void>(() => {});
+	const clearCitationPreviewRef = useRef<() => void>(() => {});
+	const clearLinkUrlTipRef = useRef<() => void>(() => {});
+
+	const {
+		citationPreview,
+		scheduleCitationHide,
+		markCitationHoverEnter,
+		clearCitationPreview,
+		handleCitationLinkHover,
+		hasCitationMatch,
+		citationImport,
+	} = usePdfCitations({
+		docId,
+		annotationCap: null,
+		hostRef,
+		zoomRef,
+		vaultPath,
+		paperPath: paperRelPath,
+		paperAbsPath,
+		sourceBytes,
+		isRemotePaper,
+		importIdentifier,
+		onPreviewShow: () => {
+			clearCrossrefPreviewRef.current();
+			clearLinkUrlTipRef.current();
+		},
+	});
+
+	const {
+		crossrefPreview,
+		scheduleCrossrefHide,
+		markCrossrefHoverEnter,
+		clearCrossrefPreview,
+		handleCrossrefLinkHover,
+	} = usePdfCrossrefPreview({
+		docId,
+		hostRef,
+		zoomRef,
+		paperAbsPath,
+		sourceBytes,
+		engineRef,
+		docCapRef,
+		onPreviewShow: () => {
+			clearCitationPreviewRef.current();
+			clearLinkUrlTipRef.current();
+		},
+		hasCitationMatch,
+	});
+
+	const {
+		linkUrlTip,
+		scheduleLinkUrlHide,
+		markLinkUrlHoverEnter,
+		clearLinkUrlTip,
+		handleLinkUrlHover: hoverLinkUrl,
+	} = usePdfLinkUrlTip();
+
+	clearCitationPreviewRef.current = clearCitationPreview;
+	clearCrossrefPreviewRef.current = clearCrossrefPreview;
+	clearLinkUrlTipRef.current = clearLinkUrlTip;
+
+	useEffect(() => {
+		return subscribeLinkPreviewDrag(() => {
+			clearCitationPreviewRef.current();
+			clearCrossrefPreviewRef.current();
+			clearLinkUrlTipRef.current();
+		});
+	}, []);
+
+	const handleLinkHover = useCallback(
+		(link: PdfLinkAnnoObject | null, point?: ScreenPoint | null) => {
+			if (linkPreviewDragActive()) {
+				clearCitationPreview();
+				clearCrossrefPreview();
+				clearLinkUrlTip();
+				return;
+			}
+			handleCitationLinkHover(link, point);
+			handleCrossrefLinkHover(link, point);
+		},
+		[
+			clearCitationPreview,
+			clearCrossrefPreview,
+			clearLinkUrlTip,
+			handleCitationLinkHover,
+			handleCrossrefLinkHover,
+		],
+	);
+
+	const handleLinkUrlHover = useCallback(
+		(url: string | null, point?: ScreenPoint | null) => {
+			if (linkPreviewDragActive()) {
+				clearLinkUrlTip();
+				return;
+			}
+			hoverLinkUrl(url, point);
+		},
+		[clearLinkUrlTip, hoverLinkUrl],
+	);
+
+	const handleCitationImportOpenChange = useCallback(
+		(open: boolean) => {
+			if (open) markCitationHoverEnter();
+			else scheduleCitationHide();
+		},
+		[markCitationHoverEnter, scheduleCitationHide],
+	);
+	const citationImportMenu = useMemo(
+		() =>
+			citationImport
+				? {
+						folders: citationImport.folders,
+						lastImportParentDir: citationImport.lastImportParentDir,
+						importingId: citationImport.importingId,
+						onImport: citationImport.importCitation,
+						onOpenChange: handleCitationImportOpenChange,
+						remotePaper: isRemotePaper,
+					}
+				: undefined,
+		[citationImport, handleCitationImportOpenChange, isRemotePaper],
 	);
 
 	const pageHandlers = useMemo<PdfPageHandlers>(
 		() => ({
 			...EMPTY_HANDLERS,
 			onTogglePageLayoutTranslate: togglePageLayoutTranslate,
+			onCitationActivate: activateCitation,
+			onTextLinkActivate: openExternalUrl,
+			onCitationHover: handleLinkHover,
+			onLinkUrlHover: handleLinkUrlHover,
 		}),
-		[togglePageLayoutTranslate],
+		[
+			togglePageLayoutTranslate,
+			activateCitation,
+			handleLinkHover,
+			handleLinkUrlHover,
+		],
 	);
 
 	const renderPage = useCallback(
@@ -199,18 +519,32 @@ export function PdfTranslationViewerInner({
 			<PdfPageLayers
 				docId={docId}
 				pageIndex={pageIndex}
+				reflowDocumentId={reflowDisplayDocument?.id}
+				reflowDocumentVersion={reflowDisplayDocument?.version}
+				searchDocumentId={searchDocumentId}
+				searchScale={searchScale}
 				width={rotatedWidth || width}
 				height={rotatedHeight || height}
 				tone={pdfTone}
 				zoomRef={zoomRef}
 				annotationCap={null}
-				marks={EMPTY_MARKS}
+				marks={pageMarks}
 				layout={pageLayout}
 				mode={PAGE_MODE}
 				handlers={pageHandlers}
 			/>
 		),
-		[docId, pdfTone, zoomRef, pageLayout, pageHandlers],
+		[
+			docId,
+			pdfTone,
+			zoomRef,
+			pageMarks,
+			pageLayout,
+			pageHandlers,
+			reflowDisplayDocument,
+			searchDocumentId,
+			searchScale,
+		],
 	);
 
 	return (
@@ -221,10 +555,19 @@ export function PdfTranslationViewerInner({
 			<DockviewViewport
 				documentId={docId}
 				hostRef={hostRef}
-				rightGutter={0}
 				className="agentero-scroll-both min-h-0 min-w-0 flex-1"
 			>
 				<WheelZoomHandler docId={docId} />
+				<KeyboardScrollHandler
+					documentId={docId}
+					active={isActive}
+					hostRef={hostRef}
+				/>
+				<PdfVimKeyHandler
+					documentId={docId}
+					active={isActive}
+					hostRef={hostRef}
+				/>
 				<PanDragHandler
 					active={isActive}
 					hostRef={hostRef}
@@ -232,10 +575,66 @@ export function PdfTranslationViewerInner({
 				/>
 				<ZoomGestureWrapper documentId={docId} enableWheel={false}>
 					<GlobalPointerProvider documentId={docId}>
-						<Scroller documentId={docId} renderPage={renderPage} />
+						<PdfScroller documentId={docId} renderPage={renderPage} />
 					</GlobalPointerProvider>
 				</ZoomGestureWrapper>
 			</DockviewViewport>
+			<PdfFindBar
+				open={findOpen}
+				inputRef={findInputRef}
+				query={findQuery}
+				onQueryChange={setFindQuery}
+				total={findTotal}
+				activeResultIndex={findActiveIndex}
+				onFindNext={handleFindNext}
+				onFindPrev={handleFindPrev}
+				onClose={handleCloseFind}
+			/>
+			<PdfTranslateProgressChip
+				layoutTranslateRunning={layoutTranslateRunning}
+				layoutTranslatePreparing={layoutTranslatePreparing}
+				layoutTranslateWaiting={layoutTranslateWaiting}
+				layoutTranslateQueued={layoutTranslateQueued}
+				layoutTranslateProgress={layoutTranslateProgress}
+				layoutTranslatePageCounts={layoutTranslatePageCounts}
+				layoutTranslatePartial={layoutTranslatePartial}
+				onStop={toggleLayoutTranslate}
+			/>
+			{typeof document !== "undefined"
+				? createPortal(
+						<>
+							{citationPreview ? (
+								<PdfCitationPreview
+									screen={citationPreview.screen}
+									matched={citationPreview.matched}
+									importMenu={citationImportMenu}
+									onPointerEnter={markCitationHoverEnter}
+									onPointerLeave={scheduleCitationHide}
+								/>
+							) : null}
+							{crossrefPreview ? (
+								<PdfCrossrefPreview
+									screen={crossrefPreview.screen}
+									kind={crossrefPreview.kind}
+									page={crossrefPreview.page}
+									image={crossrefPreview.image}
+									targetSize={crossrefPreview.targetSize}
+									onPointerEnter={markCrossrefHoverEnter}
+									onPointerLeave={scheduleCrossrefHide}
+								/>
+							) : null}
+							{linkUrlTip ? (
+								<PdfLinkUrlTip
+									url={linkUrlTip.url}
+									screen={linkUrlTip.screen}
+									onPointerEnter={markLinkUrlHoverEnter}
+									onPointerLeave={scheduleLinkUrlHide}
+								/>
+							) : null}
+						</>,
+						document.body,
+					)
+				: null}
 		</div>
 	);
 }

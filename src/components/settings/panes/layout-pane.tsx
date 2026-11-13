@@ -15,7 +15,6 @@ import {
 	SettingsRow,
 } from "@/components/settings/settings-layout";
 import type { SettingsHostContext } from "@/components/settings/types";
-import { useBuiltinProviderAvailable } from "@/components/settings/use-builtin-provider";
 import { Button } from "@/components/ui/button";
 import {
 	Collapsible,
@@ -60,7 +59,9 @@ import {
 	probeLayoutProvider,
 } from "@/lib/pdf/layout/provider-config";
 import {
+	hasReadyProvider,
 	isProviderCardConfigurable,
+	isProviderReady,
 	isRemoteLayoutProvider,
 	LAYOUT_PROVIDERS,
 	layoutProviderCard,
@@ -90,6 +91,7 @@ const EMPTY_PROVIDER_CONFIG: LayoutProviderConfig = {
 	prompt: "",
 	language: DEFAULT_MINERU_LANGUAGE,
 	isOcr: false,
+	selfHosted: false,
 };
 
 const PROBE_LABEL_KEYS = {
@@ -112,15 +114,13 @@ export function LayoutPane({
 }) {
 	const { t } = useTranslation(["settings", "common"]);
 	const layout = settings.layout;
-	const builtinAvailable = useBuiltinProviderAvailable();
 	const isLocalVault = hostContext.kind === "local";
 	const canManageResults = Boolean(vaultPath) && isLocalVault && isTauri();
 	const [dialogOpen, setDialogOpen] = useState(false);
 	const [dialogMode, setDialogMode] = useState<"clear" | "reparse">("clear");
 	const [scope, setScope] = useState<ParseResultScope>("all");
 	const [busy, setBusy] = useState(false);
-	const isProviderConfigured = (id: LayoutProviderId) =>
-		(layout.providerConfigs[id]?.apiKey ?? "").trim().length > 0;
+	const [otherProvidersOpen, setOtherProvidersOpen] = useState(false);
 	// All remote providers are listed for configuration, like the translate
 	// pane; the backend selects only offer the configured ones (plus local).
 	// Cards with no editable field (the built-in parser) render nothing.
@@ -130,6 +130,15 @@ export function LayoutPane({
 		),
 		...Object.values(PARSER_PROVIDERS),
 	]).filter(isProviderCardConfigurable);
+	const isProviderConfigured = (id: LayoutProviderId) => {
+		const card = cards.find((candidate) => candidate.id === id);
+		const config = layout.providerConfigs[id];
+		return Boolean(card && config && isProviderReady(card, config));
+	};
+	// The menus only list configured providers, so an empty menu reads as "this
+	// app cannot do MinerU". Explain the ordering where the user looks first,
+	// and drop the hint once any provider is usable.
+	const noProviderReady = !hasReadyProvider(cards, layout.providerConfigs);
 	const backendOptions = Object.values(LAYOUT_PROVIDERS).filter(
 		(descriptor) => {
 			if (!isRemoteLayoutProvider(descriptor)) return true;
@@ -138,15 +147,19 @@ export function LayoutPane({
 		},
 	);
 	const parserBackendOptions = PARSER_BACKENDS.filter((backend) => {
+		if (backend === BUILTIN_PROVIDER_ID) return false;
 		if (backend === "local") return true;
-		// The built-in parser has no apiKey, so it is exempt from the configured
-		// check like `local`; gate it on Host availability, keeping a carried-over
-		// selection visible so it renders disabled rather than vanishing.
-		if (backend === BUILTIN_PROVIDER_ID) {
-			return builtinAvailable || backend === layout.parserBackend;
-		}
 		return backend === layout.parserBackend || isProviderConfigured(backend);
 	});
+	// The built-in parser stays implemented, but it is no longer offered here.
+	useEffect(() => {
+		if (layout.parserBackend !== BUILTIN_PROVIDER_ID) return;
+		patch({ layout: { ...layout, parserBackend: "local" } });
+	}, [layout, patch]);
+	// OpenAI-compatible is a catch-all: keep it collapsed under "Other" so the
+	// recommended Paddle / MinerU path stays uncluttered (issue #656).
+	const primaryCards = cards.filter((card) => card.id !== "openaiCompatible");
+	const otherCards = cards.filter((card) => card.id === "openaiCompatible");
 
 	const openDialog = useCallback((mode: "clear" | "reparse") => {
 		setDialogMode(mode);
@@ -253,13 +266,7 @@ export function LayoutPane({
 						</SelectTrigger>
 						<SelectContent className="max-h-72">
 							{parserBackendOptions.map((backend) => (
-								<SelectItem
-									key={backend}
-									value={backend}
-									disabled={
-										backend === BUILTIN_PROVIDER_ID && !builtinAvailable
-									}
-								>
+								<SelectItem key={backend} value={backend}>
 									{t(
 										`layout.parserBackend.${backend}` as "layout.parserBackend.local",
 									)}
@@ -270,12 +277,21 @@ export function LayoutPane({
 				</SettingsRow>
 			</SettingsGroup>
 
+			{noProviderReady ? (
+				<p className="mt-3 px-0.5 text-muted-foreground text-xs">
+					{t("layout.menusHint")}
+				</p>
+			) : null}
+
 			<div className="mb-5">
 				<h3 className="mb-2 px-0.5 font-medium text-sm">
 					{t("layout.providerConfig.section")}
 				</h3>
+				<p className="mb-2 px-0.5 text-muted-foreground text-xs">
+					{t("layout.providerConfig.sectionHint")}
+				</p>
 				<div className="grid gap-2">
-					{cards.map((card) => (
+					{primaryCards.map((card) => (
 						<ProviderConfigCard
 							key={card.id}
 							provider={card}
@@ -284,6 +300,39 @@ export function LayoutPane({
 						/>
 					))}
 				</div>
+				{otherCards.length > 0 ? (
+					<Collapsible
+						className="mt-2"
+						open={otherProvidersOpen}
+						onOpenChange={setOtherProvidersOpen}
+					>
+						<CollapsibleTrigger asChild>
+							<button
+								type="button"
+								className="flex items-center gap-1 rounded px-0.5 py-0.5 text-muted-foreground text-xs outline-none transition-colors hover:text-foreground"
+								aria-expanded={otherProvidersOpen}
+							>
+								<ChevronRight
+									className={cn(
+										"size-3.5 transition-transform",
+										otherProvidersOpen && "rotate-90",
+									)}
+								/>
+								{t("layout.providerConfig.other")}
+							</button>
+						</CollapsibleTrigger>
+						<CollapsibleContent className="mt-2 grid gap-2">
+							{otherCards.map((card) => (
+								<ProviderConfigCard
+									key={card.id}
+									provider={card}
+									settings={settings}
+									patch={patch}
+								/>
+							))}
+						</CollapsibleContent>
+					</Collapsible>
+				) : null}
 			</div>
 
 			<div className="flex justify-end gap-2">
@@ -421,31 +470,40 @@ function ProviderConfigCard({
 			? draft.language
 			: stored.language || DEFAULT_MINERU_LANGUAGE;
 	const displayIsOcr = draft.isOcr !== undefined ? draft.isOcr : stored.isOcr;
-	const configured = displayApiKey.trim().length > 0;
+	const displaySelfHosted =
+		draft.selfHosted !== undefined ? draft.selfHosted : stored.selfHosted;
+	// Usable without a key when the card points at a self-hosted endpoint.
+	const configured = isProviderReady(provider, {
+		apiKey: displayApiKey,
+		baseUrl: displayBaseUrl,
+		selfHosted: displaySelfHosted,
+	});
 
 	const runProbe = useCallback(
 		(apiKey: string) => {
 			if (!isTauri()) return;
-			if (!apiKey.trim()) {
-				setStatus("idle");
-				return;
-			}
 			probeAbortRef.current?.abort();
 			const ac = new AbortController();
 			probeAbortRef.current = ac;
 			setStatus("probing");
 			// Mask → Host resolves the stored token; plaintext draft → test pre-save.
-			void probeLayoutProvider(provider.id, apiKey).then((ok) => {
-				if (!ac.signal.aborted) setStatus(ok ? "ok" : "fail");
+			void probeLayoutProvider(provider.id, apiKey).then((result) => {
+				if (ac.signal.aborted) return;
+				setStatus(result.ok ? "ok" : "fail");
+				// The dot alone cannot say why; surface the Host's reason so a
+				// failed probe is actionable instead of a silent grey dot.
+				if (!result.ok && result.error) notifyError(result.error);
 			});
 		},
 		[provider.id],
 	);
 
 	/**
-	 * Persist the current card fields. Empty apiKey clears the stored secret,
-	 * falls backends back to local when needed, and drops the provider from the
-	 * selects — clearing the input triggers this immediately (no Confirm).
+	 * Persist the current card fields. A card that is not ready (no key and no
+	 * self-hosted endpoint) clears the stored secret, falls backends back to
+	 * local when needed, and drops the provider from the selects — clearing the
+	 * input triggers this immediately (no Confirm). A ready card persists and
+	 * probes, even with an empty key.
 	 */
 	const persistConfig = useCallback(
 		async (apiKey: string) => {
@@ -454,9 +512,21 @@ function ProviderConfigCard({
 			const prompt = provider.supportsPrompt ? displayPrompt.trim() : "";
 			const language = provider.supportsLanguage ? displayLanguage : "";
 			const isOcr = provider.supportsOcr ? displayIsOcr : false;
-			const config = { apiKey, baseUrl, model, prompt, language, isOcr };
+			const selfHosted = provider.supportsSelfHosted
+				? displaySelfHosted
+				: false;
+			const config = {
+				apiKey,
+				baseUrl,
+				model,
+				prompt,
+				language,
+				isOcr,
+				selfHosted,
+			};
+			const ready = isProviderReady(provider, config);
 
-			if (!apiKey) {
+			if (!ready) {
 				// Optimistic UI: hide from backend selects before Host round-trip.
 				const cleared = layoutBackendsAfterClearingProvider(
 					layout,
@@ -480,10 +550,11 @@ function ProviderConfigCard({
 				settings,
 				provider: provider.id,
 				config,
+				ready,
 			});
 			patch({ layout: displayLayout });
 			setDraft({});
-			if (!apiKey) {
+			if (!ready) {
 				setStatus("idle");
 				return;
 			}
@@ -495,6 +566,7 @@ function ProviderConfigCard({
 			displayPrompt,
 			displayLanguage,
 			displayIsOcr,
+			displaySelfHosted,
 			layout,
 			patch,
 			provider,
@@ -605,7 +677,16 @@ function ProviderConfigCard({
 				) : null}
 				{provider.supportsBaseUrl ? (
 					<ProviderFieldRow
-						label={t("layout.providerConfig.baseUrl.label")}
+						label={
+							provider.supportsSelfHosted ? (
+								<HelpLabel
+									label={t("layout.providerConfig.baseUrl.label")}
+									help={t("layout.providerConfig.selfHostedHelp")}
+								/>
+							) : (
+								t("layout.providerConfig.baseUrl.label")
+							)
+						}
 						htmlFor={`layout-provider-${provider.id}-base-url`}
 					>
 						<Input
@@ -666,7 +747,9 @@ function ProviderConfigCard({
 						/>
 					</ProviderFieldRow>
 				) : null}
-				{provider.supportsLanguage || provider.supportsOcr ? (
+				{provider.supportsLanguage ||
+				provider.supportsOcr ||
+				provider.supportsSelfHosted ? (
 					<Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
 						<CollapsibleTrigger asChild>
 							<button
@@ -737,6 +820,29 @@ function ProviderConfigCard({
 											setDraft((prev) => ({
 												...prev,
 												isOcr: checked === true,
+											}))
+										}
+									/>
+								</ProviderFieldRow>
+							) : null}
+							{provider.supportsSelfHosted ? (
+								<ProviderFieldRow
+									label={
+										<HelpLabel
+											label={t("layout.providerConfig.selfHosted.label")}
+											help={t("layout.providerConfig.selfHosted.help")}
+										/>
+									}
+									htmlFor={`layout-provider-${provider.id}-self-hosted`}
+								>
+									<Switch
+										id={`layout-provider-${provider.id}-self-hosted`}
+										size="sm"
+										checked={displaySelfHosted}
+										onCheckedChange={(checked) =>
+											setDraft((prev) => ({
+												...prev,
+												selfHosted: checked === true,
 											}))
 										}
 									/>

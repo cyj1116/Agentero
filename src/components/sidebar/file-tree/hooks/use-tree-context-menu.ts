@@ -10,20 +10,32 @@ import {
 	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { broadcastAgentAttachContext } from "@/lib/agent/context-attach";
-import { copyTextToClipboard } from "@/lib/core/clipboard";
-import { displayPath } from "@/lib/core/path";
-import { isTauri } from "@/lib/core/tauri";
-import { isPaperDirectory, isPapersRoot } from "@/lib/paper";
+import { errorText } from "@/lib/core/error";
+import {
+	isPaperDirectory,
+	isPapersRoot,
+	type PaperMetadata,
+} from "@/lib/paper";
 import { TRASH_VIRTUAL_PATH } from "@/lib/paper/api";
 import { PLAZA_SOURCES, PLAZA_VIRTUAL_PATH } from "@/lib/plaza";
 import { getSettings, patchSettings } from "@/lib/settings/react-store";
-import { type FileNode, resolveCreateParent } from "@/lib/vault";
-import { openInTerminal, revealInFileManager } from "@/lib/vault/reveal";
+import {
+	type FileNode,
+	resolveCreateParent,
+	vaultRelativePath,
+} from "@/lib/vault";
+import { isVaultAgentRoot } from "@/lib/vault/agent-tree";
+import { normalizePathKey } from "@/lib/vault/path";
 import { openTexPdf } from "@/lib/workspace/actions";
+import {
+	addFilePathToChat,
+	copyFilePath,
+	openFilePathInTerminal,
+	revealFilePath,
+} from "@/lib/workspace/file-path-actions";
 import { isTexPath } from "@/lib/workspace/viewer";
 import type { TreeContextMenuPortalProps } from "../tree-context-menu";
-import { pathKey } from "../tree-helpers";
+import { pathKey, VAULT_ROOT_LABEL_KEY, vaultRootFace } from "../tree-helpers";
 import type {
 	TreeContextMenu,
 	TreeCreateDraft,
@@ -34,6 +46,24 @@ import type {
 /** Virtual rows and `agentero:` pseudo paths have no OS location. */
 function canRevealPath(path: string): boolean {
 	return Boolean(path) && !path.startsWith("agentero:");
+}
+
+/**
+ * Catalog id for a paper-directory row. Files and plain folders get none,
+ * and a paper with no loaded metadata stays undefined.
+ */
+function paperDirectoryCatalogId(
+	isPaperMenu: boolean,
+	vaultPath: string | null,
+	menuPath: string,
+	paperMetaByRelPath: ReadonlyMap<string, PaperMetadata> | undefined,
+): string | undefined {
+	if (!isPaperMenu || !vaultPath || !paperMetaByRelPath) return undefined;
+	const rel = vaultRelativePath(vaultPath, menuPath);
+	if (!rel) return undefined;
+	const key = rel.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+	const id = paperMetaByRelPath.get(key)?.id.trim();
+	return id || undefined;
 }
 
 export type TreeContextMenuState = {
@@ -47,6 +77,7 @@ export type TreeContextMenuState = {
 export function useTreeContextMenu({
 	nodes,
 	vaultPath,
+	paperMetaByRelPath,
 	byPath,
 	cutPaths,
 	cutPathKeys,
@@ -58,6 +89,8 @@ export function useTreeContextMenu({
 	prepareContextSelection,
 	openMovePicker,
 	onExportLibrary,
+	onRescanLibrary,
+	libraryRescanning,
 	onDiscoverCiting,
 	onDownloadAllMissing,
 	onEmptyTrash,
@@ -70,9 +103,12 @@ export function useTreeContextMenu({
 	onCutPaths,
 	onPasteInto,
 	onMoveTo,
+	skillLabels,
 }: {
 	nodes: FileNode[];
 	vaultPath: string | null;
+	/** Catalog rows keyed by vault-relative path. Used only for paper-directory ids. */
+	paperMetaByRelPath?: ReadonlyMap<string, PaperMetadata>;
 	byPath: ReadonlyMap<string, FileNode>;
 	cutPaths: string[];
 	cutPathKeys: ReadonlySet<string>;
@@ -85,6 +121,8 @@ export function useTreeContextMenu({
 	prepareContextSelection: (path: string) => void;
 	openMovePicker: (paths: string[], anchor?: { x: number; y: number }) => void;
 	onExportLibrary?: () => void | Promise<void>;
+	onRescanLibrary?: () => void | Promise<void>;
+	libraryRescanning?: boolean;
 	onDiscoverCiting?: () => void | Promise<void>;
 	/** Papers root menu: download assets for every incomplete paper. */
 	onDownloadAllMissing?: () => void | Promise<void>;
@@ -98,6 +136,7 @@ export function useTreeContextMenu({
 	onCutPaths?: (paths: string[]) => void;
 	onPasteInto?: (targetPath: string) => void;
 	onMoveTo?: (paths: string[], destParentRel: string) => void;
+	skillLabels?: ReadonlyMap<string, { name: string }>;
 }): TreeContextMenuState {
 	const { t } = useTranslation("sidebar");
 	const [menu, setMenu] = useState<TreeContextMenu | null>(null);
@@ -127,49 +166,28 @@ export function useTreeContextMenu({
 		[createDraft, renameDraft, prepareContextSelection],
 	);
 
-	const reveal = useCallback(
-		(path: string) => {
-			setMenu(null);
-			if (!canRevealPath(path)) return;
-			if (!isTauri()) {
-				setRevealError(t("fileTree.revealDesktopOnly"));
-				return;
-			}
-			setRevealError(null);
-			void revealInFileManager(path).catch(() => {
-				setRevealError(t("fileTree.revealFailed"));
-			});
-		},
-		[t],
-	);
+	const reveal = useCallback((path: string) => {
+		setMenu(null);
+		if (!canRevealPath(path)) return;
+		setRevealError(null);
+		void revealFilePath(path).catch((error) => {
+			setRevealError(errorText(error));
+		});
+	}, []);
 
-	const openTerminal = useCallback(
-		(path: string) => {
-			setMenu(null);
-			if (!canRevealPath(path)) return;
-			if (!isTauri()) {
-				setRevealError(t("fileTree.openInTerminalDesktopOnly"));
-				return;
-			}
-			setRevealError(null);
-			void openInTerminal(path).catch(() => {
-				setRevealError(t("fileTree.openInTerminalFailed"));
-			});
-		},
-		[t],
-	);
+	const openTerminal = useCallback((path: string) => {
+		setMenu(null);
+		if (!canRevealPath(path)) return;
+		setRevealError(null);
+		void openFilePathInTerminal(path).catch((error) => {
+			setRevealError(errorText(error));
+		});
+	}, []);
 
-	const copyPath = useCallback(
-		(path: string) => {
-			setMenu(null);
-			void copyTextToClipboard(displayPath(path), {
-				successMessage: t("fileTree.copiedPath"),
-				errorMessage: t("fileTree.copyPathFailed"),
-				successNotify: { duration: 2000 },
-			});
-		},
-		[t],
-	);
+	const copyPath = useCallback((path: string) => {
+		setMenu(null);
+		copyFilePath(path);
+	}, []);
 
 	// Toggle a Plaza source without closing the menu (multi-toggle friendly).
 	const togglePlazaSource = useCallback((id: string) => {
@@ -202,14 +220,28 @@ export function useTreeContextMenu({
 		!cutPathKeys.has(targetKey) &&
 		!cutPaths.some((p) => targetKey.startsWith(`${pathKey(p)}/`));
 
+	const rootFace = menuNode ? vaultRootFace(vaultPath, menuNode.path) : null;
+	const skillLabel = skillLabels?.get(normalizePathKey(menu.path))?.name;
+	const menuNodeName = isVaultAgentRoot(vaultPath, menu.path)
+		? t("fileTree.vaultRoot.agents")
+		: (skillLabel ??
+			(rootFace ? t(VAULT_ROOT_LABEL_KEY[rootFace]) : menuNode?.name));
 	const menuProps: TreeContextMenuPortalProps = {
 		menu,
 		menuRef,
+		vaultPath,
+		paperId: paperDirectoryCatalogId(
+			isPaperMenu,
+			vaultPath,
+			menu.path,
+			paperMetaByRelPath,
+		),
 		menuCount: targets.length,
-		menuNodeName: menuNode?.name,
+		menuNodeName,
 		isPaperMenu,
 		isLibraryMenu,
 		libraryExportBusy,
+		libraryRescanning,
 		citingScanBusy,
 		canPasteAtTarget,
 		plazaSources:
@@ -222,6 +254,12 @@ export function useTreeContextMenu({
 		onTogglePlazaSource:
 			menu.path === PLAZA_VIRTUAL_PATH ? togglePlazaSource : undefined,
 		onClose: close,
+		onRescanLibrary: onRescanLibrary
+			? () => {
+					setMenu(null);
+					void onRescanLibrary();
+				}
+			: undefined,
 		onExportLibrary: onExportLibrary
 			? () => {
 					setMenu(null);
@@ -270,7 +308,7 @@ export function useTreeContextMenu({
 			!targetIsVirtual && menu.path && !menu.path.startsWith("agentero:")
 				? () => {
 						setMenu(null);
-						broadcastAgentAttachContext([menu.path]);
+						addFilePathToChat(menu.path);
 					}
 				: undefined,
 		onNewFile:
@@ -279,6 +317,22 @@ export function useTreeContextMenu({
 						const parent = resolveCreateParent(vaultPath, menu.path, nodes);
 						setMenu(null);
 						onStartCreate("file", parent);
+					}
+				: undefined,
+		onNewTable:
+			onStartCreate && vaultPath
+				? () => {
+						const parent = resolveCreateParent(vaultPath, menu.path, nodes);
+						setMenu(null);
+						onStartCreate("table", parent);
+					}
+				: undefined,
+		onNewExperiment:
+			onStartCreate && vaultPath
+				? () => {
+						const parent = resolveCreateParent(vaultPath, menu.path, nodes);
+						setMenu(null);
+						onStartCreate("experiment", parent);
 					}
 				: undefined,
 		onNewFolder:

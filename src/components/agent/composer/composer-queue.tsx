@@ -1,6 +1,5 @@
 import { X } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import type { QueuedPrompt } from "@/components/agent/types";
 import {
 	Queue,
 	QueueItem,
@@ -13,7 +12,14 @@ import {
 	QueueSectionContent,
 	QueueSectionLabel,
 	QueueSectionTrigger,
-} from "@/components/ai-elements/queue";
+} from "@/components/agent/elements/queue";
+import { InlineChipText } from "@/components/agent/inline-chip-text";
+import type { QueuedPrompt } from "@/components/agent/types";
+import {
+	hasTranscriptChips,
+	inlineMarkupToPlain,
+	stripInlineTokens,
+} from "@/lib/agent/composer-inline-tokens";
 import { cn } from "@/lib/core/utils";
 
 export function ComposerQueue({
@@ -48,8 +54,13 @@ export function ComposerQueue({
 					<QueueList className={cn(compact && "mt-1")}>
 						{messageQueue.map((item) => {
 							const imageCount = item.images?.length ?? 0;
+							const chipMarkup = hasTranscriptChips(item.text)
+								? item.text
+								: undefined;
 							const queueLabel =
-								item.text.trim() ||
+								(chipMarkup
+									? inlineMarkupToPlain(chipMarkup)
+									: stripInlineTokens(item.text).trim()) ||
 								(item.visualDrafts.length
 									? t("composer.visualAnnotationsTitle", {
 											count: item.visualDrafts.length,
@@ -67,7 +78,11 @@ export function ComposerQueue({
 									<div className="flex w-full items-center gap-2">
 										<QueueItemIndicator />
 										<QueueItemContent title={queueLabel}>
-											{queueLabel}
+											{chipMarkup ? (
+												<InlineChipText markup={chipMarkup} />
+											) : (
+												queueLabel
+											)}
 										</QueueItemContent>
 										<QueueItemActions>
 											<QueueItemAction

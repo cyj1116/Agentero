@@ -1,6 +1,6 @@
 # 后端
 
-Tauri 2 + Rust Host：文件系统、Catalog、索引、ACP Client、远程 Vault。tauri 无关的基座与数据域在 `agentero-core` crate；CLI（`cli/`）只依赖 `agentero-core`，Host 经桥接 re-export 复用同一实现（见 [../development/crate-split-roadmap.md](../development/crate-split-roadmap.md)）。
+Tauri 2 + Rust Host：文件系统、Catalog、索引、ACP Client、远程 Vault。tauri 无关的基座与数据域在 `agentero-core` crate；CLI（`cli/`）只依赖 `agentero-core`，Host 经桥接 re-export 复用同一实现。
 
 > 整体架构与跨层工作流见 [../architecture.md](../architecture.md)。
 
@@ -21,7 +21,7 @@ Tauri 2 + Rust Host：文件系统、Catalog、索引、ACP Client、远程 Vaul
 
 ```text
 crates/agentero-core/src/   # tauri 无关基座 + 数据域（agentero-core crate）
-  error、fs、http、paths、log_util、sqlite、time、blocking、usage（存储层）…
+  error、fs、http、paths、log_util、perf、sqlite、time、blocking、usage（存储层）、decision…
   app_handle    # AppHandle + HostHooks（宿主回调抽象：emit / job spawn）
   features/     # catalog、vault（tree/trash/rename/doctor）、wiki、import、
                 # zotero codec/io、scholar_api、pdf_parse、refs、feeds、
@@ -33,17 +33,24 @@ src-tauri/src/
     vault/      # commands、watcher（trash/rename/doctor 的 commands 留守）
     paper/      # catalog commands、import 壳（job_runners/remote_ops/recognize）、
                 # analyze/layout、body_engines（云端 parse 引擎）、zotero db、discovery 站点代理
-    web/        # agentero-web 通用网页代理（allowlist + web_proxy_allow_host，网页论文 iframe 划词用）
+    web/        # agentero-web 通用网页代理（allowlist + web_proxy_allow_host，网页论文 iframe 划词用）；agentero-html 本地 HTML 预览
     pdf/        # export
     markdown/   # wiki commands、search
-    system/     # settings、builtin（构建期内置 provider 凭证）
+    system/     # settings、builtin（构建期内置 provider 凭证）、desktop_apps（本地桌面应用检测）
+    decision/   # 决策层装配（DecisionEngine + providers + schemas）
     agent/ jobs/ lifecycle（job 事件）
-  integration/  # connector、mcp、remote、bridge、sync（desktop-only）
+  integration/  # connector、word、mcp、remote、bridge、sync（desktop-only）
   lib.rs
   main.rs
 ```
 
 每域：`mod.rs` 对外 API + `commands.rs` 薄壳 + 按需 models。
+
+### 第三方依赖修正
+
+第三方依赖的本地修正统一放在根目录 `patches/`：pnpm 使用 `.patch` 文件；Cargo 的 `[patch.crates-io]` 使用完整 crate 目录。`patches/tesseract-rs/` 保留了上游 0.2.0 源码、README 和 MIT 许可证，将 LiteParse OCR 构建依赖中的 `zip` 升至修复安全问题的 9.x，并适配 `build.rs` 的解压 API。
+
+根 `Cargo.toml` 配置替换路径，并将该 crate 排除在 workspace members 之外；桌面 Host 和 CLI 经 `agentero-core → liteparse → tesseract-rs` 共用此修正。来源、修改范围及许可声明见根目录 [THIRD_PARTY.md](https://github.com/poco-ai/Agentero/blob/main/THIRD_PARTY.md)。
 
 ## Tauri 插件
 
@@ -53,9 +60,8 @@ src-tauri/src/
 | `tauri-plugin-dialog` | 选 Vault 目录 |
 | `tauri-plugin-opener` | `revealItemInDir`、外链 |
 | `tauri-plugin-log` | 运行日志 |
-| shell / 子进程 | spawn ACP agent（及 SSH 相关） |
 
-应用设置走 XDG `settings.json`（`features/system/settings`），不依赖把论文 meta 放进 Store。
+ACP / SSH 子进程由 Rust 与 ACP SDK 启动，不注册 Tauri shell 插件。应用设置走 XDG `settings.json`（`features/system/settings`），也不依赖 Tauri store 插件。
 
 ## 主要 Rust crates
 
@@ -65,7 +71,7 @@ src-tauri/src/
 | `agent-client-protocol` | ACP Client stdio JSON-RPC |
 | `reqwest` + `tokio` | HTTP（Translator、arXiv、翻译等） |
 | `rusqlite`（bundled） | catalog.sqlite |
-| `rmcp` | 设置开关启停的 loopback Streamable HTTP MCP |
+| `rmcp` / `agentero-mcp` | loopback Streamable HTTP MCP。桌面设置开关与 CLI `mcp serve` 共用 |
 | `notify` | Vault 文件监听 |
 | `liteparse` | 无 TeX 时 PDF → `PAPER.md` |
 | `walkdir` / `regex` / `thiserror` | 遍历、解析、错误 |
@@ -91,6 +97,10 @@ src-tauri/src/
 
 原则：Store/设置不存论文 meta；`PAPERS.md` / `library.bib` 默认不生成，仅导出。
 
+本地原子写共用 core `fs::atomic_write[_with]`：通过 `tempfile` 独占创建同目录临时文件，再原子替换目标；写入或替换失败返回错误，保留原目标并清理本次临时文件，不退化为直接截断。默认使用短唯一名称且以 `.tmp` 结尾，避免并发共用 staging、长文件名溢出，并保持同步扫描排除规则。Wiki 自定义的 UUID 临时文件名与 `.agentero-rename-` watcher 标记保留；若名称已存在则报错，不覆盖其他写者的 staging。
+
+普通文件保留 Unix `0666 & umask` 创建行为，settings / sync 凭据和 CLI 配置使用 `0600`。`sync_file` 可选在替换前同步文件内容（CLI 开启），不承诺父目录 rename 的断电持久性。Doctor alias repair 与引用侧写入的 FSEvents 特例仍保留原地写，见 [doctor.md](doctor.md)。
+
 ## 与前端边界（Host 侧）
 
 | 能力 | Host | 前端 |
@@ -112,18 +122,35 @@ src-tauri/src/
 | 论文入库 | [paper-import.md](paper-import.md) |
 | Identifier Lookup / 魔棒入库 | [identifier-lookup.md](identifier-lookup.md) |
 | 学术搜索 API | [academic-search-apis.md](academic-search-apis.md) |
+| 机构代理网关 | [institution-proxy.md](institution-proxy.md) |
 | Zotero Connector | [connector.md](connector.md) |
 | 双链索引 | [wiki.md](wiki.md) |
 | Vault Doctor | [doctor.md](doctor.md) |
 | Agent Host | [agent.md](agent.md) |
+| 研究上下文 | [context.md](context.md) |
+| 知乎接入（内置 Agent / 开放平台） | [zhihu.md](zhihu.md) |
 | 远程 Vault | [remote.md](remote.md) |
-| 云同步（S3） | [sync.md](sync.md) |
+| 云同步（S3 / WebDAV / Git） | [sync.md](sync.md) |
 | 搜索 | [search.md](search.md) |
 | 设置 | [settings.md](settings.md) |
+| 本地桌面应用检测 | [desktop-apps.md](desktop-apps.md) |
 | 翻译 | [translate.md](translate.md) |
+| 实时 TeX 预览（rtex） | [rtex.md](rtex.md) |
+| LaTeX 编译 / Recipe / SyncTeX | [latex.md](latex.md) |
 | 内置 Provider（构建期凭证） | [builtin-provider.md](builtin-provider.md) |
 | 日志 | [logging.md](logging.md) |
 | 遥测 | [telemetry.md](telemetry.md) |
 | 使用记录 | [usage.md](usage.md) |
+| 决策层 | [decision.md](decision.md) |
 | CLI | [cli.md](cli.md) |
 | API 全表 | [api.md](api.md) |
+
+## 开发插件
+
+[开发插件宿主（M0）](plugins.md)：桌面 debug 构建的显式目录加载、独立 QuickJS 进程、受限只读 API 与窗口/Vault 作用域清理。
+
+## 本地插件
+
+[本地插件系统](plugins.md)：安装、按 Vault 授权、进程隔离、受控数据 API、命令/菜单/事件、设置及私有存储。
+
+Word 官方插件兼容原型见 [word.md](word.md)：macOS 与 Windows 均为正文引文；Windows 尚未做真实 Word 验收。

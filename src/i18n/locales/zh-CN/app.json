@@ -1,4 +1,5 @@
 {
+	"navigator": { "hintTargets": "{{count}} 个键盘目标" },
 	"labels": {
 		"agent": "Agent",
 		"notes": "笔记",
@@ -7,18 +8,19 @@
 	},
 	"commandPalette": {
 		"title": "快速打开",
-		"placeholder": "搜索论文与笔记正文…",
+		"placeholder": "搜索论文、笔记和表格…",
 		"commandsTitle": "命令",
 		"commandsPlaceholder": "输入命令名称…",
 		"commands": "命令",
 		"commandsEmpty": "输入以筛选命令（快速打开中也可用 > 前缀）",
 		"papers": "论文",
 		"recent": "最近论文",
+		"aliases": "别名",
 		"contents": "正文匹配",
 		"searching": "搜索中…",
 		"noResults": "无匹配",
 		"noVault": "请先打开知识库再搜索",
-		"empty": "输入以搜索论文与笔记正文"
+		"empty": "输入以搜索论文、笔记和表格"
 	},
 	"commands": {
 		"catApp": "应用",
@@ -27,6 +29,8 @@
 		"catLibrary": "论文库",
 		"catTab": "标签",
 		"catPdf": "PDF",
+		"catEditor": "编辑器",
+		"toggleMarkdownSource": "切换 Markdown 源码",
 		"settingsOpen": "打开设置",
 		"settingsClose": "关闭设置",
 		"vaultOpen": "打开 Vault…",
@@ -48,8 +52,12 @@
 		"tabSplitPane": "向右分栏",
 		"tabNext": "下一标签",
 		"tabPrev": "上一标签",
+		"tabNextInGroup": "组内下一个标签页",
+		"tabPrevInGroup": "组内上一个标签页",
 		"exportAnnotatedPdf": "导出带批注的 PDF",
-		"wandOpen": "魔棒（按标识符入库）"
+		"wandOpen": "魔棒（按标识符入库）",
+		"pluginsLoadDevelopment": "加载开发插件…",
+		"pluginsUnloadDevelopment": "卸载开发插件"
 	},
 	"titlebar": {
 		"showLeftSidebar": "显示左侧边栏",
@@ -80,15 +88,22 @@
 	"diskConflict": {
 		"title": "“{{name}}” 已被外部修改（已保留你的未存改动）",
 		"reload": "载入磁盘版",
-		"saveBlocked": "“{{name}}” 已被外部修改——为避免丢稿，本次未写入。请先载入磁盘版，再重新编辑。"
+		"keepDraft": "保留草稿",
+		"saveBlocked": "“{{name}}” 已被外部修改——为避免丢稿，本次未写入。请先载入磁盘版，再重新编辑。",
+		"splitTitle": "这份笔记已被修改",
+		"splitDetail": "未保存的草稿还在。载入磁盘新版会丢掉草稿；保留草稿会用它覆盖磁盘上的新版本。"
 	},
 	"tabs": {
 		"strip": "已打开的文档",
+		"more": "更多标签页",
 		"close": "关闭 {{title}}",
 		"showHtml": "显示 HTML 版本",
 		"showPdf": "显示 PDF 版本",
 		"openTexPdf": "打开 PDF",
 		"texCompiling": "正在编译…",
+		"contextCopyPath": "复制路径",
+		"copiedPath": "已复制路径",
+		"copyPathFailed": "复制路径失败",
 		"contextClose": "关闭",
 		"contextOpenNotes": "打开笔记",
 		"contextMoveToNewWindow": "移动至新窗口",
@@ -232,9 +247,13 @@
 		"layoutModelDownload": "下载版面模型",
 		"layoutModelDetail": "魔搭 → HuggingFace · PP-DocLayoutV3",
 		"layoutAnalysis": "解析插图、表格、文字",
+		"layoutTranslate": "翻译全文",
 		"pdfParse": "解析 PDF 正文",
 		"parseRefs": "解析参考文献",
+		"openLayoutSettings": "打开解析设置",
+		"openTranslateSettings": "打开翻译设置",
 		"latexCompile": "编译 LaTeX",
+		"jevSmartHighlights": "jEV 智能高亮",
 		"downloadBytes": "{{phase}} · {{downloaded}} / {{total}}",
 		"downloadBytesUnknown": "{{phase}} · {{downloaded}}",
 		"batchProgress": "{{phase}} · {{current}} / {{total}}",
@@ -258,5 +277,25 @@
 		"connector": "正在保存 Connector 附件",
 		"connectorComplete": "Connector 附件已就绪",
 		"connectorFailed": "Connector 附件失败"
+	},
+	"reminders": {
+		"dismiss": "不再提醒",
+		"layoutLocalModel": {
+			"title": "版面分析使用本地模型",
+			"description": "插图、表格、公式由本机模型检测，会额外占用内存与 CPU，内存较小的机器可能变慢。可在设置中改用云端服务商。",
+			"openSettings": "打开版面解析设置"
+		},
+		"networkProxy": {
+			"title": "网络请求失败",
+			"description": "如果访问受限，可在设置中配置代理后重试。",
+			"openSettings": "打开网络设置"
+		}
+	},
+	"plugins": {
+		"chooseDirectory": "加载插件 — 允许读取当前 Vault",
+		"failed": "插件操作失败",
+		"loaded": "开发插件已加载",
+		"commandTitle": "{{title}}",
+		"suspended": "{{name}} 连续失败，已停止运行。可在设置中重新启用。"
 	}
 }

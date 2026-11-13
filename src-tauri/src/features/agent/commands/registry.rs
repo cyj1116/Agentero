@@ -1,6 +1,6 @@
 //! Registry / catalog / lifecycle Tauri commands.
 
-use super::{AgentUserAgentResponse, EnabledResponse};
+use super::AgentUserAgentResponse;
 use crate::core::error::{map_err, ApiResult, AppError};
 use crate::features::agent::models::{
     AgentListResponse, AgentOnly, AgentSkill, CatalogScanResponse, ProbeResult, UpsertAgentRequest,
@@ -142,22 +142,6 @@ pub fn agent_set_default(
 
 #[tauri::command]
 #[specta::specta]
-pub fn agent_set_enabled(
-    app: AppHandle,
-    registry: State<'_, AgentRegistry>,
-    enabled: bool,
-) -> ApiResult<EnabledResponse> {
-    match registry.set_enabled(enabled) {
-        Ok(s) => {
-            emit_registry_changed(&app);
-            ApiResult::ok(EnabledResponse { enabled: s.enabled })
-        }
-        Err(e) => map_err(e),
-    }
-}
-
-#[tauri::command]
-#[specta::specta]
 pub fn agent_set_user_agent(
     registry: State<'_, AgentRegistry>,
     user_agent: String,
@@ -183,6 +167,20 @@ pub async fn agent_probe(
         Ok(d) => d,
         Err(e) => return Ok(map_err(e)),
     };
+    // Built-in agents have no ACP process to probe; report them ready.
+    if crate::features::agent::models::is_builtin_template(&desc.template) {
+        let result = ProbeResult {
+            agent_id: id.clone(),
+            available: true,
+            agent_name: Some(desc.name.clone()),
+            protocol_version: None,
+            error: None,
+            session_capabilities: None,
+        };
+        let _ = registry.apply_probe_result(&id, &result);
+        emit_registry_changed(&app);
+        return Ok(ApiResult::ok(result));
+    }
     if !desc.available {
         let result = ProbeResult {
             agent_id: id.clone(),

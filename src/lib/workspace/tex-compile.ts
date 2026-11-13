@@ -5,15 +5,40 @@
  * pattern; the hook stays a thin adapter.
  */
 
-import { listen } from "@tauri-apps/api/event";
 import { createStore } from "zustand/vanilla";
 import i18n from "@/i18n";
 import { isBackgroundTaskCancelledError } from "@/lib/core/background-tasks";
 import { commands } from "@/lib/core/bindings";
+import { errorText } from "@/lib/core/error";
 import { notifyError, notifySuccess } from "@/lib/core/notify";
+import { normalizePath } from "@/lib/core/path";
 import { enqueueTaskSettled } from "@/lib/core/tasks";
+import { startTexAutoBuild } from "@/lib/tex/auto-build";
+import {
+	beginTexBuild,
+	ensureTexBuildEvents,
+	finishTexBuild,
+	texBuildStore,
+} from "@/lib/tex/build-state";
+import {
+	explicitTexRoot,
+	getTexProjectSettings,
+	texBuildOptions,
+} from "@/lib/tex/config";
+import {
+	chooseTexEngine,
+	inferRequiredEngine,
+	parseTexProgram,
+	rememberedTexEngine,
+} from "@/lib/tex/engine";
+import { cleanLatexArtifacts, getLatexArtifacts } from "@/lib/tex/host";
+import { readVaultFile } from "@/lib/vault/fs";
 import { vaultStore } from "@/lib/vault/store";
 import { texPdfPath } from "@/lib/workspace/viewer";
+import {
+	explicitWritingProjectForPath,
+	hasWritingMainFile,
+} from "@/lib/writing/project-manifest";
 
 export type LatexEngine = {
 	id: string;
@@ -35,10 +60,6 @@ export const texCompileStore = createStore<TexCompileState>(() => ({
 	compilingPath: null,
 }));
 
-let logDrained = false;
-// Once the user explicitly picks an engine, never overwrite their choice
-// on subsequent engine-list refreshes.
-let userPickedEngine = false;
 // Single-flight detection promise: callers can await it instead of racing
 // the async result (compile right after a window reload used to read an
 // empty list and falsely report "no engine").
@@ -56,12 +77,7 @@ export function ensureTexEngines(): Promise<void> {
 			try {
 				const res = await commands.detectLatexEngines();
 				if (res.ok && res.data && res.data.length > 0) {
-					const prev = texCompileStore.getState();
 					texCompileStore.setState({ engines: res.data });
-					// First-time default: only seed if the user has not picked yet.
-					if (!prev.selectedEngine && !userPickedEngine) {
-						texCompileStore.setState({ selectedEngine: res.data[0].id });
-					}
 				} else {
 					// Failed scan or engine-less host: allow a later retry (a
 					// TeX install mid-session is picked up by the next compile).
@@ -80,23 +96,79 @@ export function ensureTexEngines(): Promise<void> {
 
 /**
  * Kick off engine detection (idempotent; safe to call from every entry
- * point). Also wires the compile:log drain. Await `ensureTexEngines` when
- * the result is needed.
+ * point). Await `ensureTexEngines` when the result is needed.
  */
 export function initTexEngines(): void {
-	if (logDrained === false) {
-		logDrained = true;
-		listen<{ line: string }>("compile:log", () => {
-			// Drain log events; log UI can be added later.
-		});
-	}
+	startTexAutoBuild();
 	void ensureTexEngines();
 }
 
 export function selectTexEngine(id: string): void {
-	userPickedEngine = true;
 	texCompileStore.setState({ selectedEngine: id });
 }
+
+export type TexEngineChoice = {
+	rootPath: string;
+	engineId: string | null;
+	/** Root file names an engine that is installed. The settings list stays put. */
+	locked: boolean;
+};
+
+/** Engine for an already-resolved root file. */
+export async function engineChoiceForRoot(
+	rootPath: string,
+): Promise<TexEngineChoice> {
+	await ensureTexEngines();
+	const available = texCompileStore
+		.getState()
+		.engines.map((engine) => engine.id);
+	const vault = vaultStore.getState().vaultPath;
+	const project =
+		vault && (await explicitWritingProjectForPath(vault, rootPath));
+	if (project) {
+		const compiler = project.manifest.compiler;
+		return {
+			rootPath,
+			engineId: available.includes(compiler) ? compiler : null,
+			locked: true,
+		};
+	}
+	let source = "";
+	try {
+		source = await readVaultFile(rootPath);
+	} catch {
+		source = "";
+	}
+	const magic = parseTexProgram(source);
+	return {
+		rootPath,
+		engineId: chooseTexEngine({
+			magic,
+			remembered: rememberedTexEngine(rootPath),
+			required: inferRequiredEngine(source),
+			available,
+		}),
+		locked: magic != null && available.includes(magic),
+	};
+}
+
+/** Resolve the root, then the engine latexmk should call for it. */
+export async function inspectTexEngine(
+	texPath: string,
+): Promise<TexEngineChoice> {
+	const rootPath = await resolveTexRoot(texPath);
+	return engineChoiceForRoot(rootPath);
+}
+
+export type TexRootResolution = {
+	rootPath: string;
+	/**
+	 * Nothing tied the file to a document: no magic comment, no root
+	 * indicator, no main file referencing it. Callers that list projects
+	 * skip these; compilation still uses `rootPath`.
+	 */
+	fallbackSelf: boolean;
+};
 
 /**
  * Resolve the compile root for a .tex path: `% !TEX root` magic-comment chain
@@ -105,16 +177,38 @@ export function selectTexEngine(id: string): void {
  * (callers flush editors first, so a just-typed magic comment is visible);
  * falls back to `texPath` on any error so compilation still runs.
  */
-export async function resolveTexRoot(texPath: string): Promise<string> {
+export async function resolveTexRootInfo(
+	texPath: string,
+): Promise<TexRootResolution> {
+	const vault = vaultStore.getState().vaultPath;
+	const project =
+		vault && (await explicitWritingProjectForPath(vault, texPath));
+	if (vault && project) {
+		if (!(await hasWritingMainFile(vault, project)))
+			throw new Error(i18n.t("sidebar:writing.missingMainFile"));
+		return { rootPath: project.root, fallbackSelf: false };
+	}
+	const override = explicitTexRoot(texPath);
+	if (override) return { rootPath: override, fallbackSelf: false };
 	try {
 		const res = await commands.resolveLatexRoot(
 			texPath,
 			vaultStore.getState().vaultPath ?? "",
 		);
-		return res.ok && res.data?.rootPath ? res.data.rootPath : texPath;
+		if (res.ok && res.data?.rootPath) {
+			return {
+				rootPath: res.data.rootPath,
+				fallbackSelf: res.data.source === "fallbackSelf",
+			};
+		}
 	} catch {
-		return texPath;
+		// Transient IPC failure: callers still need a usable path.
 	}
+	return { rootPath: texPath, fallbackSelf: false };
+}
+
+export async function resolveTexRoot(texPath: string): Promise<string> {
+	return (await resolveTexRootInfo(texPath)).rootPath;
 }
 
 /**
@@ -133,6 +227,12 @@ export async function cleanTexAuxFiles(texPath: string): Promise<boolean> {
 	if (texCompileStore.getState().compilingPath) return false;
 	const root = await resolveTexRoot(texPath);
 	try {
+		const build = texBuildOptions(root);
+		if (build.outDir || build.auxDir || build.jobname || build.recipe) {
+			await cleanLatexArtifacts(root, build);
+			notifySuccess(i18n.t("sidebar:fileTree.cleanAuxSuccess"));
+			return true;
+		}
 		const res = await commands.cleanLatexAuxFiles(root);
 		if (!res.ok) {
 			notifyError(
@@ -152,8 +252,31 @@ export async function cleanTexAuxFiles(texPath: string): Promise<boolean> {
 	}
 }
 
+// Roots whose problems button is on screen, counted per view.
+const problemsViews = new Map<string, number>();
+
 /**
- * Compile with the selected (or first detected) engine. Runs as a background
+ * Mark the problems button of `rootPath` as on screen until the returned
+ * cleanup runs. A TeX project view calls this while it is focused, so a
+ * failed compile of its root turns that button red instead of raising a
+ * toast.
+ */
+export function showTexProblemsView(rootPath: string): () => void {
+	const key = normalizePath(rootPath);
+	problemsViews.set(key, (problemsViews.get(key) ?? 0) + 1);
+	let shown = true;
+	return () => {
+		if (!shown) return;
+		shown = false;
+		const count = (problemsViews.get(key) ?? 1) - 1;
+		if (count > 0) problemsViews.set(key, count);
+		else problemsViews.delete(key);
+	};
+}
+
+/**
+ * Compile with the root file's engine (`% !TEX program`, else the engine
+ * remembered for that project, else XeLaTeX). Runs as a background
  * job: the tasks panel shows live latexmk progress (rule / run milestones)
  * and a cancel button; `compilingPath` still drives the file-tree spinner.
  * Returns the absolute pdf path on success, else null.
@@ -164,42 +287,81 @@ export async function cleanTexAuxFiles(texPath: string): Promise<boolean> {
  * triggered row even when the build target is its root.
  *
  * `quietSuccess` skips the success toast (save-triggered compiles would spam
- * one per autosave); failures always notify.
+ * one per autosave). Failures notify, except while a focused TeX project view
+ * shows this root (`showTexProblemsView`): its problems button turns red and
+ * lists the errors instead.
  */
 export async function compileTexFile(
 	texPath: string,
-	opts?: { quietSuccess?: boolean; triggerPath?: string },
+	opts?: {
+		quietSuccess?: boolean;
+		triggerPath?: string;
+		mode?: "normal" | "force" | "clean";
+	},
 ): Promise<string | null> {
 	initTexEngines();
 	// Wait for the in-flight scan: reading the store immediately after a
 	// window reload races detection and falsely reports "no engine".
 	await ensureTexEngines();
-	const { selectedEngine, engines, compilingPath } = texCompileStore.getState();
-	const engine = selectedEngine ?? engines[0]?.id ?? null;
-	if (!engine) {
-		notifyError(i18n.t("sidebar:fileTree.selectEngineFirst"));
+	const { compilingPath } = texCompileStore.getState();
+	if (compilingPath) return null;
+	let choice: TexEngineChoice;
+	try {
+		const vault = vaultStore.getState().vaultPath;
+		if (vault && (await explicitWritingProjectForPath(vault, texPath)))
+			texPath = await resolveTexRoot(texPath);
+		choice = await engineChoiceForRoot(texPath);
+	} catch (error) {
+		notifyError(errorText(error));
+		return null;
+	}
+	const engineId =
+		choice.engineId ??
+		(!choice.locked && getTexProjectSettings(texPath).recipe
+			? "pdflatex"
+			: null);
+	if (!engineId) {
+		notifyError(i18n.t("sidebar:fileTree.noLatexEngine"));
 		return null;
 	}
 	// One in-flight compile at a time (prevents ⌘\ double-fire).
-	if (compilingPath) return null;
+	if (texCompileStore.getState().compilingPath) return null;
 
 	texCompileStore.setState({ compilingPath: opts?.triggerPath ?? texPath });
+	const build = texBuildOptions(texPath, opts?.mode);
 	try {
+		await ensureTexBuildEvents();
+		beginTexBuild(texPath);
 		await enqueueTaskSettled({
 			kind: "latexCompile",
 			vaultPath: vaultStore.getState().vaultPath ?? "",
 			path: texPath,
 			lane: "focus",
 			force: true,
-			params: { engine },
+			params: { engine: engineId, build },
 		});
+		finishTexBuild(texPath, "succeeded");
 		if (!opts?.quietSuccess) {
 			notifySuccess(i18n.t("sidebar:fileTree.compileSuccess"));
 		}
-		// latexmk writes {stem}.pdf next to the source (deterministic path).
-		return texPdfPath(texPath);
+		return (
+			texBuildStore.getState().byRoot[normalizePath(texPath)]?.result
+				?.pdfPath ?? (await resolveTexPdfPath(texPath))
+		);
 	} catch (e) {
-		if (!isBackgroundTaskCancelledError(e)) {
+		finishTexBuild(
+			texPath,
+			isBackgroundTaskCancelledError(e) ? "cancelled" : "failed",
+			isBackgroundTaskCancelledError(e)
+				? undefined
+				: e instanceof Error
+					? e.message
+					: String(e),
+		);
+		if (
+			!isBackgroundTaskCancelledError(e) &&
+			!problemsViews.has(normalizePath(texPath))
+		) {
 			notifyError(
 				e instanceof Error && e.message
 					? e.message
@@ -209,5 +371,17 @@ export async function compileTexFile(
 		return null;
 	} finally {
 		texCompileStore.setState({ compilingPath: null });
+	}
+}
+
+/** The host owns artifact layout (outDir/jobname), including custom recipes. */
+export async function resolveTexPdfPath(rootPath: string): Promise<string> {
+	const build = texBuildOptions(rootPath);
+	try {
+		return (await getLatexArtifacts(rootPath, build)).pdfPath;
+	} catch (error) {
+		if (build.outDir || build.auxDir || build.jobname || build.recipe)
+			throw error;
+		return texPdfPath(rootPath);
 	}
 }

@@ -4,16 +4,21 @@
 //! @see docs/backend/paper-import-pipeline.md
 
 pub mod auto_ingest;
+pub mod chat_extract;
 pub mod paper_import;
+pub mod preparation;
 pub mod sources;
 // `parse` (liteparse worker) is excluded on mobile targets, gate the alias too.
 pub use crate::features::paper::analyze::parse as pdf_parse;
 
 pub mod api_mapper;
+pub mod webpage;
 pub use crate::features::scholar_api::identifiers::doi_slug;
 pub use api_mapper::{api_paper_to_meta, enrich_remote_urls, map_zotero_item_to_record};
 
+pub mod code_repo;
 pub mod download;
+pub mod institution_proxy;
 pub mod recognize;
 pub mod search_router;
 pub mod skill;
@@ -29,6 +34,10 @@ pub use download::{
 // `paper_import` internals.
 pub use paper_import::{
     paper_commit, AssetsPolicy, CommitStatus, DedupePolicy, PaperCommitOptions,
+};
+pub use preparation::{
+    plan_after_assets, plan_after_merged_pdf, skipped_preparation_line, PreparationPlan,
+    PreparationStep,
 };
 pub use skill::{
     discard_skill_discovery, discover_skill_source, install_discovered_skills, SkillCandidate,
@@ -65,7 +74,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Default Translator Runtime base URL (hosted service).
-/// Override via Settings → `translatorBaseUrl` / `LookupImportArgs.translator_base_url`.
+/// Desktop callers use this fixed endpoint; CLI / remote calls may override via
+/// `LookupImportArgs.translator_base_url`.
 pub const DEFAULT_TRANSLATOR_BASE_URL: &str = "https://translation-server.agentero.app";
 
 pub fn check_task_not_cancelled(task_id: Option<&str>) -> Result<(), AppError> {
@@ -257,6 +267,11 @@ pub struct LookupImportResult {
     /// layout analysis — the runner owns the follow-ups.
     #[serde(default)]
     pub recognize_pending: bool,
+    /// Host-side follow-up plan. Not part of the IPC payload: desktop
+    /// commands enqueue from it and return the previous JSON shape.
+    #[serde(skip)]
+    #[specta(skip)]
+    pub preparation: PreparationPlan,
 }
 
 #[derive(Debug, Deserialize, specta::Type)]
@@ -317,14 +332,7 @@ pub async fn import_by_identifier_with_progress(
 
     let vault = crate::fs::resolve_vault(&args.vault_path)?;
 
-    let base = args
-        .translator_base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_TRANSLATOR_BASE_URL)
-        .trim_end_matches('/')
-        .to_string();
+    let base = translator_base(args.translator_base_url.as_deref());
 
     let text = args.text.trim();
     if text.is_empty() {
@@ -332,8 +340,14 @@ pub async fn import_by_identifier_with_progress(
     }
 
     check_task_not_cancelled(args.task_id.as_deref())?;
-    let (meta, used_translator) = resolve_metadata(text, &base, args.task_id.as_deref()).await?;
+    let resolved = resolve_metadata(text, &base, args.task_id.as_deref()).await?;
     check_task_not_cancelled(args.task_id.as_deref())?;
+
+    let ResolvedMetadata {
+        record: meta,
+        used_translator,
+        notices,
+    } = resolved;
 
     let commit = paper_commit(
         meta,
@@ -369,9 +383,14 @@ pub async fn import_by_identifier_with_progress(
         pdf: commit.pdf,
         tex: commit.tex,
         paper_md: commit.paper_md,
-        asset_messages: commit.asset_messages,
+        asset_messages: {
+            let mut messages = commit.asset_messages;
+            messages.extend(notices);
+            messages
+        },
         status: Some(commit.status),
         recognize_pending: false,
+        preparation: commit.preparation,
     })
 }
 
@@ -510,6 +529,49 @@ fn emit_batch_progress(
     );
 }
 
+/// Host scratch directory for path-less OS drops: `<home>/.agentero/import-tmp`.
+fn import_staging_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".agentero").join("import-tmp"))
+}
+
+/// `true` when `path` lives inside the Host drop staging directory.
+fn is_import_staging_path(path: &Path, staging_dir: &Path) -> bool {
+    path.starts_with(staging_dir)
+}
+
+/// Strip the [`stage_import_file`] stamp `<13-digit millis>-<8 hex>-` from a
+/// staged drop's file stem. Only the exact stamp is removed, so ordinary local
+/// filenames (arXiv ids, DOIs, user PDFs) always pass through unchanged.
+fn strip_staged_drop_prefix(stem: &str) -> &str {
+    const STAMP_LEN: usize = 13 + 1 + 8 + 1;
+    let bytes = stem.as_bytes();
+    // Exact stamp with nothing after it: keep the stem, there is no name left.
+    if bytes.len() <= STAMP_LEN {
+        return stem;
+    }
+    let digits_ok = bytes[..13].iter().all(u8::is_ascii_digit);
+    let hex_ok = bytes[14..22]
+        .iter()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b));
+    if digits_ok && bytes[13] == b'-' && hex_ok && bytes[22] == b'-' {
+        &stem[STAMP_LEN..]
+    } else {
+        stem
+    }
+}
+
+/// File stem to derive user-facing title/id from. Path-less drops are staged on
+/// disk as `<stamp>-<name>`; the Host stamp must never reach paper metadata
+/// (#801). `staging_dir` is injected via [`import_staging_dir`] so the decision
+/// stays pure and unit-testable.
+fn import_metadata_stem<'a>(path: &'a Path, staging_dir: Option<&Path>) -> &'a str {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("paper");
+    match staging_dir {
+        Some(dir) if is_import_staging_path(path, dir) => strip_staged_drop_prefix(stem),
+        _ => stem,
+    }
+}
+
 /// Write drop payload bytes to `~/.agentero/import-tmp/<stamp>-<name>` and return the path.
 /// Used when the webview cannot expose `File.path` (typical on macOS WKWebView).
 pub fn stage_import_file(args: StageImportFileArgs) -> Result<StageImportFileResult, AppError> {
@@ -539,9 +601,8 @@ pub fn stage_import_file(args: StageImportFileArgs) -> Result<StageImportFileRes
         return Err(AppError::message("file too large to stage (max 80MB)"));
     }
 
-    let home =
-        dirs::home_dir().ok_or_else(|| AppError::message("cannot resolve home directory"))?;
-    let dir = home.join(".agentero").join("import-tmp");
+    let dir =
+        import_staging_dir().ok_or_else(|| AppError::message("cannot resolve home directory"))?;
     fs::create_dir_all(&dir)?;
     let stamp = format!(
         "{}-{}",
@@ -677,7 +738,9 @@ async fn import_one_local_pdf(
         return Err(AppError::message("not a PDF file"));
     }
 
-    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("paper");
+    // Path-less drops are staged as `<import-tmp>/<stamp>-<name>`; never derive
+    // the paper title/id from the Host stamp (#801).
+    let stem = import_metadata_stem(&src, import_staging_dir().as_deref());
     let mut title = entry
         .title
         .as_deref()
@@ -833,10 +896,11 @@ async fn import_one_local_pdf(
     .await?;
 
     let recognize_pending = recognize_deferred && commit.status == CommitStatus::Created;
+    let mut preparation = commit.preparation;
     if recognize_pending {
-        if let Some(app) = ctx.app {
-            app.spawn_recognize_metadata(vault, &commit.path);
-        }
+        preparation
+            .steps
+            .push(preparation::PreparationStep::RecognizeMetadata);
     }
 
     let used_translator = sync_probe
@@ -858,6 +922,7 @@ async fn import_one_local_pdf(
         asset_messages: commit.asset_messages,
         status: Some(commit.status),
         recognize_pending,
+        preparation,
     })
 }
 
@@ -876,12 +941,12 @@ pub fn strip_pdf_ext(s: &str) -> &str {
     }
 }
 
-/// Folder-safe slug from a filename stem (alphanumerics + dots; other runs → `-`).
+/// Folder-safe Unicode slug (letters/numbers + dots; other runs → `-`).
 pub fn slug_from_stem(stem: &str) -> String {
     let mut s = String::new();
     let mut prev_sep = true; // suppress leading separators
     for c in stem.trim().chars() {
-        if c.is_ascii_alphanumeric() || c == '.' {
+        if c.is_alphanumeric() || c == '.' {
             s.push(c);
             prev_sep = false;
         } else if !prev_sep {
@@ -889,10 +954,30 @@ pub fn slug_from_stem(stem: &str) -> String {
             prev_sep = true;
         }
     }
-    let s: String = s.chars().take(60).collect();
-    let s = s.trim_matches(|c| c == '-' || c == '.').to_string();
+    let normalized: String = s
+        .chars()
+        .take(60)
+        .collect::<String>()
+        .trim_matches(|c| c == '-' || c == '.')
+        .to_string();
+    // Keep long names distinguishable after truncation. Without a suffix,
+    // unrelated files sharing the first 60 characters receive the same id
+    // and can be treated as one local paper during import.
+    let truncated = s.chars().count() > 60;
+    let s = if truncated {
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(stem.trim().as_bytes()));
+        let prefix: String = normalized.chars().take(47).collect();
+        format!("{prefix}-{}", &digest[..12])
+    } else {
+        normalized
+    };
     if s.is_empty() {
-        "paper".into()
+        use sha2::{Digest, Sha256};
+        format!(
+            "paper-{}",
+            &hex::encode(Sha256::digest(stem.trim().as_bytes()))[..12]
+        )
     } else {
         s
     }
@@ -918,19 +1003,23 @@ pub fn title_from_stem(stem: &str) -> String {
 /// catalog has a row for it (folder may have been deleted externally).
 /// Returns `(id, path_rel, absolute_dir)` — callers must adopt the returned id
 /// into `meta.id` so folder name and catalog id never diverge.
+/// Local placeholders also reserve the id across other parent directories.
 pub fn allocate_paper_path(
     vault: &Path,
     parent_rel: &str,
     base_id: &str,
+    unique_local_id: bool,
 ) -> (String, String, PathBuf) {
-    let taken = |path_rel: &str| -> bool {
-        vault.join(path_rel).exists() || matches!(papers::get_by_path(vault, path_rel), Ok(Some(_)))
+    let taken = |id: &str, path_rel: &str| -> bool {
+        vault.join(path_rel).exists()
+            || matches!(papers::get_by_path(vault, path_rel), Ok(Some(_)))
+            || (unique_local_id && matches!(papers::get_by_id(vault, id), Ok(Some(_))))
     };
     let mut id = base_id.to_string();
     let mut n = 2;
     loop {
         let path_rel = format!("{parent_rel}/{id}").replace('\\', "/");
-        if !taken(&path_rel) || n > 999 {
+        if !taken(&id, &path_rel) {
             let dir = vault.join(&path_rel);
             return (id, path_rel, dir);
         }
@@ -939,57 +1028,72 @@ pub fn allocate_paper_path(
     }
 }
 
+/// Metadata resolved for an import, plus whether the Translator Runtime
+/// produced it and any diagnostic notices for the UI.
+pub struct ResolvedMetadata {
+    pub record: PaperRecord,
+    pub used_translator: bool,
+    /// Stable tokens such as `translator_degraded|503|1102|page|<host>`.
+    /// The desktop shell translates them; they are not raw user copy.
+    pub notices: Vec<String>,
+}
+
 pub async fn resolve_metadata(
     text: &str,
     translator_base: &str,
     task_id: Option<&str>,
-) -> Result<(PaperRecord, bool), AppError> {
-    // Prefer Translator Runtime (placeholder URL)
-    match translator_fetch(text, translator_base, task_id).await {
-        Ok(meta) => {
+) -> Result<ResolvedMetadata, AppError> {
+    // Prefer Translator Runtime. A failure is not fatal for a web URL: the
+    // identifier chains run next, and a page with no DOI / arXiv / PMID is
+    // imported from the page itself.
+    let mut resolved = match translator_fetch(text, translator_base, task_id).await {
+        Ok(record) => {
             check_task_not_cancelled(task_id)?;
-            Ok((meta, true))
-        }
-        Err(e) => {
-            // Direct-connect fallback chains from the resolver table (arXiv →
-            // S2 → alphaXiv, DOI → Crossref → S2 → OpenAlex, PMID → PubMed)
-            // so local dev works without the Runtime sidecar.
-            match crate::features::scholar_api::identifiers::fetch_direct_fallback(text, task_id)
-                .await
-            {
-                Some(Ok(api_paper)) => {
-                    check_task_not_cancelled(task_id)?;
-                    Ok((api_paper_to_meta(&api_paper), false))
-                }
-                Some(Err(err)) => Err(err),
-                None => Err(AppError::message(format!(
-                    "translator unreachable at {translator_base} ({e}); no identifier matched the direct-connect fallback chains (arXiv/S2/alphaXiv, DOI/Crossref/S2/OpenAlex, PMID/PubMed)"
-                ))),
+            ResolvedMetadata {
+                record,
+                used_translator: true,
+                notices: Vec::new(),
             }
         }
+        Err(failure) => webpage::recover_metadata(text, translator_base, task_id, failure).await?,
+    };
+    if let Some(request) = crate::features::scholar_api::identifiers::extract_arxiv_request(text) {
+        resolved.record.arxiv_id = Some(strip_arxiv_version(&request));
+        let urls = crate::features::scholar_api::urls::arxiv_canonical_urls(&request);
+        resolved.record.pdf_url = Some(urls.pdf);
+        resolved.record.html_url = Some(urls.html);
+        resolved.record.source_url = Some(urls.abs);
     }
+    Ok(resolved)
 }
 
 async fn translator_fetch(
     text: &str,
     base: &str,
     task_id: Option<&str>,
-) -> Result<PaperRecord, AppError> {
+) -> Result<PaperRecord, webpage::TranslatorFailure> {
     let (endpoint, body) = translator_request(text);
     let api = TranslatorApi::new(base);
 
     let items = api
         .fetch_raw_items(&endpoint, body)
         .await
-        .map_err(|e| AppError::message(format!("translator request failed: {e}")))?;
-    check_task_not_cancelled(task_id)?;
+        .map_err(webpage::TranslatorFailure::from_api)?;
+    if check_task_not_cancelled(task_id).is_err() {
+        return Err(webpage::TranslatorFailure {
+            status: None,
+            code: None,
+            detail: "cancelled".into(),
+            cancelled: true,
+        });
+    }
 
-    let item = items
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::message("translator returned empty items array"))?;
+    let item = items.into_iter().next().ok_or_else(|| {
+        webpage::TranslatorFailure::other("translator returned empty items array")
+    })?;
 
     api_mapper::map_zotero_item_to_record(&item)
+        .map_err(|err| webpage::TranslatorFailure::other(err.to_string()))
 }
 
 /// Build a Translator Runtime request from an identifier: a **relative
@@ -1160,6 +1264,29 @@ pub async fn write_paper_shell_opts(
     mode: NoteShellMode,
     translate_abstract: bool,
 ) -> Result<(), AppError> {
+    write_paper_shell_with_translation(
+        paper_dir,
+        vault_root,
+        meta,
+        mode,
+        translate_abstract,
+        abstract_for_notes,
+    )
+    .await
+}
+
+/// Write a shell with a supplied abstract translator (offline fixtures in tests).
+pub(crate) async fn write_paper_shell_with_translation<'a, Fut>(
+    paper_dir: &Path,
+    vault_root: &Path,
+    meta: &'a PaperRecord,
+    mode: NoteShellMode,
+    translate_abstract: bool,
+    translate: impl FnOnce(&'a str) -> Fut,
+) -> Result<(), AppError>
+where
+    Fut: std::future::Future<Output = Option<String>>,
+{
     let aliases = paper_shell_aliases(meta);
     let notes = match mode {
         NoteShellMode::Blank => {
@@ -1175,13 +1302,13 @@ pub async fn write_paper_shell_opts(
             Some(notes) => notes,
             // Template missing/blank → fall through to the Standard shell.
             None => {
-                let body = standard_note_body(meta, translate_abstract).await;
+                let body = standard_note_body(meta, translate_abstract, translate).await;
                 crate::features::wiki::frontmatter::prepend_new_aliases(&body, &aliases)
                     .map_err(AppError::message)?
             }
         },
         NoteShellMode::Standard => {
-            let body = standard_note_body(meta, translate_abstract).await;
+            let body = standard_note_body(meta, translate_abstract, translate).await;
             crate::features::wiki::frontmatter::prepend_new_aliases(&body, &aliases)
                 .map_err(AppError::message)?
         }
@@ -1191,7 +1318,14 @@ pub async fn write_paper_shell_opts(
 }
 
 /// Standard shell body: `# title` + optional abstract blockquote.
-async fn standard_note_body(meta: &PaperRecord, translate_abstract: bool) -> String {
+async fn standard_note_body<'a, Fut>(
+    meta: &'a PaperRecord,
+    translate_abstract: bool,
+    translate: impl FnOnce(&'a str) -> Fut,
+) -> String
+where
+    Fut: std::future::Future<Output = Option<String>>,
+{
     let abstract_block = match meta
         .abstract_text
         .as_deref()
@@ -1202,7 +1336,7 @@ async fn standard_note_body(meta: &PaperRecord, translate_abstract: bool) -> Str
             if translate_abstract {
                 // Race free-MT engines; omit the blockquote when none succeed
                 // (do not fall back to English as a "translation").
-                match abstract_for_notes(a).await {
+                match translate(a).await {
                     Some(display) => format!("> {display}\n\n"),
                     None => String::new(),
                 }
@@ -1417,7 +1551,14 @@ mod tests {
         );
         assert_eq!(slug_from_stem("1706.03762"), "1706.03762");
         assert_eq!(slug_from_stem("  spaced  "), "spaced");
-        assert_eq!(slug_from_stem("!!!"), "paper");
+        assert!(slug_from_stem("!!!").starts_with("paper-"));
+        assert_ne!(slug_from_stem("!!!"), slug_from_stem("???"));
+        assert_eq!(slug_from_stem("舞蹈概论"), "舞蹈概论");
+        assert_eq!(slug_from_stem("舞蹈学：中国学派"), "舞蹈学-中国学派");
+        let long_a = format!("{}甲", "中文论文".repeat(16));
+        let long_b = format!("{}乙", "中文论文".repeat(16));
+        assert_ne!(slug_from_stem(&long_a), slug_from_stem(&long_b));
+        assert!(slug_from_stem(&long_a).chars().count() <= 60);
     }
 
     #[test]
@@ -1428,6 +1569,63 @@ mod tests {
         );
         assert_eq!(title_from_stem("  Hello   World  "), "Hello World");
         assert_eq!(title_from_stem("   "), "Untitled");
+    }
+
+    /// #801: stamped drop stems must yield clean title/id; only the exact
+    /// `<13-digit millis>-<8 lowercase hex>-` Host stamp is removed.
+    #[test]
+    fn staged_drop_stem_strips_host_stamp() {
+        assert_eq!(
+            strip_staged_drop_prefix("1792563636997-a5e60013-Differentiated Treatment"),
+            "Differentiated Treatment"
+        );
+        assert_eq!(
+            strip_staged_drop_prefix("1792563636997-a5e60013-中文标题"),
+            "中文标题"
+        );
+        assert_eq!(
+            strip_staged_drop_prefix("0000000000001-00000000-note"),
+            "note"
+        );
+    }
+
+    #[test]
+    fn staged_drop_stem_leaves_near_misses_unchanged() {
+        for stem in [
+            "1706.03762",
+            "10.1038-nature12373",
+            "1792563636997-ABCDEF12-x", // uppercase hex
+            "179256363699-ab5e60013-x", // 12-digit millis
+            "1792563636997-a5e6001-x",  // 7 hex chars
+            "1792563636997-a5e60013x",  // missing trailing separator
+            "1792563636997-a5e60013-",  // stamp only, no name
+            "Attention-Is-All-You-Need",
+        ] {
+            assert_eq!(strip_staged_drop_prefix(stem), stem, "stem: {stem}");
+        }
+    }
+
+    /// Only paths inside the Host staging dir lose the stamp; the same-looking
+    /// name in a user directory is a real filename and must be preserved.
+    #[test]
+    fn staged_drop_metadata_stem_only_strips_inside_staging_dir() {
+        let staging = Path::new("/home/u/.agentero/import-tmp");
+        let staged = staging.join("1792563636997-a5e60013-Differentiated Treatment.pdf");
+        let stem = import_metadata_stem(&staged, Some(staging));
+        assert_eq!(stem, "Differentiated Treatment");
+        assert_eq!(title_from_stem(stem), "Differentiated Treatment");
+        assert_eq!(slug_from_stem(stem), "Differentiated-Treatment");
+
+        let user_file = Path::new("/home/u/Downloads/1792563636997-a5e60013-My Paper.pdf");
+        assert_eq!(
+            import_metadata_stem(user_file, Some(staging)),
+            "1792563636997-a5e60013-My Paper"
+        );
+        // Unresolvable home dir (no staging dir) never strips.
+        assert_eq!(
+            import_metadata_stem(&staged, None),
+            "1792563636997-a5e60013-Differentiated Treatment"
+        );
     }
 
     #[test]
@@ -1461,16 +1659,27 @@ mod tests {
         fs::create_dir_all(vault.join("papers")).unwrap();
 
         // Free path → base id unchanged.
-        let (id, rel, dir) = allocate_paper_path(&vault, "papers", "1706.03762");
+        let (id, rel, dir) = allocate_paper_path(&vault, "papers", "1706.03762", false);
         assert_eq!(id, "1706.03762");
         assert_eq!(rel, "papers/1706.03762");
         assert_eq!(dir, vault.join("papers/1706.03762"));
 
         // Folder on disk → suffix -2, and returned id matches the folder name.
         fs::create_dir_all(vault.join("papers/1706.03762")).unwrap();
-        let (id, rel, _) = allocate_paper_path(&vault, "papers", "1706.03762");
+        let (id, rel, _) = allocate_paper_path(&vault, "papers", "1706.03762", false);
         assert_eq!(id, "1706.03762-2");
         assert_eq!(rel, "papers/1706.03762-2");
+
+        // Same Chinese filename in another organization folder must also
+        // receive a distinct local id, even though the target path is free.
+        papers::upsert_paper(
+            &vault,
+            &PaperRecord::local_pdf("中文论文".into(), "甲".into()).at_path("papers/甲/中文论文"),
+        )
+        .unwrap();
+        let (id, rel, _) = allocate_paper_path(&vault, "papers/乙", "中文论文", true);
+        assert_eq!(id, "中文论文-2");
+        assert_eq!(rel, "papers/乙/中文论文-2");
 
         let _ = fs::remove_dir_all(&vault);
     }

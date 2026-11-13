@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 
+use crate::features::paper::discovery::coolpapers::decode_entities;
 use crate::features::scholar_api::client;
 use crate::features::scholar_api::identifiers::strip_arxiv_version;
 use crate::features::scholar_api::traits::AcademicApi;
@@ -63,6 +64,26 @@ async fn search_by_title(title: &str, limit: usize) -> Result<Vec<ApiPaper>, Api
     Ok(parse_entries(&xml, limit))
 }
 
+/// Free-form arXiv Atom query, newest submissions first.
+///
+/// `search_query` is the raw arXiv query expression (already composed by the
+/// caller — e.g. `all:agent AND cat:cs.AI`); it is URL-encoded here. This is
+/// the primitive behind keyword/category/date discovery, as opposed to the
+/// single-record lookups used by the import resolver.
+pub async fn query_atom(
+    search_query: &str,
+    start: usize,
+    max_results: usize,
+) -> Result<Vec<ApiPaper>, ApiError> {
+    let url = format!(
+        "{API_BASE}?search_query={}&start={start}&max_results={max_results}\
+         &sortBy=submittedDate&sortOrder=descending",
+        urlencoding::encode(search_query)
+    );
+    let xml = client::get_text(&url).await?;
+    Ok(parse_entries(&xml, max_results))
+}
+
 fn parse_entries(xml: &str, limit: usize) -> Vec<ApiPaper> {
     let mut out = Vec::new();
     for entry in xml.split("<entry>").skip(1) {
@@ -119,7 +140,8 @@ fn parse_entries(xml: &str, limit: usize) -> Vec<ApiPaper> {
     out
 }
 
-/// First `<tag>…</tag>` in `xml`, whitespace collapsed.
+/// First `<tag>…</tag>` in `xml`, whitespace collapsed and XML entities
+/// decoded: the Atom feed escapes `&`, `<` and `>` (`&lt;0.5MB`).
 fn tag_text(xml: &str, tag: &str) -> Option<String> {
     let body = xml
         .split(&format!("<{tag}>"))
@@ -130,7 +152,7 @@ fn tag_text(xml: &str, tag: &str) -> Option<String> {
     if text.is_empty() {
         None
     } else {
-        Some(text)
+        Some(decode_entities(&text))
     }
 }
 
@@ -166,5 +188,29 @@ mod tests {
         );
         assert_eq!(p.authors.len(), 2);
         assert!(p.urls.pdf.as_deref().unwrap().contains("/pdf/1706.03762"));
+    }
+
+    #[test]
+    fn decodes_escaped_characters_in_atom_text() {
+        // As export.arxiv.org returns 1602.07360 (SqueezeNet).
+        let xml = r#"<feed>
+            <entry>
+                <id>http://arxiv.org/abs/1602.07360v4</id>
+                <published>2016-02-24T20:41:44Z</published>
+                <title>SqueezeNet: AlexNet-level accuracy with 50x fewer parameters and
+  &lt;0.5MB model size</title>
+                <summary>Smaller DNNs &amp; FPGAs: &quot;fewer&quot; parameters</summary>
+                <author><name>Forrest N. Iandola</name></author>
+            </entry>
+        </feed>"#;
+        let p = &parse_entries(xml, 1)[0];
+        assert_eq!(
+            p.title,
+            "SqueezeNet: AlexNet-level accuracy with 50x fewer parameters and <0.5MB model size"
+        );
+        assert_eq!(
+            p.abstract_text.as_deref(),
+            Some("Smaller DNNs & FPGAs: \"fewer\" parameters")
+        );
     }
 }

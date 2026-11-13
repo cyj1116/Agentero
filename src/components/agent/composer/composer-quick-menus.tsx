@@ -1,15 +1,10 @@
 import { Sparkles } from "lucide-react";
+import { cleanSkillDisplayName } from "@/components/agent/composer/composer-inline-dom";
+import { COMPOSER_MENU_SURFACE } from "@/components/agent/composer/composer-menu-surface";
 import { PopoverContent } from "@/components/ui/popover";
 import type { AgentSkill } from "@/lib/agent";
 import type { AcpCommand } from "@/lib/agent/slash-commands";
 import { cn } from "@/lib/core/utils";
-
-function cleanSkillDisplayName(name: string): string {
-	return name
-		.trim()
-		.replace(/^[/$]+/, "")
-		.replace(/^skill\s*:\s*/i, "");
-}
 
 /** Both menus must render inside the composer `Popover` subtree — `PopoverContent` needs its context. */
 export function ComposerSkillMenu({
@@ -31,7 +26,7 @@ export function ComposerSkillMenu({
 			align="start"
 			sideOffset={8}
 			onOpenAutoFocus={(event) => event.preventDefault()}
-			className="max-h-(--radix-popover-content-available-height) w-[min(28rem,calc(100vw-1rem))] gap-0 overflow-y-auto p-1"
+			className={COMPOSER_MENU_SURFACE}
 		>
 			{skillOptions.map((skill, index) => (
 				<button
@@ -84,33 +79,47 @@ export function ComposerSlashMenu({
 			align="start"
 			sideOffset={8}
 			onOpenAutoFocus={(event) => event.preventDefault()}
-			className="max-h-(--radix-popover-content-available-height) w-[min(28rem,calc(100vw-1rem))] gap-0 overflow-y-auto p-1"
+			className={COMPOSER_MENU_SURFACE}
 		>
-			{slashOptions.map((command, index) => (
-				<button
-					key={command.id}
-					id={`agent-slash-option-${index}`}
-					type="button"
-					role="option"
-					aria-selected={slashActiveIndex === index}
-					className={cn(
-						"flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm focus-visible:outline-none",
-						slashActiveIndex === index ? "bg-muted" : "hover:bg-muted/70",
-					)}
-					onMouseEnter={() => onSlashActiveIndexChange(index)}
-					onClick={() => onAttachSlashCommand(command)}
-				>
-					<span className="flex min-w-0 flex-1 items-center truncate">
-						<span className="shrink-0 font-mono text-muted-foreground">/</span>
-						<span className="shrink-0 whitespace-nowrap">{command.title}</span>
-					</span>
-					{command.description ? (
-						<span className="min-w-0 max-w-40 flex-1 truncate text-muted-foreground text-xs">
-							{command.description}
+			{slashOptions.map((command, index) => {
+				const isSkill = command.kind === "skill";
+				return (
+					<button
+						key={command.id}
+						id={`agent-slash-option-${index}`}
+						type="button"
+						role="option"
+						aria-selected={slashActiveIndex === index}
+						className={cn(
+							"flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm focus-visible:outline-none",
+							slashActiveIndex === index ? "bg-muted" : "hover:bg-muted/70",
+						)}
+						onMouseEnter={() => onSlashActiveIndexChange(index)}
+						onClick={() => onAttachSlashCommand(command)}
+					>
+						{isSkill ? (
+							<Sparkles
+								className="size-3.5 shrink-0 text-muted-foreground"
+								aria-hidden
+							/>
+						) : (
+							<span className="shrink-0 font-mono text-muted-foreground">
+								{command.prefix}
+							</span>
+						)}
+						<span className="flex min-w-0 flex-1 items-center truncate">
+							<span className="shrink-0 whitespace-nowrap">
+								{isSkill ? cleanSkillDisplayName(command.title) : command.title}
+							</span>
 						</span>
-					) : null}
-				</button>
-			))}
+						{command.description ? (
+							<span className="min-w-0 max-w-40 flex-1 truncate text-muted-foreground text-xs">
+								{command.description}
+							</span>
+						) : null}
+					</button>
+				);
+			})}
 		</PopoverContent>
 	);
 }

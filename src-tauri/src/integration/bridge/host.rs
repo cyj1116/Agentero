@@ -13,12 +13,13 @@ use crate::features::agent::models::{
 };
 #[cfg(not(target_os = "ios"))]
 use crate::features::agent::{
-    service as agent_service, AgentRegistry, AgentRunController, PermissionGate, RemoteAgentHosts,
+    service as agent_service, AgentRegistry, AgentRunController, AgentWarmPool, PermissionGate,
+    RemoteAgentHosts,
 };
 use crate::features::markdown::search::{self, VaultSearchArgs};
 use crate::features::paper::catalog::papers;
 use crate::features::vault::tree;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::Utc;
 use crypto_box::aead::rand_core::RngCore;
@@ -792,6 +793,7 @@ async fn dispatch_rpc(
                 vault_path: vault_root.to_string_lossy().into_owned(),
                 query: args.query,
                 limit: args.limit,
+                ..Default::default()
             })?)
         }
         "vault_read_text" => {
@@ -990,6 +992,7 @@ async fn dispatch_agent_rpc(
                 app.state::<AgentRegistry>().inner(),
                 remote_hosts.inner().as_ref(),
                 app.state::<crate::features::agent::AgentWarmGate>().inner(),
+                app.state::<Arc<AgentWarmPool>>().inner(),
                 optional_string(&params, "agentId"),
                 vault_path,
                 optional_string(&params, "cursor"),
@@ -1003,6 +1006,20 @@ async fn dispatch_agent_rpc(
             let result = agent_service::load_session(
                 app.state::<AgentRegistry>().inner(),
                 remote_hosts.inner().as_ref(),
+                optional_string(&params, "agentId"),
+                session_id,
+                vault_path,
+            )
+            .await;
+            api_service_data(result)
+        }
+        "agent_delete_session" => {
+            let session_id = required_string(&params, "sessionId")?;
+            let remote_hosts = app.state::<std::sync::Arc<dyn RemoteAgentHosts>>();
+            let result = agent_service::delete_session(
+                app.state::<AgentRegistry>().inner(),
+                remote_hosts.inner().as_ref(),
+                app.state::<Arc<AgentWarmPool>>().inner(),
                 optional_string(&params, "agentId"),
                 session_id,
                 vault_path,
@@ -1200,9 +1217,9 @@ fn vault_relative_path(vault_root: &Path, value: &str, writing: bool) -> Result<
 }
 
 fn decode_crypto_box_public_key(value: &str) -> Result<PublicKey, AppError> {
-    let bytes = URL_SAFE_NO_PAD
+    let bytes = STANDARD
         .decode(value)
-        .map_err(|_| AppError::message("E2EE public key is not valid base64url"))?;
+        .map_err(|_| AppError::message("E2EE public key is not valid Base64"))?;
     let bytes: [u8; 32] = bytes
         .try_into()
         .map_err(|_| AppError::message("E2EE public key must contain 32 bytes"))?;
@@ -1239,6 +1256,15 @@ fn set_error(app: &AppHandle, shared: &HostShared, error: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_public_key_accepts_relay_wire_format() {
+        let key = decode_crypto_box_public_key("+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/s=")
+            .expect("decode standard padded Base64");
+        assert_eq!(key.as_bytes(), &[251; 32]);
+        assert!(decode_crypto_box_public_key(&STANDARD.encode([0; 31])).is_err());
+        assert!(decode_crypto_box_public_key(&URL_SAFE_NO_PAD.encode([251; 32])).is_err());
+    }
 
     #[test]
     fn rpc_path_rejects_parent_directory_escape() {

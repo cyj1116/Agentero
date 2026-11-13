@@ -5,22 +5,35 @@
 		"remoteContextHint": "Vault is open on {{host}} ({{path}}). App appearance stays local; Agent catalog below probes that host when you open the Agent section."
 	},
 	"nav": {
+		"account": "Account and teams",
 		"general": "General",
 		"appearance": "Appearance",
 		"agent": "Agent",
 		"translate": "Translate",
 		"layout": "Layout",
+		"experimental": "Experimental",
 		"doctor": "Doctor",
 		"keyboard": "Keyboard",
-		"remote-access": "Remote access",
+		"remote-access": "Mobile access",
 		"about": "About",
 		"quickSetup": "Quick setup wizard",
 		"featureTour": "Feature tour",
-		"sync": "Sync"
+		"sync": "Sync",
+		"plugins": "Plugins"
+	},
+	"writing": {
+		"uploadMode": "When to upload",
+		"uploadManual": "Manually",
+		"uploadOnCompile": "After each compile",
+		"uploadInterval": "On a timer",
+		"uploadEvery": "Interval",
+		"uploadMinutes": "{{count}} min",
+		"save": "Save",
+		"saved": "Saved"
 	},
 	"remoteAccess": {
-		"title": "Remote access",
-		"localVaultRequired": "Open a local Vault to provide remote access.",
+		"title": "Mobile access",
+		"localVaultRequired": "Open a local Vault to provide mobile access.",
 		"hostName": {
 			"label": "Computer name"
 		},
@@ -28,8 +41,8 @@
 			"online": "Online",
 			"offline": "Offline"
 		},
-		"start": "Enable remote access",
-		"stop": "Disable remote access",
+		"start": "Enable mobile access",
+		"stop": "Disable mobile access",
 		"qrAlt": "Pairing QR code",
 		"pairing": {
 			"title": "Pair an iPhone or iPad"
@@ -56,6 +69,33 @@
 	},
 	"general": {
 		"title": "General",
+		"sections": {
+			"papers": "Paper library",
+			"pdf": "PDF reading",
+			"plaza": "Plaza",
+			"system": "System",
+			"network": "Network",
+			"integrations": "Integrations",
+			"mcp": "MCP",
+			"keyboard": "Keyboard"
+		},
+		"terminalApp": {
+			"label": "Open in Terminal with",
+			"unavailable": "{{name}} (not installed)"
+		},
+		"finder": {
+			"label": "Finder integration",
+			"description": "Adds \"Open with Agentero\" to the right-click menu for folders in Finder",
+			"descriptionInstalled": "Right-click a folder in Finder to open it as a Vault",
+			"stale": "Agentero was moved — update to fix the menu entry",
+			"install": "Install",
+			"update": "Update",
+			"uninstall": "Remove",
+			"installSuccess": "Finder Quick Action installed",
+			"uninstallSuccess": "Finder Quick Action removed",
+			"installFailed": "Could not install the Finder Quick Action",
+			"uninstallFailed": "Could not remove the Finder Quick Action"
+		},
 		"paperTreeLabelMode": {
 			"label": "Paper names in file tree",
 			"title-author": "Title · Author",
@@ -96,6 +136,26 @@
 			"ask": "Ask",
 			"always": "Always when safe"
 		},
+		"pdfScrollStrategy": {
+			"label": "PDF navigation mode",
+			"vertical": "Vertical",
+			"horizontal": "Horizontal",
+			"paginated": "Page by page"
+		},
+		"pdfVimKeys": {
+			"label": "Enable PDF Vim keys (j/k/h/l)",
+			"requiresVimMode": "Requires Vim mode"
+		},
+		"vimMode": {
+			"label": "Vim mode",
+			"description": "Enable j/k/h/l navigation and F jump labels in the file tree, dropdown lists and the PDF reader. Off keeps plain typing and arrow keys."
+		},
+		"pdfSpreadMode": {
+			"label": "PDF page layout",
+			"none": "Single page",
+			"odd": "Two-page (from page 1)",
+			"even": "Two-page (cover separate)"
+		},
 		"batchImportConcurrency": {
 			"label": "Background task concurrency",
 			"value": "{{value}} simultaneous"
@@ -104,14 +164,40 @@
 			"label": "Network proxy",
 			"systemDetected": "System proxy detected ({{url}}) — used automatically while this switch is off."
 		},
-		"githubMirror": {
-			"label": "GitHub mirror",
-			"description": "Choose a built-in public mirror for Skill import fallback when GitHub is unreachable."
+		"institutionProxy": {
+			"label": "Institution proxy",
+			"cookieLabel": "Proxy cookie",
+			"cookiePlaceholder": "Paste WebVPN cookie",
+			"login": "Open login",
+			"loginFailed": "Could not open the institution login",
+			"cookieExpired": "Institution login expired. Open the gateway and sign in again; cookies are saved automatically.",
+			"typeLabel": "Gateway type",
+			"typeAuto": "Auto-detect",
+			"typeEzproxy": "EZProxy (login?url=)",
+			"typeWengine": "WebVPN (wengine)",
+			"typeSubdomain": "WebVPN (subdomain mapping)",
+			"test": "Test",
+			"testing": "Testing…",
+			"probeIdle": "Not tested",
+			"probeOk": "Available",
+			"probeFail": "Unavailable",
+			"probeProbing": "Testing…",
+			"presetsLabel": "Common institutions",
+			"presets": {
+				"zju": "Zhejiang University",
+				"ustc": "University of Science and Technology of China",
+				"xjtu": "Xi'an Jiaotong University",
+				"neu": "Northeastern University",
+				"tsinghua": "Tsinghua University",
+				"fudan": "Fudan University",
+				"bjmu": "Peking University Health Science Center"
+			}
 		},
 		"easyScholar": {
 			"section": "EasyScholar",
 			"keyLabel": "Key",
 			"placeholder": "Enter EasyScholar key",
+			"openKeyPage": "Get an EasyScholar key",
 			"confirm": "Confirm",
 			"probeIdle": "Not configured",
 			"probeOk": "Available",
@@ -128,6 +214,9 @@
 			"invalidPort": "Port must be between 1 and 65535."
 		},
 		"mcp": {
+			"exposeText": {
+				"label": "Expose paper text (MCP)"
+			},
 			"label": "MCP server",
 			"portLabel": "MCP port",
 			"invalidPort": "Port must be between 1 and 65535.",
@@ -150,12 +239,6 @@
 				"copied": "Copied",
 				"openTunnels": "Open tunnels",
 				"openApiKeys": "Open API keys"
-			}
-		},
-		"export": {
-			"section": "Note export",
-			"watermark": {
-				"label": "Agentero watermark by default"
 			}
 		},
 		"privacy": {
@@ -193,6 +276,11 @@
 			"label": "Interface scale",
 			"value": "{{percent}}%"
 		},
+		"sound": {
+			"label": "In-app sounds",
+			"description": "Quiet cues when an Agent needs you, or a turn or PDF translation finishes or fails",
+			"preview": "Preview"
+		},
 		"fonts": {
 			"section": "Fonts",
 			"interface": "Interface font",
@@ -205,8 +293,6 @@
 		"fontSize": {
 			"label": "Editor font size",
 			"value": "{{size}} px",
-			"increase": "Increase font size",
-			"decrease": "Decrease font size",
 			"select": "Select font size"
 		},
 		"fontFamily": {
@@ -225,12 +311,32 @@
 			"label": "Line height",
 			"value": "{{value}}"
 		},
+		"wikiEmbedFontSize": {
+			"label": "Wiki embed font size",
+			"value": "{{size}} px"
+		},
+		"markdownMaxWidth": {
+			"label": "Markdown max width",
+			"full": "Full width",
+			"value": "{{width}} px"
+		},
 		"editorToolbar": {
 			"label": "Formatting toolbar"
 		}
 	},
 	"agent": {
 		"title": "Agent",
+		"zhihu": {
+			"section": "Zhihu",
+			"keyLabel": "Access Secret",
+			"placeholder": "Paste the Zhihu Access Secret",
+			"confirm": "Save",
+			"openKeyPage": "Open Zhihu developer console",
+			"probeIdle": "Not configured",
+			"probeProbing": "Checking…",
+			"probeOk": "Ready",
+			"probeFail": "Unavailable"
+		},
 		"userAgent": {
 			"section": "Relay compatibility",
 			"label": "User-Agent",
@@ -270,6 +376,29 @@
 		"desktopHint": "Run `pnpm tauri dev` to scan agents on this machine.",
 		"commonAgents": "Common agents",
 		"commonAgentsHint": "If ACP fails, try configuring a proxy under General.",
+		"nodeNotice": {
+			"title": "Node.js is required",
+			"npmTitle": "npm is required",
+			"description": "ACP adapters and npm-based Agent installs need Node.js (npm ships with it). Install it, then retry.",
+			"unusableTitle": "Node.js cannot run",
+			"npmUnusableTitle": "npm cannot run",
+			"unusableDescription": "Agentero found Node.js but could not start it. Open Diagnostics for the error details (a library-path conflict is a common cause), then retry.",
+			"diagnostics": "Diagnostics"
+		},
+		"nodeRequired": "This Agent action needs Node.js. Install Node.js, then retry.",
+		"nodeUnusable": "This Agent action needs a working Node.js. Open Diagnostics for the error details, then retry.",
+		"desktopApps": {
+			"section": "Local desktop apps",
+			"hint": "These desktop apps don't speak ACP themselves — Agentero connects through the CLI they bundle (Codex in ChatGPT, CodeBuddy in WorkBuddy, …).",
+			"scanning": "Detecting…",
+			"open": "Open {{name}}",
+			"chatgpt": "ChatGPT",
+			"qwenwork": "QwenWork",
+			"workbuddy": "WorkBuddy",
+			"dsh-desktop": "Dsh Desktop",
+			"bundledCli": "Bundled CLI — connectable"
+		},
+		"zcodeDesktopPathHint": "If ZCode is not found, set ZCODE_BIN to its zcode.cjs path. This supports any drive and nested install folder.",
 		"defaultAgent": {
 			"section": "Default agent",
 			"label": "Default Agent",
@@ -295,6 +424,8 @@
 		"updateAgent": "Update",
 		"updateAgentAria": "Update {{name}} agent CLI",
 		"updateAgentTitle": "Update agent CLI",
+		"openCliAria": "Open {{name}} CLI in terminal",
+		"openCliTitle": "Open terminal for {{command}}",
 		"updateSuccess": "Updated {{name}}",
 		"lifecycleWaiting": "Waiting for installer…",
 		"lifecycleInstalling": "Running installer…",
@@ -311,8 +442,11 @@
 			"agentInstalled": "Agent installed",
 			"agentMissing": "No agent",
 			"acpMissing": "No ACP",
+			"acpNodeBlocker": "Node unavailable",
 			"acpBundled": "Built-in",
-			"acpBundledTitle": "Bundled ACP adapter {{version}} — used only when no adapter is on PATH (a PATH install always wins; the bundled one moves with app releases)."
+			"acpBundledTitle": "Bundled ACP adapter {{version}} — used only when no adapter is on PATH (a PATH install always wins; the bundled one moves with app releases).",
+			"desktopBundled": "Desktop‑bundled",
+			"desktopBundledTitle": "Driven by the CLI bundled with a desktop app ({{path}}). A PATH install always wins."
 		},
 		"permission": {
 			"label": "Permission mode",
@@ -352,6 +486,15 @@
 				"followAgent": "Follow agent default"
 			}
 		},
+		"paperReader": {
+			"section": "Paper reading",
+			"agentId": {
+				"label": "Reading agent"
+			},
+			"modelId": {
+				"label": "Reading model"
+			}
+		},
 		"form": {
 			"defaultName": "Desktop",
 			"name": "Name",
@@ -364,7 +507,7 @@
 			"lead": "Choose what to remove:",
 			"removeAgent": "Remove Agent CLI",
 			"removeAcp": "Remove ACP adapter",
-			"dirsLabel": "Directories to delete",
+			"dirsLabel": "Paths to delete",
 			"copyAria": "Copy to clipboard",
 			"registryOnly": "Only the Agentero registry entry will be removed; installed files stay on disk.",
 			"customConfirm": "Remove this custom agent from Agentero?",
@@ -386,6 +529,7 @@
 			"label": "Default service",
 			"agentero": "Agentero built-in",
 			"deeplx": "DeepLX",
+			"cnki": "CNKI Translate",
 			"huoshanweb": "Volcengine Web",
 			"tencenttransmart": "Tencent Transmart",
 			"googleapi": "Google Translate (API)",
@@ -401,7 +545,8 @@
 			"probeProbing": "Checking availability…"
 		},
 		"errors": {
-			"noBuiltinKey": "Built-in translation is not available in this build."
+			"noBuiltinKey": "Built-in translation is not available in this build.",
+			"unreachable": "Could not reach the translation service. Check the network or pick another service in Translate settings."
 		},
 		"targetLang": {
 			"label": "Target language",
@@ -412,8 +557,30 @@
 		"autoSelection": {
 			"label": "Auto-translate PDF selection"
 		},
-		"dualPane": {
-			"label": "Open rendered translation in a side window"
+		"autoImport": {
+			"label": "Auto-translate after import",
+			"description": "Runs full-text translation in the background once layout analysis finishes. Uses the current translation service and cache settings.",
+			"concurrency": {
+				"label": "Concurrent papers for auto-translation"
+			}
+		},
+		"displayMode": {
+			"label": "Translation display mode",
+			"overlay": "Overlay on original PDF",
+			"dualPane": "Dual pane"
+		},
+		"cache": {
+			"section": "Cache",
+			"ir": {
+				"label": "Cache reflow IR",
+				"description": "Saves extracted character geometry so reopening a paper skips extraction."
+			},
+			"final": {
+				"label": "Cache translated PDF",
+				"description": "Saves the built translated PDF. Each paper takes about 25 MB."
+			},
+			"tip": "Turning a switch off only stops new writes; existing entries keep being reused.",
+			"reset": "Restore defaults"
 		},
 		"providerConfig": {
 			"section": "API Services",
@@ -434,6 +601,11 @@
 			"model": {
 				"label": "Model",
 				"placeholder": "Provider model id"
+			},
+			"extraRequestBody": {
+				"label": "Extra JSON",
+				"invalid": "Extra parameters must be a valid JSON object.",
+				"reserved": "Extra parameters cannot override model, messages or stream."
 			}
 		},
 		"providerDesc": {
@@ -456,9 +628,17 @@
 		},
 		"customPrompt": {
 			"label": "Translation prompt",
-			"placeholder": "Empty = built-in academic prompt. Insert the default to edit a copy.",
+			"systemLabel": "System",
+			"userLabel": "User template",
+			"systemPlaceholder": "Empty keeps the built-in academic style. A one-line note is an extra preference; engine rules stay.",
+			"userPlaceholder": "Leave empty to send the source in quotes. In a template, the source replaces {{text}} only. {{targetLang}} and {{sourceLang}} are also available.",
 			"seed": "Insert default",
-			"reset": "Reset"
+			"reset": "Reset",
+			"unknownPlaceholder": "Unknown placeholder: {{name}}. Only {{targetLang}}, {{sourceLang}}, and {{text}} are allowed.",
+			"userNeedsText": "A user template must include {{text}} where the source goes."
+		},
+		"autoTranslation": {
+			"section": "Auto-translate"
 		}
 	},
 	"layout": {
@@ -477,14 +657,17 @@
 			"mineru": "MinerU",
 			"openaiCompatible": "OpenAI-compatible"
 		},
+		"menusHint": "Only configured providers are listed here. If Paddle or MinerU is missing, configure it below and save — it becomes selectable once the check passes.",
 		"providerConfig": {
 			"section": "Provider settings",
+			"sectionHint": "Paddle or MinerU is recommended. Other OpenAI-compatible services are collapsed under Other below.",
+			"other": "Other providers",
 			"providerName": {
 				"paddle": "Paddle",
 				"mineru": "MinerU",
 				"openaiCompatible": "OpenAI-compatible"
 			},
-			"confirm": "Confirm",
+			"confirm": "Save",
 			"openDocsLabel": "Get an API key",
 			"advanced": "Advanced",
 			"apiKey": {
@@ -498,6 +681,11 @@
 			"baseUrl": {
 				"label": "Base URL"
 			},
+			"selfHostedHelp": "Official cloud API base, or a relay address.",
+			"selfHosted": {
+				"label": "Self-hosted API",
+				"help": "Enable only when using a self-hosted server."
+			},
 			"model": {
 				"label": "Model"
 			},
@@ -507,7 +695,7 @@
 			},
 			"language": {
 				"label": "Language",
-				"help": "Specify the document language",
+				"help": "OCR language pack; ignored by self-hosted 4.0.",
 				"options": {
 					"ch": "Chinese–English",
 					"en": "Pure English"
@@ -515,7 +703,7 @@
 			},
 			"forceOcr": {
 				"label": "Force OCR",
-				"help": "Enable OCR for all pages."
+				"help": "OCR every page regardless of the text layer."
 			},
 			"probeIdle": "Not checked yet",
 			"probeOk": "Available",
@@ -540,6 +728,40 @@
 				"clearTitle": "Clear parse results?",
 				"reparseTitle": "Clear and reparse?",
 				"scopeLabel": "Choose scope"
+			}
+		}
+	},
+	"experimental": {
+		"title": "Experimental features",
+		"decision": {
+			"section": "Decision model",
+			"getKey": "Get an API key",
+			"smartHighlight": "Smart highlight",
+			"provider": {
+				"label": "Provider",
+				"jev": "TypeSafe Jev",
+				"clef": "Cloudflare Clef",
+				"openai": "OpenAI (config)",
+				"custom": "Custom"
+			},
+			"apiKey": {
+				"label": "API key",
+				"placeholder": "API key"
+			},
+			"baseUrl": {
+				"label": "Endpoint URL"
+			},
+			"model": {
+				"label": "Model",
+				"placeholder": "Model id"
+			},
+			"test": "Test connection",
+			"probeStatus": {
+				"idle": "Not tested yet",
+				"probing": "Testing…",
+				"ok": "Reachable",
+				"fail": "Unreachable",
+				"unconfigured": "API key required"
 			}
 		}
 	},
@@ -579,7 +801,9 @@
 				"installing": "Installing…",
 				"tooltip": "Install the Node.js LTS through your system package manager (winget or Homebrew)",
 				"hint": "Some ACP Agents need Node.js and npm on PATH. Install the LTS via your system package manager, then re-detect.",
-				"noPackageManager": "No supported package manager found. Install Node.js manually from nodejs.org, then re-detect."
+				"noPackageManager": "No supported package manager found. Install Node.js manually from nodejs.org, then re-detect.",
+				"download": "Download from nodejs.org",
+				"success": "Node.js installed. Retry the Agent install."
 			}
 		},
 		"network": {
@@ -687,10 +911,35 @@
 			"confirmTitle": "Apply link repairs?",
 			"confirmDescription": "Doctor will rewrite {{count}} link target(s) as one transaction. Only the selected byte ranges change.",
 			"success": "Updated links in {{count}} file(s)."
+		},
+		"backfill": {
+			"title": "Paper backfill",
+			"downloadCount": "Download source: {{count}} (network)",
+			"parseCount": "Parse PDF body: {{count}} (write PAPER.md)",
+			"repairCount": "State repaired: {{count}} (local)",
+			"hint": "Check missing paper sources and bodies. Downloads and PDF parsing start only after confirmation.",
+			"selection": "Selected {{selected}} / {{total}}",
+			"selectAll": "Select all",
+			"later": "Later",
+			"start": "Start backfill",
+			"check": "Check",
+			"queued": "Backfill queued: {{count}}",
+			"reasons": {
+				"downloadSource": "Download source · network",
+				"parseBody": "Parse body"
+			}
 		}
 	},
 	"keyboard": {
-		"title": "Keyboard"
+		"title": "Keyboard",
+		"edit": "Change shortcut for {{command}}",
+		"clear": "Unbind {{command}}",
+		"clearHint": "Unbind this shortcut",
+		"restore": "Restore default for {{command}}",
+		"restoreHint": "Restore the default shortcut",
+		"restoreAll": "Restore all defaults",
+		"search": "Search commands or shortcuts",
+		"noResults": "No matching shortcuts"
 	},
 	"about": {
 		"title": "About",
@@ -711,6 +960,20 @@
 			"clearDone": "Cache cleared",
 			"clearFailed": "Couldn't clear the paper full-text cache."
 		},
+		"reflowCache": {
+			"label": "Translation cache",
+			"summary": "{{size}}",
+			"open": "Open cache folder",
+			"openFailed": "Couldn't open the cache folder.",
+			"clear": "Clear cache",
+			"clearDone": "Translation cache cleared",
+			"clearFailed": "Couldn't clear the translation cache.",
+			"tip": "Caches full-text translation intermediates so re-translating the same paper reuses them instead of re-extracting and rebuilding. Turning a switch off only stops new writes; existing entries keep being reused. Control both caches under Settings → Translate → Cache."
+		},
+		"downloadNetworkError": {
+			"title": "Network error downloading from GitHub",
+			"openSettings": "Open network settings"
+		},
 		"update": {
 			"available": "Version {{version}} is ready",
 			"downloading": "Downloading update...",
@@ -719,6 +982,7 @@
 			"installFailed": "Couldn't install the update. Try again",
 			"check": "Check for updates",
 			"downloadInstall": "Install and restart",
+			"releaseNotes": "Release notes",
 			"tagNew": "New version",
 			"tagUpdating": "Updating…",
 			"tagDownloading": "Updating {{progress}}%",
@@ -754,27 +1018,37 @@
 			"openReleaseFailed": "Could not open the release page",
 			"syncFailed": "Could not auto-sync the installed CLI with this app version. Update it from Settings → About"
 		},
-		"finder": {
-			"label": "Finder integration",
-			"description": "Adds \"Open with Agentero\" to the right-click menu for folders in Finder",
-			"descriptionInstalled": "Right-click a folder in Finder to open it as a Vault",
-			"stale": "Agentero was moved — update to fix the menu entry",
-			"install": "Install",
-			"update": "Update",
-			"uninstall": "Remove",
-			"installSuccess": "Finder Quick Action installed",
-			"uninstallSuccess": "Finder Quick Action removed",
-			"installFailed": "Could not install the Finder Quick Action",
-			"uninstallFailed": "Could not remove the Finder Quick Action"
+		"feedback": {
+			"label": "Feedback",
+			"description": "Send a problem or an idea to the team",
+			"open": "Write",
+			"title": "Feedback",
+			"hint": "Includes the app version and system. Your library, file names, and papers stay on this device.",
+			"kindBug": "Problem",
+			"kindIdea": "Idea",
+			"message": "Description",
+			"messagePlaceholder": "What happened, or what you'd like",
+			"contact": "Email",
+			"contactPlaceholder": "Optional, if we should reply",
+			"send": "Send",
+			"sending": "Sending",
+			"sent": "Sent",
+			"unavailable": "This build can't send feedback",
+			"invalid": "Write a short description first",
+			"failed": "Couldn't send feedback. Try again"
 		}
 	},
 	"sync": {
 		"title": "Cloud sync",
 		"advanced": "Advanced",
 		"localVaultOnly": "Cloud sync is available for local vaults only.",
+		"vault": "Vault",
+		"vaultPlaceholder": "Choose a vault",
 		"backend": "Sync method",
+		"backendAgentero": "This account",
 		"backendS3": "Object storage",
 		"backendWebdav": "WebDAV",
+		"backendGit": "Git",
 		"backendLocked": "Disconnect before switching the storage backend.",
 		"serverUrl": "Server URL",
 		"username": "Username",
@@ -788,6 +1062,8 @@
 		"secretKey": "Secret access key",
 		"pathStyle": "Path-style addressing",
 		"pathStyleHint": "Keep on for R2 / MinIO; turn off for bucket subdomains.",
+		"gitRemote": "Repository URL",
+		"gitBranch": "Branch",
 		"noConditionalWrites": "This storage doesn't support conditional (atomic) writes, so sync falls back to plain uploads. Fine for single-device use; concurrent edits from multiple devices may need an extra sync round to converge.",
 		"saved": "Sync configured",
 		"disconnect": "Disconnect",
@@ -809,14 +1085,93 @@
 			"finalize": "Finalizing…"
 		},
 		"connect": "Connect",
+		"useAccount": "Sync with this account",
+		"space": "Sync to",
+		"spacePersonal": "Personal space",
+		"spaceTeam": "Current team",
+		"noTeam": "Open a team from your account before syncing to a team space.",
 		"save": "Save",
 		"autoSync": "Auto sync",
 		"interval": "Sync interval",
 		"intervalMinutes": "{{count}} min",
 		"scope": "Sync scope",
 		"scopeHint": "Notes, metadata and highlights always sync. Unselected content is neither uploaded nor downloaded — and is never deleted because of the filter. PDFs and LaTeX sources can be re-downloaded from their source at any time.",
+		"scopeHintGit": "Notes, metadata and highlights always sync. Unselected files are written to .gitignore and left out of new commits.",
 		"scopePdf": "PDFs",
 		"scopeSource": "LaTeX sources",
 		"scopeAttachments": "Attachments"
+	},
+	"cloudSync": {
+		"title": "Cloud sync",
+		"usedOf": "{{used}} used / {{limit}}",
+		"unlimited": "Unlimited",
+		"signInRequired": "Sign in to see your cloud sync capacity.",
+		"notIncluded": "The current plan does not include cloud sync."
+	},
+	"plugins": {
+		"install": "Install from folder…",
+		"localOnly": "Open a local Vault to manage plugins.",
+		"empty": "No plugins installed.",
+		"failed": "Plugin operation failed",
+		"configure": "Configure {{name}}",
+		"remove": "Uninstall {{name}}",
+		"enable": "Enable {{name}}",
+		"saveEnable": "Save and enable",
+		"permissions": {
+			"vault:read": "Read Vault files and papers",
+			"catalog:write": "Change paper tags and read status",
+			"vault:notes:write": "Write paper notes",
+			"vault:write": "Write Vault text and move papers"
+		},
+		"cancel": "Cancel"
+	},
+	"word": {
+		"damagedField": "This citation has an empty or damaged field result. Restore the document or reinsert the citation in a copy.",
+		"label": "Zotero Word plugin",
+		"search": "Search papers",
+		"pages": "Pages (for selected references)",
+		"style": "Citation style",
+		"styles": {
+			"apa": "APA 7",
+			"ieee": "IEEE",
+			"chicago": "Chicago author-date"
+		},
+		"cancel": "Cancel",
+		"apply": "Apply",
+		"working": "Updating Word…",
+		"noResults": "No papers found",
+		"actions": {
+			"addEditCitation": "Add / edit citation",
+			"addEditBibliography": "Add / update bibliography",
+			"setDocPrefs": "Document preferences",
+			"refresh": "Refresh citations"
+		},
+		"noDocument": "Open a document in Word first.",
+		"readOnly": "The Word document is read-only.",
+		"trackChanges": "Turn off Track Changes before using this prototype.",
+		"notesUnsupported": "This prototype supports body citations only, without footnotes or endnotes.",
+		"documentChanged": "The document changed. Run the Word command again.",
+		"selectionChanged": "The cursor moved. Run the Word command again.",
+		"insertFailed": "Word could not insert the citation field.",
+		"invalidPath": "Invalid Word driver path.",
+		"driverFailed": "Word automation failed.",
+		"timeout": "Word did not respond in time. Check the document before retrying.",
+		"platformUnsupported": "This prototype currently supports macOS and Windows.",
+		"foreignFields": "This document contains Zotero or unsupported citation fields. Use a new document for this prototype.",
+		"unknownStyle": "Unsupported citation style.",
+		"connectorRequired": "Enable Zotero Connector before enabling the Word integration.",
+		"localVaultRequired": "Open a local Vault first.",
+		"zoteroRunning": "Quit Zotero Desktop before enabling the Word integration.",
+		"busy": "A Word operation is already in progress.",
+		"expired": "The Word request expired. Run the command again.",
+		"disabled": "The Word integration is disabled.",
+		"commandUnsupported": "This Word command is not supported by the prototype.",
+		"collapseSelection": "Place the cursor at an insertion point without selecting text.",
+		"cursorInCitation": "Move the cursor outside the citation before inserting a bibliography.",
+		"vaultChanged": "The active Vault changed. Run the Word command again.",
+		"invalidSelection": "Select between 1 and 50 valid references.",
+		"noCitations": "Insert a citation before adding a bibliography.",
+		"permission": "Allow Agentero to control Microsoft Word in macOS System Settings → Privacy & Security → Automation.",
+		"failed": "Word integration failed: {{detail}}"
 	}
 }

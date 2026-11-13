@@ -9,22 +9,16 @@ permissions:
   contents: write
 
 jobs:
-  atomgit:
-    name: Sync release to AtomGit
-    needs: [installers, android, cli]
-    # Push access (write) is required to list the still-draft release via the
-    # releases list endpoint; the tag endpoint only returns published releases.
+  checks:
+    name: Validate release commit
+    uses: ./.github/workflows/ci.yml
     permissions:
-      contents: write
-    uses: ./.github/workflows/sync-atomgit-release.yml
-    with:
-      tag: ${{ github.ref_name }}
-    secrets:
-      ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
+      contents: read
 
   # Shared draft so installers + CLI can upload in parallel without racing create.
   prepare:
     name: Create draft release
+    needs: checks
     runs-on: ubuntu-latest
     steps:
       - name: Verify updater signing configuration
@@ -124,7 +118,7 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      # macOS: Developer ID signing + notarytool (see docs/development/macos-signing.md).
+      # macOS: Developer ID signing + notarytool (see docs/test/macos-signing.md).
       # Without APPLE_CERTIFICATE the build still runs unsigned (existing behavior).
       # Do NOT pass empty APPLE_TEAM_ID/APPLE_ID via the build env — empty strings make
       # Tauri/notarytool fail with "Team ID must be at least 3 characters".
@@ -189,6 +183,7 @@ jobs:
       - name: Build Tauri installers
         uses: tauri-apps/tauri-action@v1
         env:
+          VITE_AGENTERO_ACCOUNT_SURFACE: "0"
           # macos-latest runners have 7GB RAM, so Node's default ~2GB heap
           # limit is not enough for `vite build` on this bundle.
           NODE_OPTIONS: --max-old-space-size=6144
@@ -196,6 +191,13 @@ jobs:
           # PostHog project API key baked in at compile time (build.rs);
           # empty/absent secret compiles telemetry out. See docs/backend/telemetry.md.
           AGENTERO_POSTHOG_KEY: ${{ secrets.POSTHOG_KEY }}
+          # Optional. When all four are set, About feedback lands in that
+          # PostHog API survey. Absent secrets still build; feedback is sent
+          # as a `feedback submitted` activity event. See docs/backend/telemetry.md.
+          AGENTERO_POSTHOG_SURVEY_ID: ${{ secrets.POSTHOG_SURVEY_ID }}
+          AGENTERO_POSTHOG_SURVEY_KIND_ID: ${{ secrets.POSTHOG_SURVEY_KIND_ID }}
+          AGENTERO_POSTHOG_SURVEY_MESSAGE_ID: ${{ secrets.POSTHOG_SURVEY_MESSAGE_ID }}
+          AGENTERO_POSTHOG_SURVEY_CONTACT_ID: ${{ secrets.POSTHOG_SURVEY_CONTACT_ID }}
           # Built-in provider gateway key, baked in at compile time (build.rs);
           # empty/absent secret still builds, but ships without the built-in
           # provider, so verify it after release. See docs/backend/builtin-provider.md.
@@ -225,6 +227,24 @@ jobs:
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
           updaterJsonPreferNsis: true
+
+  # tauri-action writes api.github.com asset URLs into latest.json; anonymous
+  # API requests share a 60/hour per-IP quota, so updater downloads 403 behind
+  # shared NATs. Rewrite them to CDN download URLs once all installers are up.
+  updater-json:
+    name: Rewrite updater manifest
+    needs: installers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Point updater downloads at the release CDN
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: node scripts/rewrite-updater-json.mjs
 
   # Android ships its own signed APK into the same draft. Kept out of the
   # `installers` matrix because it needs the Android SDK/NDK and a keystore
@@ -400,27 +420,20 @@ jobs:
 
       # tauri.macos.conf.json lists pdfium/libpdfium.dylib under
       # bundle.macOS.frameworks; tauri-build hard-fails when the file is
-      # missing even when only compiling the headless CLI. This job has no
-      # Node setup, so download the binary directly (tag must stay in sync
-      # with scripts/prepare-pdfium.mjs).
+      # missing even when only compiling the headless CLI. The staging script
+      # owns the release tag and the download fallbacks.
+      - name: Setup Node.js for PDFium staging
+        if: runner.os == 'macOS'
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+
       - name: Stage PDFium for Tauri build-script
         if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="chromium/7897"
-          case "$(uname -m)" in
-            arm64 | aarch64) asset="pdfium-mac-arm64" ;;
-            *) asset="pdfium-mac-x64" ;;
-          esac
-          tmp="$(mktemp -d)"
-          url="https://github.com/run-llama/pdfium-binaries/releases/download/${tag/\//%2F}/${asset}.tgz"
-          echo "Downloading $url"
-          curl -fsSL "$url" | tar -xz -C "$tmp"
-          test -f "$tmp/lib/libpdfium.dylib"
-          mkdir -p src-tauri/pdfium
-          cp "$tmp/lib/libpdfium.dylib" src-tauri/pdfium/libpdfium.dylib
-          rm -rf "$tmp"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/prepare-pdfium.mjs
 
       - name: Build agentero CLI (release)
         run: cargo build -p agentero-cli --release

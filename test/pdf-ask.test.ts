@@ -13,7 +13,10 @@ import {
 	threadPreview,
 	threadTitle,
 } from "@/lib/pdf/ask";
-import { buildPdfAskPrompt } from "@/lib/pdf/ask/prompt";
+import {
+	buildPdfAskPrompt,
+	rememberPairedAskTranslation,
+} from "@/lib/pdf/ask/prompt";
 
 describe("pdf-ask schema", () => {
 	it("parses a valid thread", () => {
@@ -87,6 +90,36 @@ describe("pdf-ask schema", () => {
 		expect(parsePdfAskThread({ version: 2, id: "x" })).toBeNull();
 	});
 
+	it("keeps translated selection boxes and ignores an unusable list", () => {
+		const raw = {
+			version: 1,
+			kind: "ask",
+			id: "t1",
+			paperPath: "papers/1706.03762",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			status: "open",
+			anchor: {
+				page: 2,
+				rects: [{ x: 0.1, y: 0.2, w: 0.3, h: 0.05 }],
+				quote: "attention is all you need",
+				trigger: "selection",
+				translatedRects: [{ x: 0.2, y: 0.31, w: 0.18, h: 0.02 }],
+			},
+			messages: [],
+		};
+		expect(parsePdfAskThread(raw)?.anchor.translatedRects).toEqual([
+			{ x: 0.2, y: 0.31, w: 0.18, h: 0.02 },
+		]);
+		const broken = parsePdfAskThread({
+			...raw,
+			anchor: { ...raw.anchor, translatedRects: "nope" },
+		});
+		expect(broken).not.toBeNull();
+		expect(broken?.anchor.translatedRects).toBeUndefined();
+		expect(broken?.anchor.rects).toEqual(raw.anchor.rects);
+	});
+
 	it("builds an ask conversation card from Agent-panel selection turn", () => {
 		const thread = createAskThreadFromAgentSelection({
 			paperPath: "papers/transformer",
@@ -155,7 +188,7 @@ describe("pdf-ask schema", () => {
 });
 
 describe("pdf-ask prompt", () => {
-	it("includes page, quote, and question", () => {
+	it("asks the question without pasting the quote", () => {
 		const thread = createEmptyThread({
 			paperPath: "papers/x",
 			anchor: {
@@ -172,9 +205,32 @@ describe("pdf-ask prompt", () => {
 			createdAt: new Date().toISOString(),
 		});
 		const p = buildPdfAskPrompt(thread, "Explain");
-		expect(p).toContain("Page: 3");
-		expect(p).toContain("Transformer");
+		expect(p).not.toContain("Page: 3");
+		expect(p).not.toContain("Transformer");
 		expect(p).toContain("Explain");
+		expect(p).toContain("research context");
+	});
+
+	it("adds a session translation without writing it onto the thread", () => {
+		const thread = createEmptyThread({
+			paperPath: "papers/x",
+			anchor: {
+				page: 3,
+				rects: [{ x: 0, y: 0, w: 0.1, h: 0.1 }],
+				quote: "First sentence.",
+				trigger: "selection",
+			},
+		});
+		rememberPairedAskTranslation(thread.id, "第一句。");
+		thread.messages.push({
+			id: "u1",
+			role: "user",
+			content: "Explain",
+			createdAt: new Date().toISOString(),
+		});
+		const prompt = buildPdfAskPrompt(thread, "Explain");
+		expect(prompt).not.toContain("第一句。");
+		expect(JSON.stringify(thread)).not.toContain("第一句");
 	});
 
 	it("adds bounded visual instructions for a figure crop", () => {

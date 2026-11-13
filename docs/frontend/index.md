@@ -4,6 +4,8 @@ React 19 + TypeScript Webview UI。全局状态为按域 **zustand vanilla store
 
 > 整体架构与跨层工作流见 [../architecture.md](../architecture.md)。
 
+科研对象／结果表、字段编辑和 Notebook 实时引用见 [科研表格](research-tables.md)。
+
 ## 定位
 
 - 为人类提供审阅、编辑、导航界面；Host 负责磁盘、网络、索引与 ACP。
@@ -24,9 +26,9 @@ React 19 + TypeScript Webview UI。全局状态为按域 **zustand vanilla store
 |---|---|
 | Tailwind CSS 4 | 布局与 token |
 | shadcn/ui（radix-nova） | `src/components/ui/` |
-| AI Elements | Chat / Prompt / Sources / FileTree → `src/components/ai-elements/` |
+| shadcn AI Elements | `components/ui/` 上游基础件；`components/agent/` 业务组合；`sidebar/file-tree/file-tree-primitives.tsx` 文件树交互 |
 | streamdown | `MessageResponse` 流式 Markdown |
-| use-stick-to-bottom | 对话贴底 |
+| @shadcn/react | Message Scroller 对话跟底与滚动导航 |
 | Radix / Lucide | 可访问性与图标 |
 | react-resizable-panels | 左/右 collapsible 侧栏 |
 | dockview | 中间文档工作区 |
@@ -37,7 +39,7 @@ React 19 + TypeScript Webview UI。全局状态为按域 **zustand vanilla store
 
 动效约定：`index.css` `:root` 定义 motion token（`--motion-duration-fast: 150ms` 浮层进出、`--motion-duration-normal: 200ms` 布局编排、`--motion-ease-out`）；组件类对应 100=微反馈 / 150=浮层 / 200=布局。全局 `prefers-reduced-motion` 兜底关闭所有动效（`animate-spin` 除外）。
 
-该 CSS 兜底只覆盖 CSS transition/keyframes；JS 驱动的动效（`scrollIntoView` / 虚拟列表滚动 / `use-stick-to-bottom` 贴底 / `motion/react`）必须自行询问 `src/lib/core/motion.ts` 的 `prefersReducedMotion()` / `scrollBehavior()`，`motion/react` 组件用其 `useReducedMotion()`。
+该 CSS 兜底只覆盖 CSS transition/keyframes；JS 驱动的动效（`scrollIntoView` / 虚拟列表滚动 / Message Scroller 导航 / `motion/react`）必须自行询问 `src/lib/core/motion.ts` 的 `prefersReducedMotion()` / `scrollBehavior()`，`motion/react` 组件用其 `useReducedMotion()`。
 
 ### 领域库
 
@@ -97,10 +99,15 @@ UI (AI Elements: Conversation + Message + PromptInput + Sources)
 | 论文库 Library（含阅读热力条） | [library.md](library.md) |
 | 入库 UI | [paper-import.md](paper-import.md) |
 | Markdown 编辑 | [markdown.md](markdown.md) |
+| LaTeX 写作、编译与 SyncTeX | [latex.md](latex.md) |
+| 写作工作面 | [writing.md](writing.md) |
+| 写作模板与新增会议模板 | [writing-templates.md](writing-templates.md) |
 | PDF 阅读与划词 | [pdf.md](pdf.md) |
-| 网页论文阅读与划词（内置代理 + 选区桥） | [web-view.md](web-view.md) |
+| 应用内通用划词动作、来源与浮层生命周期 | [selection.md](selection.md) |
+| 网页论文阅读与划词（内置代理 + 选区桥）；本地 HTML 预览 | [web-view.md](web-view.md) |
 | PDF 版面分析（Figures / Tables / Algorithms / Formulas） | [pdf-layout-analysis.md](pdf-layout-analysis.md) |
 | Agent 面板 | [agent.md](agent.md) |
+| 知乎 Agent（内置，直答 / 检索） | [zhihu.md](zhihu.md) |
 | 移动端壳与 Bridge 客户端 | [mobile.md](mobile.md) |
 | 双链 UI | [wiki.md](wiki.md) |
 | 命令面板 | [command-palette.md](command-palette.md) |

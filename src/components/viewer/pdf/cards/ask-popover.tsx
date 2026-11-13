@@ -1,46 +1,72 @@
-import { MessageSquareIcon, MinusIcon, Pencil, Trash2Icon } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+	Maximize2Icon,
+	MessageSquareIcon,
+	Minimize2Icon,
+	MinusIcon,
+	Pencil,
+	Trash2Icon,
+} from "lucide-react";
+import {
+	type ReactNode,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
-
+import {
+	PromptInput,
+	PromptInputBody,
+	PromptInputSubmit,
+	PromptInputTextarea,
+} from "@/components/agent/composer/prompt-input";
+import { ContextSourceLinks } from "@/components/agent/context-source-links";
 import {
 	Message,
 	MessageAction,
 	MessageActions,
 	MessageContent,
 	MessageResponse,
-} from "@/components/ai-elements/message";
+} from "@/components/agent/message";
 import {
 	ChatGPTIcon,
 	ClaudeIcon,
 	openInChatGPT,
 	openInClaude,
-} from "@/components/ai-elements/open-in-chat";
-import {
-	PromptInput,
-	PromptInputBody,
-	PromptInputSubmit,
-	PromptInputTextarea,
-} from "@/components/ai-elements/prompt-input";
-import { Shimmer } from "@/components/ai-elements/shimmer";
+} from "@/components/agent/open-in-chat";
 import { Button } from "@/components/ui/button";
+import { Shimmer } from "@/components/ui/shimmer";
 import { SelectionCard } from "@/components/viewer/pdf/cards/selection-card";
-import type { ScreenPoint } from "@/components/viewer/pdf/types";
+import { isEditableClipboardTarget } from "@/components/viewer/pdf/host-dom";
+import type { CardScreenPoint } from "@/components/viewer/pdf/types";
 import { useImeGuard } from "@/hooks/use-ime-guard";
 import { cn } from "@/lib/core/utils";
-import { threadTitle } from "@/lib/pdf/ask/schema";
+import { threadHasUserQuestion, threadTitle } from "@/lib/pdf/ask/schema";
 import type { PdfAskThread } from "@/lib/pdf/ask/types";
 import {
 	findLastUserMessageIndex,
 	shouldRecallPreviousPrompt,
 } from "@/lib/ui/prompt-recall";
 
+/** An untouched Quick Chat draft opens smaller than the compact conversation. */
+const QUICK_CHAT_DRAFT_HEIGHT = 140;
+/** One line of the compact composer including vertical padding (px). */
+const QUICK_CHAT_COMPOSER_MIN_HEIGHT = 32;
+/** Three lines of the compact composer including vertical padding (px). */
+const QUICK_CHAT_COMPOSER_MAX_HEIGHT = 72;
+/** Keep the grow transition class for the 300ms CSS animation. */
+const QUICK_CHAT_GROW_MS = 400;
+
 type AskPopoverProps = {
+	source?: ReactNode;
 	thread: PdfAskThread;
 	/** Catalog title used to build the external "open in chat" query. */
 	paperTitle?: string;
 	/** Catalog arXiv / source link used in the external "open in chat" query. */
 	paperLink?: string;
-	screen: ScreenPoint;
+	screen: CardScreenPoint;
 	/** Match gutter pin side so the card stays next to the pin. */
 	preferRight?: boolean;
 	streaming: boolean;
@@ -53,8 +79,11 @@ type AskPopoverProps = {
 	 * `question` as a new turn (same rollback semantics as Agent chat).
 	 */
 	onResend?: (messageId: string, question: string) => void;
-	/** Collapse dialog; keep margin pin */
-	onHide: () => void;
+	/**
+	 * Collapse the dialog. The composer text travels with it: a started draft
+	 * keeps its pin/highlight and is restored when the card reopens.
+	 */
+	onHide: (draft?: string) => void;
 	/** Remove thread + pin permanently */
 	onDelete: () => void;
 	onStop?: () => void;
@@ -65,6 +94,7 @@ type AskPopoverProps = {
 };
 
 export function AskPopover({
+	source,
 	thread,
 	paperTitle,
 	paperLink,
@@ -83,15 +113,49 @@ export function AskPopover({
 }: AskPopoverProps) {
 	const { t } = useTranslation("viewer");
 	const title = threadTitle(thread, t("pdfAsk.newTitle"));
+	const hasQuestion = threadHasUserQuestion(thread);
+	// An error needs the normal body height to be readable, so it also ends the
+	// compact draft state.
+	const isDraft = !hasQuestion && !error;
+	const [expanded, setExpanded] = useState(false);
+	const [growingThreadId, setGrowingThreadId] = useState<string | null>(null);
+	const growing = growingThreadId === thread.id;
+	const [composerSize, setComposerSize] = useState<{
+		threadId: string;
+		height: number;
+	}>({ threadId: thread.id, height: QUICK_CHAT_COMPOSER_MIN_HEIGHT });
+	const composerHeight =
+		composerSize.threadId === thread.id
+			? composerSize.height
+			: QUICK_CHAT_COMPOSER_MIN_HEIGHT;
+	const draftHeight =
+		QUICK_CHAT_DRAFT_HEIGHT +
+		Math.max(0, composerHeight - QUICK_CHAT_COMPOSER_MIN_HEIGHT);
 	const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
 	const [editingText, setEditingText] = useState("");
 	const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+	const composerRef = useRef<HTMLTextAreaElement | null>(null);
+	/** Thread whose question was submitted; a pending run must not be discarded. */
+	const sentThreadRef = useRef<string | null>(null);
 	const scrollPortRef = useRef<HTMLDivElement | null>(null);
 	const scrolledForThreadRef = useRef<string | null>(null);
 	const {
 		isBlockedByIme: isEditBlockedByIme,
 		compositionProps: editCompositionProps,
 	} = useImeGuard();
+
+	/**
+	 * Closing an untouched card deletes it; a typed or already-submitted
+	 * question is kept together with its pin and selection highlight.
+	 */
+	const dismiss = useCallback(() => {
+		const draft = composerRef.current?.value.trim();
+		if (!hasQuestion && sentThreadRef.current !== thread.id && !draft) {
+			onDelete();
+			return;
+		}
+		onHide(draft || undefined);
+	}, [hasQuestion, thread.id, onDelete, onHide]);
 
 	/** Keep the first user turn in view on open — do not stick to the answer bottom. */
 	const userAnchorId = useMemo(() => {
@@ -151,6 +215,76 @@ export function AskPopover({
 		el.setSelectionRange(el.value.length, el.value.length);
 	}, [editingMessageId]);
 
+	// Opening Quick Chat puts the caret in the composer so the user can type
+	// immediately, and repeats when the card switches to another thread.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: refocus the composer when switching threads
+	useEffect(() => {
+		const el = composerRef.current;
+		if (!el) return;
+		el.focus();
+		el.setSelectionRange(el.value.length, el.value.length);
+	}, [thread.id]);
+
+	// Restore the composer height when the card opens with a saved draft.
+	useLayoutEffect(() => {
+		const el = composerRef.current;
+		if (!el) return;
+		el.style.height = "auto";
+		const height = Math.min(
+			el.scrollHeight || QUICK_CHAT_COMPOSER_MIN_HEIGHT,
+			QUICK_CHAT_COMPOSER_MAX_HEIGHT,
+		);
+		el.style.height = `${height}px`;
+		setComposerSize((prev) =>
+			prev.threadId === thread.id && prev.height === height
+				? prev
+				: { threadId: thread.id, height },
+		);
+	}, [thread.id]);
+
+	// Escape hides the card from anywhere outside an editable field. The
+	// composer / inline editor keep their own Escape handling, and another
+	// dialog or menu on top owns the key.
+	useEffect(() => {
+		const onKeyDown = (event: KeyboardEvent) => {
+			if (
+				event.key !== "Escape" ||
+				event.defaultPrevented ||
+				event.isComposing ||
+				event.repeat ||
+				event.altKey ||
+				event.ctrlKey ||
+				event.metaKey ||
+				event.shiftKey ||
+				isEditableClipboardTarget(event.target)
+			)
+				return;
+			const card = composerRef.current?.closest('[role="dialog"]');
+			const overlay =
+				event.target instanceof Element
+					? event.target.closest(
+							"[role='dialog'], [role='alertdialog'], [role='menu'], [role='listbox']",
+						)
+					: null;
+			if (overlay && overlay !== card) return;
+			event.preventDefault();
+			dismiss();
+		};
+		window.addEventListener("keydown", onKeyDown, true);
+		return () => window.removeEventListener("keydown", onKeyDown, true);
+	}, [dismiss]);
+
+	// Wait for the optimistic user turn before timing the draft → normal
+	// transition; the fallback clears the class if the send never lands.
+	useEffect(() => {
+		if (!growing) return;
+		const timer = setTimeout(
+			() => setGrowingThreadId(null),
+			hasQuestion ? QUICK_CHAT_GROW_MS : 2000,
+		);
+		return () => clearTimeout(timer);
+	}, [growing, hasQuestion]);
+
 	const startEditing = (messageId: string, text: string) => {
 		if (streaming || !onResend) return;
 		setEditingMessageId(messageId);
@@ -183,22 +317,45 @@ export function AskPopover({
 	return (
 		<SelectionCard
 			screen={screen}
-			width={360}
-			height={360}
+			width={expanded ? 720 : 360}
+			// An untouched draft is just the composer; the first question grows
+			// it to the normal conversation height.
+			height={expanded ? 600 : isDraft ? draftHeight : 360}
+			// Conversation UI stays at the app's body type scale, like the
+			// other floating selection cards.
 			// Fixed height so the nested scrollport has a definite viewport.
 			lockHeight
-			// Follow pin while scrolling; shrink height near edges instead of
-			// jumping the card far from the selection.
-			trackPin
+			resizable
+			resizeMinHeight={isDraft ? draftHeight : undefined}
+			// Drag from the title bar; once moved, the card stays put instead of
+			// following the source anchor, and expand/restore only resizes it.
+			draggable
+			showDragHandle={false}
 			preferRight={preferRight}
 			title={title}
-			icon={MessageSquareIcon}
+			icon={<MessageSquareIcon />}
 			ariaLabel={t("pdfAsk.dialogLabel")}
 			onPointerEnter={onPointerEnter}
 			onPointerLeave={onPointerLeave}
+			// Leave WebKit's native resize corner outside the footer composer.
+			className={cn(
+				"pb-3",
+				growing &&
+					"transition-[height,top] duration-300 ease-out motion-reduce:transition-none",
+			)}
 			// Body only constrains flex; messages own their own scrollport.
 			bodyClassName="min-h-0 overflow-hidden p-0"
 			actions={[
+				{
+					id: "resize",
+					label: t(expanded ? "pdfAsk.restoreSize" : "pdfAsk.expand"),
+					onClick: () => setExpanded((value) => !value),
+					icon: expanded ? (
+						<Minimize2Icon className="size-3.5" />
+					) : (
+						<Maximize2Icon className="size-3.5" />
+					),
+				},
 				{
 					label: t("pdfAsk.openInChatGPT"),
 					onClick: () => openInChatGPT(openInQuery),
@@ -217,33 +374,53 @@ export function AskPopover({
 				},
 				{
 					label: t("pdfAsk.hide"),
-					onClick: onHide,
+					onClick: dismiss,
 					icon: <MinusIcon className="size-3.5" />,
+					shortcut: "Escape",
 				},
 			]}
 			footer={
 				<PromptInput
 					key={`${thread.id}-${initialPrompt ?? ""}`}
 					className="w-full rounded-full border-border/80 bg-background shadow-none"
-					inputGroupClassName="overflow-visible"
+					inputGroupClassName="h-auto overflow-visible"
 					onSubmit={({ text }) => {
 						const q = text.trim();
 						if (streaming || !q || editingMessageId) return;
+						sentThreadRef.current = thread.id;
+						const composer = composerRef.current;
+						if (composer) composer.style.height = "";
+						if (isDraft) setGrowingThreadId(thread.id);
 						onSend(q);
 					}}
 				>
 					<PromptInputBody>
 						<div className="flex w-full items-center gap-1 px-1.5 py-0.5">
 							<PromptInputTextarea
+								ref={composerRef}
 								placeholder={t("pdfAsk.placeholder")}
-								defaultValue={initialPrompt}
+								defaultValue={thread.draft ?? initialPrompt}
 								disabled={streaming || Boolean(editingMessageId)}
 								rows={1}
-								className="min-h-8 max-h-8 flex-1 resize-none border-0 bg-transparent px-2 py-1.5 text-sm leading-5 shadow-none focus-visible:ring-0"
+								className="min-h-8 max-h-[4.5rem] flex-1 resize-none overflow-y-auto border-0 bg-transparent px-2 py-1.5 text-sm leading-5 shadow-none focus-visible:ring-0"
+								onChange={(event) => {
+									const el = event.currentTarget;
+									el.style.height = "auto";
+									const height = Math.min(
+										el.scrollHeight || QUICK_CHAT_COMPOSER_MIN_HEIGHT,
+										QUICK_CHAT_COMPOSER_MAX_HEIGHT,
+									);
+									el.style.height = `${height}px`;
+									setComposerSize((prev) =>
+										prev.threadId === thread.id && prev.height === height
+											? prev
+											: { threadId: thread.id, height },
+									);
+								}}
 								onKeyDown={(e) => {
 									if (e.key === "Escape") {
 										e.preventDefault();
-										onHide();
+										dismiss();
 										return;
 									}
 									// Empty input + ↑ → edit last user prompt (same as Agent chat).
@@ -267,6 +444,7 @@ export function AskPopover({
 			}
 		>
 			{/* Plain scroll — not StickToBottom (hover/open must not jump to reply end). */}
+			{source}
 			<div
 				ref={scrollPortRef}
 				className={cn(
@@ -370,14 +548,23 @@ export function AskPopover({
 										// Avoid live markdown reflow thrash while streaming;
 										// animate only the latest assistant turn.
 										<MessageResponse
+											className="[&_.katex]:inline-block [&_.katex]:max-w-full [&_.katex]:overflow-x-auto [&_.katex]:overflow-y-hidden [&_.katex]:align-middle"
 											isAnimating={
 												streaming &&
 												from === "assistant" &&
 												m.id === thread.messages[thread.messages.length - 1]?.id
 											}
+											enableOpenUiBlocks={from === "assistant"}
 										>
 											{m.content}
 										</MessageResponse>
+									) : null}
+									{from === "assistant" && m.sources?.length ? (
+										<ContextSourceLinks
+											sources={m.sources.flatMap((source) =>
+												source.uri ? [source.uri] : [],
+											)}
+										/>
 									) : null}
 								</MessageContent>
 								{from === "user" && onResend && !streaming ? (

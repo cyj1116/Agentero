@@ -12,6 +12,7 @@
 	},
 	"permission": {
 		"title": "Agent permission",
+		"remoteHost": "Remote host: {{host}}",
 		"deny": "Deny",
 		"kind": {
 			"allowOnce": "Allow once",
@@ -19,6 +20,24 @@
 			"rejectOnce": "Reject once",
 			"rejectAlways": "Always reject"
 		}
+	},
+	"delegate": {
+		"targets": "Remote vaults",
+		"result": "Remote result",
+		"cancel": "Cancel remote run",
+		"run": "{{host}} · {{agent}} · {{status}}",
+		"status": {
+			"running": "Running",
+			"completed": "Done",
+			"failed": "Failed",
+			"cancelled": "Cancelled"
+		}
+	},
+	"piTrust": {
+		"title": "Pi has not loaded this Vault's project resources",
+		"description": "Pi needs folder trust before it can load skills.",
+		"action": "Trust this Vault",
+		"dismiss": "Dismiss"
 	},
 	"switchAgent": "Switch ACP agent",
 	"configBar": {
@@ -28,7 +47,11 @@
 		"summarizePaper": "Summarize the open paper",
 		"askLibrary": "Ask a question across my library",
 		"listClaims": "List key claims and evidence",
-		"draftRelatedWork": "Draft a Related Work section"
+		"draftRelatedWork": "Draft a Related Work section",
+		"continueManuscript": "Continue this manuscript from where it stops. Match its LaTeX and voice.",
+		"tightenProse": "Tighten the prose of the section I am editing. Keep the claims and the citations.",
+		"pressArgument": "Point out the weak spots in the argument and say what to change in the source.",
+		"citeFromLibrary": "Draft the next paragraph from papers in my library, and cite them."
 	},
 	"history": {
 		"aria": "Open chat history",
@@ -37,6 +60,12 @@
 		"description": "Recent ACP sessions in this chat.",
 		"empty": "No sessions yet.",
 		"restoring": "Restoring session…",
+		"rename": "Rename",
+		"renameAria": "Conversation title",
+		"delete": "Delete",
+		"deleteConfirmTitle": "Delete this conversation?",
+		"deleteFailed": "Could not delete this conversation.",
+		"deleteAgentFailed": "Hidden here. The agent kept its own copy.",
 		"status": {
 			"running": "Running",
 			"completed": "Completed",
@@ -56,7 +85,14 @@
 		"placeholder": "How can I help you today?",
 		"queueLabel": "Queued",
 		"queueRemove": "Remove from queue",
-		"contextInstruction": "Read these Vault files before answering when relevant:",
+		"paperContext": {
+			"heading": "Current paper (for reference):",
+			"title": "Title",
+			"authors": "Authors",
+			"venue": "Venue",
+			"year": "Year",
+			"abstract": "Abstract"
+		},
 		"plazaContextInstruction": "Plaza entries referenced with @ (not yet in the Vault):",
 		"plazaEntryUnavailable": "Entry metadata is unavailable (no longer in the Plaza cache). Ask the user to re-reference it from the Plaza tab.",
 		"plazaScratchInstruction": "Full texts are provided as read-only scratch copies outside the Vault. Read the listed files directly; do not download papers or write anything into the Vault unless the user explicitly asks to import a paper.",
@@ -64,15 +100,14 @@
 		"plazaCollectionInstruction": "Above is the abstract catalog of today's recommended papers. Triage from the abstracts alone: if filtering / comparing is enough to answer, give the final report directly. Only when a question requires deep reading, output `NEED_FULLTEXT <arXiv id> ...` (at most {{max}} ids) as the FIRST line of your reply and stop — the system will supply those full texts automatically. Do not fetch or download these papers yourself.",
 		"plazaFulltextFollowup": "Full texts have been retrieved (see context). Please complete the final report based on them.",
 		"resizeHandle": "Resize composer height",
+		"openMention": "Open {{title}}",
 		"removeContext": "Remove {{path}} from context",
 		"removeSkill": "Remove ${{skill}} from context",
-		"removeSelection": "Remove selected text from context",
 		"selection": "Selection",
 		"selectionChip": "{{title}}",
 		"selectionChipWithPage": "{{title}}:p.{{page}}",
 		"selectionChipWithLine": "{{title}} line {{from}}",
 		"selectionChipWithLines": "{{title}} lines {{from}}-{{to}}",
-		"removeVisualDraft": "Remove visual annotation from context",
 		"visualAnnotation": "Visual annotation",
 		"visualAnnotationPage": "p.{{page}}",
 		"visualAnnotationsTitle": "Visual annotations ({{count}})",
@@ -113,7 +148,20 @@
 	"empty": {
 		"title": "Chat with your vault",
 		"description": "Messages go to your ACP agent. Click the agent name above to switch backends.",
+		"writingDescription": "The open manuscript is attached. Select a passage in the source or the PDF to ask about it.",
 		"waiting": "Waiting for agent…"
+	},
+	"zhihuDiscussions": {
+		"noPaper": "Open a paper to see what Zhihu is saying about it.",
+		"noSecret": "No Zhihu Access Secret yet. Add one in Settings → Agent → Zhihu.",
+		"loading": "Searching Zhihu…",
+		"empty": "No related discussions found on Zhihu.",
+		"note": "Title search on Zhihu — results may be unrelated.",
+		"retry": "Retry",
+		"refresh": "Refresh",
+		"answer": "Answer",
+		"article": "Article",
+		"votes": "{{votes}} upvotes"
 	},
 	"thinking": "Thinking…",
 	"working": "Working…",
@@ -125,7 +173,9 @@
 		"starting": "Starting agent…",
 		"waitingModel": "Waiting for model…",
 		"reconnecting": "Upstream reconnecting",
-		"elapsed": "{{count}}s"
+		"elapsed": "{{count}}s",
+		"expandProcess": "Show live process",
+		"collapseProcess": "Collapse live process"
 	},
 	"copy": "Copy",
 	"copied": "Copied",
@@ -142,15 +192,54 @@
 		"defaultTitle": "Tool",
 		"failed": "Tool failed"
 	},
+	"uiBlock": {
+		"streaming": "Building UI block…",
+		"invalid": "This UI block uses unsupported components or props. Showing its source instead.",
+		"tooLarge": "This UI block is too large to render safely. Showing its source instead.",
+		"incomplete": "This UI block did not finish. Showing its source instead.",
+		"empty": "This UI block has no content to render. Showing its source instead.",
+		"tableEmpty": "No rows.",
+		"chartEmpty": "No data.",
+		"chartAria": "Bar chart: {{title}}",
+		"lineChartAria": "Line chart: {{title}}",
+		"openPaper": "Open paper",
+		"openSource": "Open source",
+		"page": "p. {{page}}",
+		"paperStatus": {
+			"unread": "Unread",
+			"reading": "Reading",
+			"read": "Read",
+			"queued": "Queued"
+		},
+		"figureKind": {
+			"figure": "Figure",
+			"table": "Table",
+			"formula": "Equation",
+			"algorithm": "Algorithm",
+			"section": "Section"
+		},
+		"claimStatus": {
+			"supports": "Supports",
+			"contradicts": "Contradicts",
+			"mixed": "Mixed",
+			"unclear": "Unclear"
+		},
+		"stepsEmpty": "No steps."
+	},
 	"askUserQuestion": {
 		"submit": "Submit",
 		"submitted": "Submitted",
 		"cancel": "Cancel",
 		"prev": "Back",
 		"next": "Next",
+		"skip": "Skip",
+		"answerRequired": "Choose an answer or enter a response.",
 		"progress": "{{current}} / {{total}}",
 		"freeTextPlaceholder": "Type your answer",
+		"other": "Other",
 		"pendingInComposer": "Answer in the questionnaire below",
+		"noAnswer": "No answer",
+		"cancelled": "Cancelled",
 		"keyboardHint": "↑↓ options · Space select · Enter confirm",
 		"keyboardHintMulti": "↑↓ options · Space select · Enter next · ←→ pages",
 		"collapse": "Collapse questionnaire",

@@ -24,10 +24,12 @@ import {
 	resolvePapersParentDir,
 } from "@/lib/paper";
 import {
+	copyPaperFolder,
 	type PaperMetaPatch,
 	rescanPapers,
 	resolveIdentifierMetadata,
 	setPaperTags,
+	syncPublication,
 	updatePaperMeta,
 } from "@/lib/paper/api";
 import {
@@ -49,6 +51,7 @@ import { joinVaultPath, readVaultFile } from "@/lib/vault";
 import { isRemoteVaultHandle } from "@/lib/vault/remote/remote-vault";
 import { getVaultPath, refreshTree, vaultStore } from "@/lib/vault/store";
 import { toVaultRelative } from "@/lib/wiki";
+import { rebuildWikiAndNotify } from "@/lib/wiki/store";
 import { openPaper, syncUpdatedPaperTabs } from "@/lib/workspace/actions";
 import {
 	refreshTabNotes,
@@ -103,7 +106,7 @@ export async function rescanLibraryPapers(): Promise<void> {
 		if (n > 0) {
 			notifySuccess(i18n.t("sidebar:papersLibrary.rescanned", { count: n }));
 		} else {
-			notifyWarning(i18n.t("sidebar:papersLibrary.rescanEmpty"));
+			notifySuccess(i18n.t("sidebar:papersLibrary.rescanEmpty"));
 		}
 	} catch (e) {
 		notifyError(
@@ -238,6 +241,55 @@ export async function downloadPaperAssetsAction(node: FileNode): Promise<void> {
  * Library-table row action: re-download assets (PDF / TeX) from the paper's
  * upstream source — the row for papers synced without bulky attachments.
  */
+/**
+ * Duplicate library papers into one `papers/` folder ("copy to folder").
+ *
+ * Batch-safe: a paper whose target already exists only fails that paper, and
+ * the summary toast reports the counts. The library is refreshed so the copies
+ * appear as their own rows (same logical id, different path).
+ */
+export async function copyLibraryPapersTo(
+	papers: PaperMetadata[],
+	destParentRel: string,
+): Promise<void> {
+	const vaultPath = getVaultPath();
+	if (!vaultPath) return;
+	if (isRemoteVaultHandle(vaultPath)) {
+		notifyError(i18n.t("sidebar:fileTree.copyDesktopOnly"));
+		return;
+	}
+	const rels = papers
+		.map((paper) => paper.path?.replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""))
+		.filter((rel): rel is string => Boolean(rel));
+	if (rels.length === 0) return;
+	let copied = 0;
+	let failed = 0;
+	for (const rel of rels) {
+		try {
+			await copyPaperFolder(vaultPath, rel, destParentRel);
+			copied++;
+		} catch {
+			failed++;
+		}
+	}
+	await refreshTree(vaultPath);
+	await refreshLibrary();
+	if (copied > 0) await rebuildWikiAndNotify(vaultPath);
+	if (copied > 0) {
+		notifySuccess(
+			i18n.t("sidebar:papersLibrary.copy.copied", {
+				count: copied,
+				folder: destParentRel || "papers",
+			}),
+		);
+	}
+	if (failed > 0) {
+		notifyWarning(
+			i18n.t("sidebar:papersLibrary.copy.failed", { count: failed }),
+		);
+	}
+}
+
 export async function downloadLibraryPaper(
 	paper: PaperMetadata,
 ): Promise<void> {
@@ -424,14 +476,15 @@ export async function paperMetaChange(
 			path,
 			extra: { fields: Object.keys(patch) },
 		});
+		// Host returns the full record; omitted optional fields were cleared.
 		setLibraryPapers((prev) =>
 			prev.map((p) => {
 				const key = p.path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-				return key === path ? { ...p, ...updated } : p;
+				return key === path ? { ...updated, has_pdf: p.has_pdf } : p;
 			}),
 		);
 		syncUpdatedPaperTabs(vaultPath, path, updated, paperMeta.id);
-		return { ...paperMeta, ...updated };
+		return updated;
 	} catch (e) {
 		notifyError(errorText(e));
 		return null;
@@ -439,14 +492,16 @@ export async function paperMetaChange(
 }
 
 /**
- * Re-resolve external metadata for the given papers and overwrite catalog fields
- * where the provider returned a non-empty value (library header refresh button).
+ * Sync publication information for the given papers: re-resolve external
+ * metadata when a DOI/arXiv/title is available, then let the Host refresh the
+ * `#submitted:` projection and EasyScholar metrics in one pass.
+ *
  * Runs as one `metadataRefresh` renderer batch job (executor in
  * `library-tasks.ts`): the paper list travels in the job params, progress is
- * reported per item (N/M), cancellation routes through the panel, and partial
+ * reported per item, cancellation routes through the panel, and partial
  * failures surface on the job row.
  */
-export async function refreshLibraryMetadata(
+export async function syncLibraryPublication(
 	vaultPath: string | null | undefined,
 	targets: PaperMetadata[],
 ): Promise<void> {
@@ -457,7 +512,10 @@ export async function refreshLibraryMetadata(
 			query: p.doi?.trim() || p.arxiv_id?.trim() || p.title?.trim() || "",
 		}))
 		.filter((p) => p.path && p.query);
-	if (papers.length === 0) {
+	const syncPaths = targets
+		.map((p) => p.path?.trim())
+		.filter((path): path is string => Boolean(path));
+	if (papers.length === 0 && syncPaths.length === 0) {
 		notifyError(i18n.t("sidebar:papersLibrary.refreshMetadataNoTargets"));
 		return;
 	}
@@ -466,7 +524,7 @@ export async function refreshLibraryMetadata(
 			kind: "metadataRefresh",
 			vaultPath,
 			path: "",
-			params: { papers },
+			params: { papers, syncPaths },
 		});
 	} catch (e) {
 		notifyError(errorText(e));
@@ -523,6 +581,15 @@ export async function refreshPaperMetadata(
 			notifySuccess(i18n.t("sidebar:papersLibrary.refreshMetadataDone"));
 		} else {
 			notifyWarning(i18n.t("sidebar:papersLibrary.refreshMetadataEmpty"));
+		}
+		try {
+			await syncPublication(vaultPath, [paper.path]);
+			scheduleLibraryRefresh();
+		} catch (e) {
+			logger.warn("publication sync after single refresh failed", {
+				path: paper.path,
+				error: errorText(e),
+			});
 		}
 	} catch (e) {
 		logger.error("refresh paper metadata failed", {

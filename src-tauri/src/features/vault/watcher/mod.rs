@@ -111,6 +111,7 @@ impl FsWatchController {
                 // events are pending — timeouts never run when the queue is empty.
                 let mut pending: Vec<Event> = Vec::new();
                 let mut deadline: Option<Instant> = None;
+                let mut burst_at: Option<Instant> = None;
                 loop {
                     let recv = match deadline {
                         None => match rx.recv() {
@@ -135,6 +136,15 @@ impl FsWatchController {
                         Err(()) => break,
                         Ok(None) => {
                             if !pending.is_empty() {
+                                if let Some(started) = burst_at.take() {
+                                    crate::core::perf::record(
+                                        "fs_watch_wait",
+                                        started.elapsed().as_micros(),
+                                        true,
+                                        "host",
+                                        "kind=wait",
+                                    );
+                                }
                                 let batch = std::mem::take(&mut pending);
                                 for payload in payloads_from_events(batch) {
                                     invalidate_caps_for_paths(&app, &watch_root, &payload.paths);
@@ -157,6 +167,10 @@ impl FsWatchController {
                             deadline = None;
                         }
                         Ok(Some(Ok(event))) => {
+                            note_markdown_for_rename(&app, &watch_root, &event);
+                            if burst_at.is_none() {
+                                burst_at = Some(Instant::now());
+                            }
                             pending.push(event);
                             deadline = Some(Instant::now() + DEBOUNCE);
                         }
@@ -246,6 +260,27 @@ fn caps_paper_dirs(vault_root: &str, path: &str) -> Vec<String> {
         current = parent;
     }
     dirs
+}
+
+/// Record Markdown writes before the UI debounce, without taking the wiki
+/// index lock. Rename planning re-reads just these paths, including saves
+/// whose watcher echo deliberately does not rebuild the index.
+fn note_markdown_for_rename(app: &AppHandle, vault: &str, event: &Event) {
+    if event.paths.is_empty() {
+        return;
+    }
+    let Some(state) = app.try_state::<crate::features::markdown::wiki::WikiIndexState>() else {
+        return;
+    };
+    for path in &event.paths {
+        let Some(text) = path.to_str() else {
+            continue;
+        };
+        if is_ignored(text) || is_agentero_atomic_temp(text) {
+            continue;
+        }
+        state.enqueue_saved_source(vault, text);
+    }
 }
 
 /// Drop cached `PaperCaps` for folders an external write touched, so the next

@@ -1,7 +1,7 @@
 //! Multi-window helpers.
 
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, EventTarget, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::core::log_util::OpTimer;
 
@@ -21,9 +21,11 @@ const TRAFFIC_LIGHT_X: f64 = 14.0;
 const SETTINGS_TRAFFIC_LIGHT_Y: f64 = 16.0;
 
 pub const SETTINGS_WINDOW_LABEL: &str = "settings";
+pub const SETTINGS_SECTION_REQUESTED_EVENT: &str = "settings:section-requested";
+pub const SETTINGS_VAULT_REQUESTED_EVENT: &str = "settings:vault-requested";
 
 /// Broadcast when a singleton child window closes (or fails to build).
-/// Wire naming follows docs/development/lifecycle-events.md (`domain:event`);
+/// Wire naming follows docs/architecture.md (`domain:event`);
 /// this is a window signal, not a lifecycle fact event.
 pub const WINDOW_CLOSED_EVENT: &str = "window:closed";
 
@@ -38,6 +40,59 @@ struct WindowClosedPayload<'a> {
 /// Emit `window:closed` with `kind: "settings" | "feature"` (+ `view` for feature).
 pub fn emit_window_closed(app: &AppHandle, kind: &str, view: Option<&str>) {
     let _ = app.emit(WINDOW_CLOSED_EVENT, WindowClosedPayload { kind, view });
+}
+
+/// Bring an existing singleton window back to the front, restoring it if the
+/// user minimized it.
+///
+/// `set_focus` alone is not enough on Windows: tao only calls
+/// `SetForegroundWindow` for a window that is visible and not minimized, so a
+/// minimized Settings / feature / document window silently ignores the click.
+/// `unminimize` and `show` are queued onto the event loop when called from an
+/// async command, so a `set_focus` right after them would still read the stale
+/// minimized state. Run the sequence on the main thread, where each call is
+/// applied to the window state before the next one reads it. macOS and Linux
+/// keep plain `set_focus` — their implementations already deminiaturize and
+/// raise the window.
+fn raise_existing_window(window: &tauri::WebviewWindow) {
+    #[cfg(windows)]
+    {
+        let win = window.clone();
+        let _ = window.run_on_main_thread(move || {
+            let _ = win.unminimize();
+            let _ = win.show();
+            let _ = win.set_focus();
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = window.set_focus();
+}
+
+/// Enables macOS native fullscreen space and window tiling (Move & Resize).
+///
+/// `setCollectionBehavior:` must run on the main thread: AppKit routes it
+/// through its window-management coordinator, which traps (`EXC_BREAKPOINT`)
+/// when called from an async command thread and takes the whole app down
+/// before the new window ever shows. `window_new` / `doc_window_open` are
+/// `async` (see [`window_new`]), so hop back to the main thread with
+/// `run_on_main_thread`.
+#[cfg(target_os = "macos")]
+pub fn enable_window_tiling(window: &tauri::WebviewWindow) {
+    let window = window.clone();
+    let scheduler = window.clone();
+    let _ = scheduler.run_on_main_thread(move || {
+        use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
+        let Ok(ptr) = window.ns_window() else {
+            return;
+        };
+        let ns_win = unsafe { (ptr as *mut NSWindow).as_ref() };
+        if let Some(ns_win) = ns_win {
+            let mut behavior = ns_win.collectionBehavior();
+            behavior |= NSWindowCollectionBehavior::FullScreenPrimary
+                | NSWindowCollectionBehavior::FullScreenAllowsTiling;
+            ns_win.setCollectionBehavior(behavior);
+        }
+    });
 }
 
 /// Open a fresh Agentero window without restoring the last vault (`?fresh=1`).
@@ -55,19 +110,19 @@ pub async fn window_new(app: AppHandle) -> Result<(), String> {
     let op = OpTimer::start("window_new");
     let label = format!("agentero-{}", uuid::Uuid::new_v4().simple());
 
-    // Main window uses tauri.conf.json `dragDropEnabled: false` so HTML5
-    // DnD works (vault moves, tab reorder, Library/composer file drops).
+    // Windows/macOS main windows use `dragDropEnabled: false` for HTML5
+    // DnD (vault moves, tab reorder, Library/composer file drops). Linux
+    // enables native GTK file paths as a fallback for empty WebKit FileLists.
     // On Windows, Tauri native drag-drop swallows HTML5 dragover/drop.
     // Frontend preventDefaults leftover file drops so the webview never
     // navigates to a dropped PDF.
-    // WebviewWindowBuilder in this Tauri version has no drag_drop_enabled();
-    // secondary windows inherit platform defaults — frontend still preventDefaults.
+    // Secondary windows inherit platform defaults — frontend still preventDefaults.
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut builder =
         WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html?fresh=1".into()))
             .title("Agentero")
             .inner_size(1280.0, 800.0)
-            .min_inner_size(960.0, 520.0)
+            .min_inner_size(700.0, 520.0)
             .resizable(true);
 
     #[cfg(target_os = "macos")]
@@ -96,6 +151,8 @@ pub async fn window_new(app: AppHandle) -> Result<(), String> {
             return Err(e.to_string());
         }
     };
+    #[cfg(target_os = "macos")]
+    enable_window_tiling(&window);
     let _ = window.set_focus();
 
     // Native menu is macOS-only; other platforms drive actions from the React
@@ -116,20 +173,42 @@ pub async fn window_new(app: AppHandle) -> Result<(), String> {
 #[specta::specta]
 pub async fn settings_window_open(
     app: AppHandle,
-    section: String,
+    section: Option<String>,
     vault_path: Option<String>,
 ) -> Result<(), String> {
     let op = OpTimer::start("settings_window_open");
 
     if let Some(win) = app.get_webview_window(SETTINGS_WINDOW_LABEL) {
-        let _ = win.set_focus();
+        if let Some(section) = section {
+            win.emit_to(
+                EventTarget::webview_window(SETTINGS_WINDOW_LABEL),
+                SETTINGS_SECTION_REQUESTED_EVENT,
+                section,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        // The window is a singleton; reuse must retarget it at the Vault that
+        // asked for it, otherwise the sync pane keeps editing the first vault.
+        if let Some(path) = vault_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            win.emit_to(
+                EventTarget::webview_window(SETTINGS_WINDOW_LABEL),
+                SETTINGS_VAULT_REQUESTED_EVENT,
+                path,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        raise_existing_window(&win);
         op.finish_ok_extra("existing");
         return Ok(());
     }
 
     let mut url = format!(
         "index.html?window=settings&section={}",
-        urlencoding::encode(&section)
+        urlencoding::encode(section.as_deref().unwrap_or("general"))
     );
     if let Some(path) = vault_path {
         url.push_str(&format!("&vault_path={}", urlencoding::encode(&path)));
@@ -173,7 +252,18 @@ pub async fn settings_window_open(
 }
 
 /// Valid right-rail feature views that may open as a singleton native window.
-const FEATURE_VIEWS: &[&str] = &["agent", "backlinks", "annotations", "references", "figures"];
+pub(crate) const FEATURE_VIEWS: &[&str] =
+    &["agent", "backlinks", "annotations", "references", "figures"];
+
+/// Feature views the desktop frontend can actually pop out today (see
+/// `FeatureViewType` in `lib/shell/ui-store`).
+pub(crate) const UI_OPENABLE_FEATURE_VIEWS: &[&str] = &["agent", "annotations"];
+
+/// True for a window id the `ui:request` `open-window` action may target: the
+/// singleton Settings window or an openable right-rail feature window.
+pub(crate) fn is_known_window(view: &str) -> bool {
+    view == "settings" || UI_OPENABLE_FEATURE_VIEWS.contains(&view)
+}
 
 pub fn feature_window_label(view: &str) -> String {
     format!("feature-{view}")
@@ -221,7 +311,7 @@ pub async fn feature_window_open(
     let label = feature_window_label(&view);
 
     if let Some(win) = app.get_webview_window(&label) {
-        let _ = win.set_focus();
+        raise_existing_window(&win);
         op.finish_ok_extra(format!("existing view={view}"));
         return Ok(());
     }
@@ -312,7 +402,7 @@ pub async fn doc_window_open(
     let label = doc_window_label(&path);
 
     if let Some(win) = app.get_webview_window(&label) {
-        let _ = win.set_focus();
+        raise_existing_window(&win);
         op.finish_ok_extra(format!("existing label={label}"));
         return Ok(());
     }
@@ -366,6 +456,8 @@ pub async fn doc_window_open(
             return Err(e.to_string());
         }
     };
+    #[cfg(target_os = "macos")]
+    enable_window_tiling(&window);
     let _ = window.set_focus();
 
     op.finish_ok_extra(format!("new label={label}"));

@@ -3,9 +3,12 @@ pub mod acp;
 mod acp_tests;
 pub mod citation;
 pub mod commands;
+mod context_turn;
+pub mod delegate;
 pub mod doctor;
 pub mod doctor_agents;
 pub mod models;
+pub mod pi_trust;
 pub mod prompt;
 pub mod registry;
 pub mod remote_host;
@@ -23,6 +26,6 @@ pub use runtime::{
     PermissionGate,
 };
 pub use session::{
-    list_acp_sessions, load_acp_session, new_ids, run_once, warm_agent, AgentWarmPool,
-    RunOnceParams,
+    delete_acp_session, list_acp_sessions, load_acp_session, new_ids, run_once, warm_agent,
+    AgentWarmPool, RunOnceParams,
 };

@@ -1,13 +1,22 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { EmbedStatus } from "@/components/editor/embeds/embed-status";
 import { useMarkdownExportMode } from "@/components/editor/markdown-export-mode-context";
 import { PdfViewer } from "@/components/viewer";
+import { useVaultStore } from "@/hooks/use-app-stores";
+import { resolvePdfCitation } from "@/lib/agent/api";
+import { errorText } from "@/lib/core/error";
 import { createKeyedCache } from "@/lib/core/keyed-cache";
+import { notifyError } from "@/lib/core/notify";
 import { cn } from "@/lib/core/utils";
-import { localFileToArrayBuffer } from "@/lib/paper/media";
+import { paperDirFromPath } from "@/lib/paper/detect";
+import { findLocalPdfPath, localFileToArrayBuffer } from "@/lib/paper/media";
+import { layoutKindFromCitationFragment } from "@/lib/pdf/layout/store";
+import type { PdfNavigationTarget } from "@/lib/pdf/pending-pdf-page";
+import { normalizePathKey, vaultRelativePath } from "@/lib/vault/path";
+import { type LinkFragment, wikiFragmentSuffix } from "@/lib/wiki/api";
 import { imageMimeFromPath, isPlainPdfPath } from "@/lib/workspace/viewer";
 
 type WikiAttachmentEmbedProps = {
@@ -16,6 +25,9 @@ type WikiAttachmentEmbedProps = {
 	targetPath: string;
 	revision: number;
 	imageSize?: string | null;
+	vaultPath?: string | null;
+	fragment?: LinkFragment | null;
+	locateRequest?: number;
 };
 
 type AttachmentState =
@@ -111,12 +123,88 @@ export function WikiAttachmentEmbed({
 	targetPath,
 	revision,
 	imageSize,
+	vaultPath,
+	fragment,
+	locateRequest,
 }: WikiAttachmentEmbedProps) {
 	const { t } = useTranslation("editor");
+	const instanceId = useId();
 	const exportMode = useMarkdownExportMode();
+	const citationSource =
+		kind === "pdf" && fragment && !exportMode
+			? `${targetPath}${wikiFragmentSuffix(fragment)}`
+			: null;
+	const citationKey = citationSource
+		? JSON.stringify([vaultPath, citationSource, revision])
+		: null;
+	const [citation, setCitation] = useState<{
+		key: string;
+		target: PdfNavigationTarget | null;
+	} | null>(null);
+
+	useEffect(() => {
+		if (!citationKey || !citationSource || !vaultPath) return;
+		let cancelled = false;
+		void resolvePdfCitation(vaultPath, citationSource).then(
+			(target) => {
+				if (cancelled) return;
+				setCitation({
+					key: citationKey,
+					target: {
+						page: target.pageIndex + 1,
+						region: {
+							id: target.regionId,
+							pageIndex: target.pageIndex,
+							bbox: target.bbox,
+							kind: layoutKindFromCitationFragment(target.fragment),
+						},
+					},
+				});
+			},
+			(error) => {
+				if (cancelled) return;
+				setCitation({ key: citationKey, target: null });
+				notifyError(t("embed.error"), { description: errorText(error) });
+			},
+		);
+		return () => {
+			cancelled = true;
+		};
+	}, [citationKey, citationSource, vaultPath, t]);
 	const expandEmbeds = exportMode?.expandEmbeds === true;
 	const dimensions = parseWikiImageEmbedDimensions(imageSize);
 	const requestKey = attachmentRequestKey(kind, absoluteTarget, revision);
+	const paperFolders = useVaultStore((state) => state.paperFolders);
+	const paperRoot =
+		kind === "pdf" && vaultPath
+			? paperDirFromPath(absoluteTarget, paperFolders)
+			: null;
+	const paperContextKey =
+		paperRoot && !exportMode ? JSON.stringify([requestKey, paperRoot]) : null;
+	const [paperContext, setPaperContext] = useState<{
+		key: string;
+		path: string | null;
+	} | null>(null);
+	useEffect(() => {
+		if (!paperContextKey || !paperRoot) return;
+		let cancelled = false;
+		void findLocalPdfPath(paperRoot).then((primaryPdf) => {
+			if (cancelled) return;
+			setPaperContext({
+				key: paperContextKey,
+				path:
+					primaryPdf &&
+					normalizePathKey(primaryPdf) === normalizePathKey(absoluteTarget)
+						? paperRoot
+						: null,
+			});
+		});
+		return () => {
+			cancelled = true;
+		};
+	}, [paperContextKey, paperRoot, absoluteTarget]);
+	const paperAbsPath =
+		paperContext?.key === paperContextKey ? paperContext?.path : null;
 	const [load, setLoad] = useState<CachedAttachmentLoad>(() => {
 		const bytes = attachmentCache.get(requestKey);
 		return {
@@ -234,12 +322,35 @@ export function WikiAttachmentEmbed({
 			</span>
 		);
 	}
+	if (citationKey) {
+		if (!vaultPath || (citation?.key === citationKey && !citation.target)) {
+			return <EmbedStatus message={t("embed.error")} />;
+		}
+		if (citation?.key !== citationKey) {
+			return <EmbedStatus message={t("embed.loading")} />;
+		}
+	}
+	if (paperContextKey && paperContext?.key !== paperContextKey) {
+		return <EmbedStatus message={t("embed.loading")} />;
+	}
 	return (
 		<PdfViewer
 			source={null}
 			sourceBytes={state.bytes}
-			docId={`wiki-embed:${targetPath}:${revision}`}
-			plainViewer={isPlainPdfPath(targetPath)}
+			docId={`wiki-embed:${instanceId}:${targetPath}:${revision}`}
+			embeddedTarget={citationKey === citation?.key ? citation?.target : null}
+			embeddedTargetRequest={locateRequest}
+			insetCommentCards
+			rememberReadingPosition={false}
+			paperAbsPath={paperAbsPath}
+			paperRelPath={
+				paperAbsPath && vaultPath
+					? vaultRelativePath(vaultPath, paperAbsPath)
+					: null
+			}
+			vaultPath={vaultPath}
+			pdfPath={absoluteTarget}
+			plainViewer={isPlainPdfPath(targetPath) || !paperAbsPath}
 			className="h-96 w-full"
 		/>
 	);

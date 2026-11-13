@@ -1,3 +1,4 @@
+import { loadCustomProperties } from "@/lib/paper/custom-properties-store";
 /**
  * App bootstrap effects: theme / locale / uiScale application, restored-vault
  * validation then `app:ready`, lifecycle handler registration + wire bridge
@@ -8,10 +9,13 @@
 import { useTheme } from "next-themes";
 import { useEffect } from "react";
 import { useSettings, useVaultStore } from "@/hooks/use-app-stores";
+import { useInstitutionProxyHealth } from "@/hooks/use-institution-proxy-health";
+import { useUiRequest } from "@/hooks/use-ui-request";
 import { useVaultOpenRequest } from "@/hooks/use-vault-open-request";
 import { applyLocale } from "@/i18n";
 import { startActivityTracking } from "@/lib/activity";
 import { commands } from "@/lib/core/bindings";
+import { perfActive } from "@/lib/core/perf";
 import { startTaskRuntime } from "@/lib/core/tasks";
 import { isTauri } from "@/lib/core/tauri";
 import { initLifecycleBridge, lifecycle } from "@/lib/lifecycle";
@@ -24,17 +28,24 @@ import { registerImportTaskExecutor } from "@/lib/paper/import/import-tasks";
 import { startJobCompletionRefresh } from "@/lib/paper/job-refresh";
 import { refreshLibrary } from "@/lib/paper/library-store";
 import { registerLibraryTaskExecutors } from "@/lib/paper/library-tasks";
+import { startDevelopmentPlugins } from "@/lib/plugins/development";
+import { pluginsSurfaceEnabled } from "@/lib/plugins/visibility";
+import { startPerfRun } from "@/lib/shell/perf-run";
 // Side-effect: register catalog title lookup for JobCenter task subjects.
 import "@/lib/paper/task-label";
 import { registerLayoutTaskExecutor } from "@/lib/pdf/layout/enqueue-paper-layout";
+import { registerLayoutTranslateTaskExecutor } from "@/lib/pdf/layout/headless-translate";
 import { applyDocumentChrome } from "@/lib/settings";
 import { validateRestoredVault } from "@/lib/vault/actions";
 import { setTree, setTreeLoading } from "@/lib/vault/store";
 
 export function useAppBootstrap(): void {
+	useInstitutionProxyHealth();
 	const { setTheme } = useTheme();
 	// CLI / deep-link: agentero open <path> → vault:open-request
 	useVaultOpenRequest();
+	// CLI / deep-link: agentero paper open / agentero ui … → ui:request
+	useUiRequest();
 
 	const theme = useSettings((s) => s.theme);
 	const locale = useSettings((s) => s.locale);
@@ -68,7 +79,10 @@ export function useAppBootstrap(): void {
 		});
 	}, [uiScale, interfaceFontFamily, monoFontFamily]);
 
-	useEffect(() => startActivityTracking(), []);
+	useEffect(() => {
+		if (perfActive()) return;
+		return startActivityTracking();
+	}, []);
 
 	// Validate the restored local Vault before restoring its tree and tabs, then
 	// announce readiness — app:ready must not claim a validation that is still
@@ -95,6 +109,11 @@ export function useAppBootstrap(): void {
 		};
 	}, []);
 
+	useEffect(() => {
+		if (!pluginsSurfaceEnabled) return;
+		return startDevelopmentPlugins();
+	}, []);
+
 	// Per-vault side effects hang off vault:opened (see lifecycle/register.ts).
 	// Returning the scope release makes switch / close / unmount all tear down.
 	useEffect(() => {
@@ -102,6 +121,7 @@ export function useAppBootstrap(): void {
 			setTree([]);
 			setTreeLoading(false);
 			void refreshLibrary();
+			void loadCustomProperties();
 			return;
 		}
 		return lifecycle.emitScoped("vault:opened", {
@@ -114,6 +134,7 @@ export function useAppBootstrap(): void {
 	useEffect(() => {
 		if (!isTauri()) return;
 		registerLayoutTaskExecutor();
+		registerLayoutTranslateTaskExecutor();
 		registerImportTaskExecutor();
 		registerConnectorTaskExecutor();
 		registerLibraryTaskExecutors();
@@ -125,5 +146,9 @@ export function useAppBootstrap(): void {
 			disposeConnector();
 			disposeRefresh();
 		};
+	}, []);
+
+	useEffect(() => {
+		startPerfRun();
 	}, []);
 }

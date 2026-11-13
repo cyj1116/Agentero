@@ -110,6 +110,7 @@ vi.mock("@/lib/vault/store", () => ({
 
 const handlers = vi.hoisted(() => ({
 	lookup: vi.fn(async () => undefined),
+	lookupBatch: vi.fn(async () => undefined),
 	skill: vi.fn(async () => undefined),
 	localPdf: vi.fn(async () => undefined),
 	plaza: vi.fn(async () => undefined),
@@ -118,6 +119,7 @@ const handlers = vi.hoisted(() => ({
 
 vi.mock("@/lib/paper/import-actions", () => ({
 	runLookupImportJob: handlers.lookup,
+	runLookupBatchImportJob: handlers.lookupBatch,
 	runSkillImportJob: handlers.skill,
 	runLocalPdfImportJob: handlers.localPdf,
 }));
@@ -193,6 +195,34 @@ describe("import job executor", () => {
 				phase: null,
 				error: null,
 				state: "succeeded",
+				params: null,
+			},
+		]);
+	});
+
+	it("dispatches lookupBatch (chat-review checklist) to the batch executor", async () => {
+		registerImportTaskExecutor();
+		startJobCenterExecutorListener();
+		await flush();
+
+		offer("job-import-chat", "import", {
+			mode: "lookupBatch",
+			texts: ["arXiv:2603.29080", "https://doi.org/10.1038/nature12373"],
+		});
+		await flush();
+
+		expect(handlers.lookupBatch).toHaveBeenCalledTimes(1);
+		expect(handlers.lookup).not.toHaveBeenCalled();
+		const ctx = handlers.lookupBatch.mock.calls[0]?.[0];
+		expect(ctx.jobId).toBe("job-import-chat");
+		expect(reportCalls("job-import-chat")).toEqual([
+			{
+				jobId: "job-import-chat",
+				progress: 100,
+				phase: null,
+				error: null,
+				state: "succeeded",
+				params: null,
 			},
 		]);
 	});
@@ -213,6 +243,7 @@ describe("import job executor", () => {
 				phase: null,
 				error: "translator offline",
 				state: "failed",
+				params: null,
 			},
 		]);
 	});
@@ -233,6 +264,7 @@ describe("import job executor", () => {
 				phase: null,
 				error: null,
 				state: "cancelled",
+				params: null,
 			},
 		]);
 	});
@@ -311,6 +343,7 @@ describe("connector sync relay", () => {
 				phase: "Saving browser PDF",
 				error: null,
 				state: null,
+				params: null,
 			},
 		]);
 
@@ -323,6 +356,7 @@ describe("connector sync relay", () => {
 			phase: "Browser PDF saved",
 			error: null,
 			state: "succeeded",
+			params: null,
 		});
 
 		// A later save for the same key starts a fresh job.
@@ -358,6 +392,7 @@ describe("connector sync relay", () => {
 				phase: "Browser PDF save failed",
 				error: "login wall",
 				state: "failed",
+				params: null,
 			},
 		]);
 
@@ -413,6 +448,7 @@ describe("connector sync relay", () => {
 				phase: null,
 				error: null,
 				state: "cancelled",
+				params: null,
 			},
 		]);
 	});

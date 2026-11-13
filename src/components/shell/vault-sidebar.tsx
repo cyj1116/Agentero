@@ -4,7 +4,14 @@
  * tree updates no longer re-render the whole App.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { registerFileTreeHandle } from "@/components/shell/file-tree-registry";
 import {
@@ -13,6 +20,8 @@ import {
 	VaultSidebarHeader,
 } from "@/components/sidebar/file-tree";
 import { PaperInfoPanel } from "@/components/sidebar/paper-info-panel";
+import { useTexProject } from "@/components/sidebar/use-tex-project";
+import { WritingOutline } from "@/components/writing/writing-outline";
 import {
 	useLibraryStore,
 	useSettings,
@@ -20,12 +29,19 @@ import {
 	useVaultStore,
 	useWorkspaceStore,
 } from "@/hooks/use-app-stores";
-import type { PaperMetadata, PaperTag } from "@/lib/paper";
-import { resolvePapersParentDir } from "@/lib/paper";
+import { errorText } from "@/lib/core/error";
+import { notifyError } from "@/lib/core/notify";
+import type { PaperTag } from "@/lib/paper";
+import {
+	isPaperDirectory,
+	paperDirFromPath,
+	resolvePapersParentDir,
+} from "@/lib/paper";
 import {
 	dropLocalPdfs,
+	enqueueLookup,
+	enqueueLookupBatch,
 	importLocalPdf,
-	lookupSubmit,
 } from "@/lib/paper/import-actions";
 import {
 	discoverCitingPapers,
@@ -36,9 +52,15 @@ import {
 	libraryImport,
 	paperTagsChange,
 	readPaper,
+	rescanLibraryPapers,
 } from "@/lib/paper/library-actions";
 import { setZoteroOpen, setZoteroSyncOpen } from "@/lib/shell/ui-store";
-import { vaultDisplayName } from "@/lib/vault";
+import {
+	joinVaultPath,
+	treeFindNode,
+	vaultDisplayName,
+	vaultRelativePath,
+} from "@/lib/vault";
 import {
 	cancelCreate,
 	cancelRenamePath,
@@ -61,15 +83,30 @@ import {
 import { isRemoteVaultHandle } from "@/lib/vault/remote/remote-vault";
 import { loadDirChildren } from "@/lib/vault/store";
 import {
+	openPaper,
 	openPaperNotes,
 	openPlazaSource,
 	selectFileNode,
 	selectLibrary,
 	selectTrash,
 } from "@/lib/workspace/actions";
+import { bindWritingVault } from "@/lib/writing/store";
 
 // Stable callbacks so the memoized header / tree bail out on unrelated renders.
-const onLookupSubmit = (texts: string[]) => lookupSubmit(texts);
+// The wand returns as soon as its inputs are queued; the background task HUD
+// carries the rest of the lifecycle, so the next identifier can be submitted
+// while earlier jobs still run.
+const onLookupSubmit = async (texts: string[]) => {
+	await enqueueLookup(texts);
+};
+const onLookupBatchSubmit = async (texts: string[]) => {
+	const queued = await enqueueLookupBatch(texts);
+	// Enqueue already closed the popover; a batch failure surfaces as a toast
+	// and on the task row.
+	void queued?.settled.catch((error) => {
+		notifyError(errorText(error));
+	});
+};
 const onImportBibliography = () => void libraryImport();
 const onImportLocalPdf = () => void importLocalPdf();
 const onOpenRecent = (p: string) => void openRecentVault(p);
@@ -92,9 +129,18 @@ const onMoveTo = (paths: string[], dest: string) =>
 	void movePathsTo(paths, dest);
 const onDropMove = (paths: string[], targetPath: string) =>
 	void dropMovePaths(paths, targetPath);
+const onPasteInto = (targetPath: string) => void pasteCutPaths(targetPath);
 const onEmptyTrash = () => void emptyTrash();
 const onExportLibrary = () => void libraryExport();
+const onRescanLibrary = () => void rescanLibraryPapers();
 const onDiscoverCiting = () => void discoverCitingPapers();
+
+/** Catalog keys are vault-relative with forward slashes and no edge slashes. */
+function normalizePaperRelPath(path: string | null | undefined): string | null {
+	if (!path) return null;
+	const normalized = path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+	return normalized || null;
+}
 
 export function VaultSidebar() {
 	const fileTreeRef = useRef<FileTreeHandle>(null);
@@ -106,52 +152,103 @@ export function VaultSidebar() {
 	const { t } = useTranslation(["app", "sidebar"]);
 	const vaultPath = useVaultStore((s) => s.vaultPath);
 	const tree = useVaultStore((s) => s.tree);
+	const treeWithWriting = useMemo(() => {
+		if (!vaultPath) return tree;
+		const path = joinVaultPath(vaultPath, "thesis");
+		if (
+			tree.some(
+				(node) =>
+					node.path.replaceAll("\\", "/").toLowerCase() ===
+					path.replaceAll("\\", "/").toLowerCase(),
+			)
+		)
+			return tree;
+		return [
+			...tree,
+			{
+				id: path,
+				path,
+				name: "thesis",
+				kind: "directory" as const,
+				children: [],
+			},
+		];
+	}, [tree, vaultPath]);
 	const treeLoading = useVaultStore((s) => s.treeLoading);
 	const treeSelectedPath = useVaultStore((s) => s.treeSelectedPath);
+	const paperFolders = useVaultStore((s) => s.paperFolders);
 	const createDraft = useVaultStore((s) => s.createDraft);
 	const renameDraft = useVaultStore((s) => s.renameDraft);
 	const busy = useVaultStore((s) => s.busy);
 	const recentVaults = useVaultStore((s) => s.recentVaults);
 	const cutPaths = useVaultStore((s) => s.cutPaths);
 	const ioBusy = useLibraryStore((s) => s.ioBusy);
+	const libraryRescanning = useLibraryStore((s) => s.rescanning);
 	const paperMetaByRelPath = useLibraryStore((s) => s.paperMetaByRelPath);
+	const papers = useLibraryStore((s) => s.papers);
 	const lookupOpenSignal = useUiStore((s) => s.lookupOpenSignal);
+	const hoveredPaperPath = useUiStore((s) => s.hoveredPaperPath);
 	const paperTreeLabelMode = useSettings((s) => s.paperTreeLabelMode);
 	const paperTreeSortMode = useSettings((s) => s.paperTreeSortMode);
-	const paperMeta = useWorkspaceStore(
-		(s) => s.tabs.find((tab) => tab.id === s.activeTabId)?.paperMeta ?? null,
+	const activeTab = useWorkspaceStore(
+		(s) => s.tabs.find((tab) => tab.id === s.activeTabId) ?? null,
 	);
-	const [lastPaper, setLastPaper] = useState<{
-		vaultPath: string | null;
-		meta: PaperMetadata | null;
-	}>({ vaultPath: null, meta: null });
+	const paperMeta = activeTab?.paperMeta ?? null;
+	const texProjectPath = useTexProject(
+		vaultPath,
+		activeTab?.path ?? null,
+		activeTab?.writingRoot ?? activeTab?.texRoot,
+	);
+	useLayoutEffect(() => {
+		bindWritingVault(vaultPath);
+	}, [vaultPath]);
 
-	useEffect(() => {
-		if (paperMeta) {
-			setLastPaper({ vaultPath, meta: paperMeta });
-			return;
-		}
-		setLastPaper((previous) =>
-			previous.vaultPath === vaultPath ? previous : { vaultPath, meta: null },
-		);
-	}, [paperMeta, vaultPath]);
+	// While a paper / note tab hydrates, its own `paperMeta` is still null.
+	// Resolve the owning paper from the tree/path so Paper Info does not
+	// unmount/remount and resize the tree viewport mid-open (WebKit
+	// blank-until-scroll, #738).
+	const fallbackPaperRel = useMemo(() => {
+		if (!activeTab || !vaultPath || activeTab.paperMeta) return null;
+		const treeNode = treeFindNode(tree, activeTab.path);
+		const paperAbs =
+			treeNode?.kind === "directory" &&
+			isPaperDirectory(treeNode.path, treeNode.children)
+				? treeNode.path
+				: paperDirFromPath(activeTab.path, paperFolders);
+		if (!paperAbs) return null;
+		return normalizePaperRelPath(vaultRelativePath(vaultPath, paperAbs));
+	}, [activeTab, vaultPath, paperFolders, tree]);
 
-	const selectedPaperMeta =
-		paperMeta ?? (lastPaper.vaultPath === vaultPath ? lastPaper.meta : null);
-	// Library tag edits update the catalog store while the open tab may retain an older snapshot.
-	const selectedPaperPath = selectedPaperMeta?.path
-		.replace(/\\/g, "/")
-		.replace(/^\/+|\/+$/g, "");
-	const displayedPaperMeta = selectedPaperPath
-		? (paperMetaByRelPath.get(selectedPaperPath) ?? selectedPaperMeta)
-		: selectedPaperMeta;
+	// Prefer the catalog snapshot: library tag edits update it while the open
+	// tab may still hold an older copy.
+	const activePaperPath = normalizePaperRelPath(
+		paperMeta?.path ?? fallbackPaperRel,
+	);
+	const activePaperMeta = activePaperPath
+		? (paperMetaByRelPath.get(activePaperPath) ?? paperMeta)
+		: paperMeta;
+	// Hovering a Library row previews that paper without opening it.
+	const hoveredPaperKey = normalizePaperRelPath(hoveredPaperPath);
+	const hoveredPaperMeta = hoveredPaperKey
+		? (paperMetaByRelPath.get(hoveredPaperKey) ?? null)
+		: null;
+	// Auto-hide on non-paper surfaces; only papers and Library hover are shown.
+	const displayedPaperMeta = activePaperMeta ?? hoveredPaperMeta;
 	const onPaperTagsChange = useCallback(
 		async (tags: PaperTag[]) => {
 			if (!displayedPaperMeta) return;
-			const updated = await paperTagsChange(displayedPaperMeta, tags);
-			if (updated) setLastPaper({ vaultPath, meta: updated });
+			await paperTagsChange(displayedPaperMeta, tags);
 		},
-		[displayedPaperMeta, vaultPath],
+		[displayedPaperMeta],
+	);
+	const onOpenZoteroCollectionPaper = useCallback(
+		(relPath: string) => {
+			if (!vaultPath) return;
+			// Keep the user in the read-only Zotero hierarchy; the reference still
+			// opens its one real paper folder, without scrolling the physical tree.
+			openPaper(joinVaultPath(vaultPath, relPath), { revealTree: false });
+		},
+		[vaultPath],
 	);
 
 	const lookupParentDir = useMemo(
@@ -203,6 +300,7 @@ export function VaultSidebar() {
 					selection={treeSelectionHeader}
 					lookupParentDir={lookupParentDir}
 					onLookupSubmit={onLookupSubmit}
+					onLookupBatchSubmit={onLookupBatchSubmit}
 					onImportBibliography={onImportBibliography}
 					onImportLocalPdf={onImportLocalPdf}
 					importBusy={ioBusy === "import"}
@@ -221,61 +319,70 @@ export function VaultSidebar() {
 					onSyncZotero={onSyncZotero}
 				/>
 			</div>
-			<div className="flex min-h-0 flex-1 flex-col pl-1">
-				<FileTree
-					ref={fileTreeRef}
-					nodes={tree}
-					loading={treeLoading}
-					selectedPath={treeSelectedPath}
-					vaultPath={vaultPath}
-					createDraft={createDraft}
-					onConfirmCreate={onConfirmCreate}
-					onCancelCreate={cancelCreate}
-					renameDraft={renameDraft}
-					onStartRename={startRenamePath}
-					onConfirmRename={onConfirmRename}
-					onCancelRename={onCancelRename}
-					onDeletePath={onDeletePath}
-					onDeletePaths={onDeletePaths}
-					onMoveTo={onMoveTo}
-					onDropMove={onDropMove}
-					onCutPaths={cutSelectedPaths}
-					onPasteInto={(target) => void pasteCutPaths(target)}
-					onSelectionChange={setTreeSelectionCount}
-					cutPaths={cutPaths}
-					onDropLocalPdfs={dropLocalPdfs}
-					onSelectFile={selectFileNode}
-					onSelectLibrary={selectLibrary}
-					onSelectTrash={selectTrash}
-					onSelectPlazaSource={openPlazaSource}
-					onEmptyTrash={onEmptyTrash}
-					onExportLibrary={onExportLibrary}
-					libraryExportBusy={ioBusy === "export"}
-					onDiscoverCiting={onDiscoverCiting}
-					citingScanBusy={ioBusy !== null}
-					onStartCreate={startCreate}
-					onDownloadPaperAssets={downloadPaperAssetsAction}
-					onDownloadAllMissingAssets={downloadAllMissingAssets}
-					paperMetaByRelPath={paperMetaByRelPath}
-					paperTreeLabelMode={paperTreeLabelMode}
-					paperTreeSortMode={paperTreeSortMode}
-					onReadPaper={readPaper}
-					onOpenPaperNotes={openPaperNotes}
-					onEditPaperMeta={
-						vaultPath && !isRemoteVaultHandle(vaultPath)
-							? editPaperMetaFromTree
-							: undefined
-					}
-					onLoadDirChildren={loadDirChildren}
-				/>
+			<div className="flex min-h-0 flex-1 flex-col">
+				<div className="flex min-h-0 flex-1 flex-col pl-1">
+					<FileTree
+						ref={fileTreeRef}
+						nodes={treeWithWriting}
+						loading={treeLoading}
+						selectedPath={treeSelectedPath}
+						vaultPath={vaultPath}
+						createDraft={createDraft}
+						onConfirmCreate={onConfirmCreate}
+						onCancelCreate={cancelCreate}
+						renameDraft={renameDraft}
+						onStartRename={startRenamePath}
+						onConfirmRename={onConfirmRename}
+						onCancelRename={onCancelRename}
+						onDeletePath={onDeletePath}
+						onDeletePaths={onDeletePaths}
+						onMoveTo={onMoveTo}
+						onDropMove={onDropMove}
+						onCutPaths={cutSelectedPaths}
+						onPasteInto={onPasteInto}
+						onSelectionChange={setTreeSelectionCount}
+						cutPaths={cutPaths}
+						onDropLocalPdfs={dropLocalPdfs}
+						onSelectFile={selectFileNode}
+						onSelectLibrary={selectLibrary}
+						onSelectTrash={selectTrash}
+						onSelectPlazaSource={openPlazaSource}
+						zoteroCollectionPapers={papers}
+						onOpenZoteroCollectionPaper={onOpenZoteroCollectionPaper}
+						onEmptyTrash={onEmptyTrash}
+						onExportLibrary={onExportLibrary}
+						onRescanLibrary={onRescanLibrary}
+						libraryRescanning={libraryRescanning}
+						libraryExportBusy={ioBusy === "export"}
+						onDiscoverCiting={onDiscoverCiting}
+						citingScanBusy={ioBusy !== null}
+						onStartCreate={startCreate}
+						onDownloadPaperAssets={downloadPaperAssetsAction}
+						onDownloadAllMissingAssets={downloadAllMissingAssets}
+						paperMetaByRelPath={paperMetaByRelPath}
+						paperTreeLabelMode={paperTreeLabelMode}
+						paperTreeSortMode={paperTreeSortMode}
+						onReadPaper={readPaper}
+						onOpenPaperNotes={openPaperNotes}
+						onEditPaperMeta={
+							vaultPath && !isRemoteVaultHandle(vaultPath)
+								? editPaperMetaFromTree
+								: undefined
+						}
+						onLoadDirChildren={loadDirChildren}
+					/>
+				</div>
 			</div>
-			{/* Paper info is a resizable, unboxed section below the file tree. */}
-			{displayedPaperMeta ? (
+			{texProjectPath ? (
+				<div className="flex h-[35%] min-h-32 shrink-0 flex-col">
+					<WritingOutline texPath={texProjectPath} />
+				</div>
+			) : !displayedPaperMeta ? null : (
 				<PaperInfoPanel
 					meta={displayedPaperMeta}
 					onTagsChange={onPaperTagsChange}
 				/>
-			) : null}
+			)}
 		</>
 	);
 }

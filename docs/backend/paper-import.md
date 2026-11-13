@@ -1,6 +1,6 @@
 # 论文入库
 
-多入口共享落盘内核 **`paper_commit`**（`features/import/paper_import`）：分配路径、写 catalog、NOTES 壳、资源。
+多入口共享落盘内核 **`paper_commit`**（`features/import/paper_import`）：分配路径、写 catalog、NOTES 壳、资源。主 PDF 到位后，若 `code_repo` 为空且用户没有改过该字段，从摘要、首页脚注和文末写入论文自己的 GitHub 仓库。已经在库里的论文在下一次打开时补扫一次（见 [catalog.md](catalog.md)）。
 
 ## 入口
 
@@ -43,39 +43,84 @@ Skill 不写入 catalog、不创建 `papers/` 条目、不执行 `scripts/`。�
   → PaperRecord → catalog upsert
   → papers/<id>/ + 带 aliases frontmatter 的 NOTES.md 壳（不覆盖已有 NOTES）
   → PDF → {paper}/{id}.pdf
-  → arXiv e-print → 解压 LaTeX 到 source/
-  → 无 TeX：liteparse → PAPER.md
+  → arXiv e-print → 暂存解包、校验主 TeX / 依赖后发布到 source/
+  → 明确无可用 TeX：配置的正文引擎 → PAPER.md
   → 前端刷树 / openPaper
 ```
 
-- 设置：`translatorBaseUrl`。
+- Translator 地址：桌面端固定使用官方常量 `DEFAULT_TRANSLATOR_BASE_URL`，不读设置；CLI / 远程调用可通过 `LookupImportArgs.translator_base_url` 覆盖。查找与 Zotero 导入共用 `import::translator_base`：去除首尾空白、空值回退默认服务、移除末尾 `/`。
 - arXiv 的 `abs` / `pdf` / `html` / `src` / `e-print` URL 与裸 ID 都会先提取 ID；不会将 PDF 二进制 URL 交给 Translator 的网页解析器。
 - Translator 带回的 arXiv 学科分类（`Computer Science - Machine Learning` 这类 `"Archive - Sub-Field"` 标签）写入 catalog 时加 `@arxiv:` 前缀，作为隐标签保留来源、不出现在 Library / Paper Info / 标签筛选。用户自己加的普通标签不受影响。
-- 补资源：`paper_download_assets`（单篇 / Library 批量）。
+- venue 标签：arXiv e-print 解包到 `source/` 后扫描 LaTeX 模板（`\documentclass` / `\usepackage` / `.sty`/`.cls` 名），命中已知会议/期刊时写 `#submitted:<会议> <年份>` 标签（如 `#submitted:AAAI 2027`）。该标签由 Host 维护、仅作为投稿目标的兼容投影，UI 在「发表 / 投稿」列显示；若 catalog `publication` 已是**真实出版 venue**，同步时会删除它。`#venue:` 已废弃，不再写入。preprint / 仓库类 `publication`（arXiv、bioRxiv、medRxiv、SSRN、Research Square、Zenodo、OpenReview 等）不算 venue，会保留/走模板推断。已有 `#submitted:`、或用户标签已含该会议名的论文会跳过。见 [catalog.md](catalog.md)。
+- 补资源：`job_download_assets_enqueue`（DownloadAssets 后台任务；单篇 / Library 批量）。
 - 失败回滚：文件夹创建后，若 PDF 复制 / NOTES 壳 / catalog 写入任一失败，删除刚建的论文文件夹，避免出现树里有、catalog 无的"半篇论文"；资源下载阶段的错误不回滚（壳与 catalog 已落地）。
-- 孤儿文件夹自愈：`paper_download_assets` 发现盘上论文文件夹缺 catalog 行（历史失败导入的残留）时，按 `metadata.json` sidecar 重建 catalog 行（无 sidecar 退化为文件夹名最小记录）并发 `paper:imported`，Library / 树随之刷新。
+- 孤儿文件夹自愈：`DownloadAssets` 后台任务发现盘上论文文件夹缺 catalog 行（历史失败导入的残留）时，按 `metadata.json` sidecar 重建 catalog 行（无 sidecar 退化为文件夹名最小记录）并发 `paper:imported`，Library / 树随之刷新。
 - 网络资源阶段有整篇论文 `3 分钟`截止时间（`PAPER_ASSET_TIMEOUT`），覆盖 PDF
   fallback、DOI 元数据查询及 arXiv e-print；单个 HTTP
   请求仍使用更短的 reqwest timeout。超时不会回滚已经写入的 paper 壳和 catalog，
   资源错误会保留在导入结果中，后续可再次执行补资源。
-- Connector 不启动这条后台资源或解析管线：Chrome 先上传附件，DOI/arXiv Host 下载仅作
-  fallback；附件成功或失败的 finalizer 先将 paper 移到 latest target，再通过稳定路径的
-  `connector:item-saved` 交给现有 open/reconcile 解析流程。
+- Connector 先由 Chrome 上传附件，DOI/arXiv Host 下载作 fallback；附件成功或失败的
+  finalizer 先将 paper 移到 latest target，再在稳定路径提交共享正文准备任务，补齐源码后
+  决定是否解析 PDF。打开论文 / reconcile 也使用相同规则。
 - 错误：全局 Toast；重复不破坏用户 NOTES。
-- 标识符去重（#406）：批量预检之外，commit 阶段再按 `id` / `arxiv_id` / `doi` / `pmid` / `isbn` 查 catalog（`DedupePolicy::ByIdentifiers`），任一命中即 `Deduped`，不新建文件夹。
+- 标识符去重（#406）：批量预检之外，commit 阶段按规范 `id` / `arxiv_id` / `doi` / `pmid` / `isbn` 查 catalog（`DedupePolicy::ByIdentifiers`），任一可靠身份命中即 `Deduped`。本地 PDF 的文件名占位 ID 不作为合并依据；碰撞时分配独立条目，避免中文或同名 PDF 被挂到无关论文附件（#937 / #938）。带 arXiv/DOI 的本地 PDF 只有 ID 与该标识符派生值一致时才允许按 ID 恢复不完整旧行。
 - 新建壳会写论文全称 alias，并在元数据足够时写确定性短 alias；历史笔记由 [Doctor](doctor.md) 诊断和确认迁移。`created` 不属于入库壳或 Doctor 的职责。
 - 壳内容由设置 `paper_note_mode` 决定（`standard` / `title-only` / `blank` / `custom`，默认 `standard`，见 [settings.md](../frontend/settings.md)）；`custom` 模板位于 `{vault}/.agentero/templates/NOTES.md`，缺失或不可读时回退 standard 并 warn。任何模式的产物都会补齐 aliases frontmatter（模板 frontmatter 不可安全改写时留给 Doctor）。Connector 的后台摘要机翻仅对 standard 壳生效，避免改写 custom 模板渲染的原文摘要。
+
+## 全库论文补齐（#932）
+
+打开本地 Vault 时只调用 `job_backfill_preview({ vaultPath })`：复用 `source::preparation_reason`，返回论文路径、标题、原因以及三类计数。`needs_preparation` 由同一分类派生，单篇打开与导入仍沿用原自动准备流程。
+
+- `downloadSource`：允许同步 source 且到达重试时间的 arXiv 源码补齐；确认后可能联网下载，仍无 TeX 时可能回退解析 PDF。
+- `parseBody`：有 PDF、无有效 TeX、缺少非空 `PAPER.md`；确认后写入正文。零字节 `PAPER.md` 也属于该类，已有非空正文不覆盖。
+- `repairState`：仅 catalog 正文来源与磁盘状态不符；预览阶段内联 `reconcile_body`，不创建任务。
+
+有代价项由右上角常驻 Sonner 提示列出计数，支持展开滚动列表、全选和逐篇选择。取消全选后不能开始；「稍后」在本次应用会话内不再自动提示该 Vault，设置 → 问题诊断 → 论文补齐的「检查」在本节下方展示同一勾选列表和「开始补齐」，不再弹出右上角提醒。切换/关闭 Vault 会撤下其提示，并丢弃尚未返回的预览；未主动选择「稍后」时，切回该 Vault 会重新检查并提示，空预览或被取消的预览不消耗提示机会。
+
+确认后 `job_backfill_enqueue({ vaultPath, paths })` 先校验整批路径并去重，再仅按选中路径进入 idle lane 的 ParseBody，不二次扫描全库；保留活跃识别任务延后、执行时磁盘短路、源码 15 分钟退避、`unavailable` 终态及 source 同步排除策略。不触发版面分析。
 
 ## 可读正文
 
 | 情况 | 行为 |
 |---|---|
 | 有 TeX | 优先 TeX；不强制 `PAPER.md` |
-| 无 TeX 有 PDF | 下载后由选定的正文解析引擎生成 `PAPER.md`（默认按构建是否注入内置 provider key 决定：注入则 `agentero`，否则本地 liteparse 隔离子进程，单次解析限时 120 秒） |
-| 解析失败或超时 | 保留 PDF、`NOTES.md` 与 catalog；`paper_parse_body` 返回 `error`，对应 job 标记 `Failed` 并在任务面板展示原因，后续可重新执行 `paper parse` |
+| 无 TeX 有 PDF | 下载后由选定的正文解析引擎生成 `PAPER.md`（默认本地 liteparse 隔离子进程，单次解析限时 120 秒，不受构建是否注入内置 provider key 影响） |
+| 解析失败或超时 | 保留 PDF、`NOTES.md` 与 catalog；`ParseBody` 后台任务返回 `error`，job 标记 `Failed` 并在任务面板展示原因，后续可重新执行 `paper parse` |
 | 质量字段 | catalog `body_source` / `body_quality`（实现以 schema 为准） |
 
 `PAPER.md` 是派生文件，可删可重建；`source/` 与 PDF 才是归档事实来源。
+
+### LaTeX 优先与源码补全
+
+`ParseBody` 是共享的正文准备入口：先按 catalog 的 arXiv 身份准备有效源码，再考虑已有
+`PAPER.md` 或 PDF 引擎。本地 PDF 识别 / 合并、Connector 附件保存和目录移动完成、Zotero
+迁移、打开论文与全库 reconcile 均走该入口；标识符与 Bib/RIS 的资源下载也使用同一源码准备器。
+CLI `paper parse` 使用相同规则。远程导入保留 staging / 上传路径，复用源码校验与准备；
+远程 Connector 完成后在工作镜像中准备正文并上传产物。
+
+- 源码与正文是两个判定：有 OCR Markdown 仍可缺原始源码，下载按钮与批量补资源不会因此
+  隐藏源码缺失。打开 Vault / 论文时可补齐历史 OCR 论文的源码；已存在的 `PAPER.md` 保留。
+- `source/agentero-source.json` 保存请求版本、尝试时间，以及 `ready` / `unavailable` /
+  `retryableError` 和错误原因。PDF-only、PostScript 或成功解包但没有 TeX 的提交属于明确无
+  TeX；网络错误、坏归档、缺失正文 input 属于可重试失败，不静默启动云端 OCR。
+- 自动重试间隔 15 分钟；手动下载可立即重试。该间隔只控制自动网络请求，不隐藏缺源码提示。
+  同步配置排除 `source` 时，自动正文准备不主动下载该目录；用户显式下载仍可执行。
+- 保留显式版本 URL，catalog 去重仍用 bare ID。资源下载先落 PDF；原生文字里能读到版本戳时，用它固定 e-print。保存时没有带版本的 URL，文字戳也读不出来，就按最新版下载源码：无版本的 arXiv 链接本身就是当时的最新版。显式版本和 PDF 文字戳冲突时仍报错，不混合下载或覆盖旧文件。
+- TeX 有效性、聊天读取与编译共享 literal `input/include/subfile/import` 扫描基础；有效源码
+  需要主文档指示与可读正文依赖。空主文档、HTML 错误页不算源码；被 `\input` 的空白章节文件
+  属于合法空内容，不会让整篇源码判定失败。不会执行 TeX 或要求本机安装宏包。前言区来自 TeX
+  发行版的缺失 input 可保留原文，正文缺失章节不视为完整源码。
+- 解包在隐藏暂存目录完成，gzip 后重新识别 PDF；拒绝坏 tar、路径越界、链接与过大归档。
+  发布不覆盖已有不同内容的源文件或派生 sidecar；冲突 / 写入失败撤销本次新增文件，保留
+  用户原文件。旧的半解包源码可补足缺失文件；与上游冲突时报告具体路径供用户处理。
+- 源码获取和正文发布共用按论文路径隔离的锁；等待 PDF 解析许可后再次检查 TeX，写盘前
+  重检 TeX、取消状态与 PDF 文件标识。晚到源码或 PDF 替换使旧 OCR 结果被丢弃。
+- catalog 正文来源通过既有 SQLite 字段原子更新能力修正；清除派生正文同步失效来源标签，
+  `body_source` 不再代替文件存在性。主 PDF 只取论文根目录，优先 `{id}.pdf`，兼容旧根文件名，
+  不将 `source/` 中的图 PDF 当作论文或当作已经下载了主 PDF。
+
+PDF 版面任务保持独立，供坐标、图表与引用等功能使用；`force` 仍只表示重建派生正文，不会
+越过有效 TeX 的优先级。切换正文引擎只改变后续解析，不自动对全库重新 OCR。
 
 ### 正文解析引擎（可插拔）
 
@@ -83,11 +128,11 @@ Skill 不写入 catalog、不创建 `papers/` 条目、不执行 `scripts/`。�
 
 | backend | 流程 | `body_source` | `body_quality` |
 |---|---|---|---|
-| `local`（无编译期 key 时的默认） | liteparse worker 子进程 + PDFium | `pdf` / `ocr` | `medium` / `low` |
+| `local`（默认） | liteparse worker 子进程 + PDFium | `pdf` / `ocr` | `medium` / `low` |
 | `mineru` | 复用 MinerU 批量提取（上传 → 轮询 → 结果 zip）；写入 `full.md`，并保留其 ZIP 中 `images/` 下的派生图片资产，保持 `images/...` 相对链接可渲染 | `mineru` | `high` |
 | `paddle` | 复用 AI Studio 异步任务，拼接 JSONL 中每页 `markdown.text`。正文模型默认 `PaddleOCR-VL-1.6`，可在设置里改（版面分析固定 `PP-StructureV3`，不受影响） | `paddle` | `high` |
 | `openaiCompatible` | 渲染 worker 逐页出 150 DPI PNG（上限 100 页）→ OpenAI 兼容 `/chat/completions` 多模态 OCR（预设硅基流动；`PaddlePaddle/PaddleOCR-VL-1.5` 提示词 `OCR:`，`deepseek-ai/DeepSeek-OCR` 用 grounding 提示词，按 model id 自动选择） | `vlm` | `medium` |
-| `agentero`（注入 key 的构建里的默认） | **复用同一个 `OpenAiVlmBodyEngine`，没有新引擎**：流程与 `openaiCompatible` 完全一致，只是 endpoint / key / model 来自构建期的内置网关（model 兜底 `PaddlePaddle/PaddleOCR-VL-1.5`，提示词按 model id 自动选）。引擎携带自己注册时的 id，所以回退提示读作 `agentero failed: …` | `vlm` | `medium` |
+| `agentero`（Host 兼容已有配置） | **复用同一个 `OpenAiVlmBodyEngine`，没有新引擎**：流程与 `openaiCompatible` 完全一致，只是 endpoint / key / model 来自构建期的内置网关（model 兜底 `PaddlePaddle/PaddleOCR-VL-1.5`，提示词按 model id 自动选）。引擎携带自己注册时的 id，所以回退提示读作 `agentero failed: …` | `vlm` | `medium` |
 
 - **`agentero` 只是 parser backend，不是版面分析 backend**：`LAYOUT_BACKENDS` 仍是 `local` / `paddle` / `mineru`，`default_layout_backend()` 无条件 `local`——版面分析跑随包的离线 PP-DocLayoutV3 ONNX，切云端只会让每个 PDF 都产生费用而无收益。`layout_prompt` / `layout_language` / `layout_is_ocr` 对它不特判，因此提示词由 model id 推导，而**语言与强制 OCR 是 MinerU 专用**；前端内置描述符的 `requiresApiKey` / `supports*` 全 false，整张凭证卡被 `isProviderCardConfigurable` 过滤掉，什么都不渲染。
 - **两处白名单**：`PARSER_BACKENDS` 必须含 `agentero`，否则 `normalize()` 在每次保存时把它重置为默认值并写盘；引擎注册表也必须显式注册，因为未注册的 backend 会**静默回退**到 `LocalBodyEngine` 而不报错。两者都有测试守着。
@@ -95,8 +140,10 @@ Skill 不写入 catalog、不创建 `papers/` 条目、不执行 `scripts/`。�
 - **凭据注入**：引擎配置以进程级快照持有（启动与 `settings_set` 时从 `AppSettingsStore` 刷新，模式同 `core::http::configure_proxy`），明文 key 不出 Host。
 - **提示词**：默认按 model id 自动选择（含 `deepseek-ocr` → grounding 提示词；含 `paddleocr` → `OCR:`；其余 → 通用指令）。设置里的 Prompt 输入框可覆盖，留空即走自动。
   - ⚠️ `PaddleOCR-VL` 是**任务提示词**模型，只认它自己那几个固定提示词；换成自由指令会退化成检测模式并吐出 `<|LOC_n|>` 坐标 token。自定义提示词请配指令型 VLM（如 DeepSeek-OCR 去掉 `<|grounding|>`、Qwen-VL 等）。
-- **MinerU 高级选项**：`language`（OCR 语言包，默认 `ch` 中英文，Host 白名单校验）与 `isOcr`（强制 OCR，默认关闭、按文本层自动判断）存在共用的 `layout.providerConfigs.mineru`，版面分析与正文解析复用同一套请求参数。
+- **MinerU 高级选项**：`language`（OCR 语言包，默认 `ch` 中英文，Host 白名单校验）与 `isOcr`（强制 OCR，默认关闭、按文本层自动判断）存在共用的 `layout.providerConfigs.mineru`，版面分析与正文解析复用同一套请求参数。打开「自建 API」开关（`selfHosted`）后按自建服务处理，版本在请求时自动识别（4.0 V1 / 3.x `/file_parse`），正文解析读 zip 内的 Markdown（`markdown.md` 或 `<stem>.md`）与 `images/`。
+- **MinerU 在途提取共享**：相同 PDF 内容、文件名、服务地址、凭据、语言、OCR 与自建协议选项的并发正文/版面请求只执行一次提取，并读取同一 `Arc` ZIP；两个消费者各自接收进度。取消一个消费者不影响另一个，最后消费者退出即释放上游 HTTP future；已提交到服务端的任务不保证取消。仅保留在途弱引用，不缓存已结束的 ZIP、不落盘请求键或凭据，结束后重算仍会新建提取。Paddle 的不同模型保持独立。
 - **MinerU 图片资产**：MinerU 的 `full.md` 使用 `images/...` 相对链接引用结果 ZIP 中的裁图。Agentero 将这些图片与 `PAPER.md` 一起写到论文目录中的 `images/`；二者均为可重建的派生物，不改变 PDF、TeX 或 `NOTES.md` 的归档地位。
+- **MinerU 版面图注（#704）**：远程版面框保留 Content List 的正文与 `image_caption` / `table_caption` 文字；从 `middle.json` / `layout.json` 的嵌套 `image_caption` / `table_caption` 块追加真实图注框。Content List 的 0–1000 坐标仍按页面尺寸换算，中间格式图注框直接使用 PDF points。只有文字时不伪造图注几何；前端补读 PDF 文字并进行同页 / 保守跨页关联，见 [PDF 版面分析](../frontend/pdf-layout-analysis.md)。
 - **输出清洗**：grounding 输出形如 `<|ref|>label<|/ref|><|det|>[[box]]<|/det|>\n正文`，`<|ref|>` 内是版面**类别名**（`text` / `title`）而非正文，两段都整体丢弃，否则正文里会混入 `text` / `sub_title` 噪声行；`<|LOC_n|>` 同样剥离。
 - **实现**：`src-tauri/src/features/paper/analyze/parse/engines/`（`BodyParseEngine` trait + local / mineru / paddle / openai_vlm）；云端上传/轮询复用 `features/paper/analyze/layout/hosted` 的 `run_mineru_extract` / `run_paddle_ocr_job`。
 - **Live 验证**（`#[ignore]`，需自备 key，密钥只走环境变量）：
@@ -122,7 +169,7 @@ liteparse 在**运行时 `dlopen`** PDFium，而 `liteparse-pdfium-sys` 的 buil
 | 环节 | 位置 |
 |---|---|
 | 暂存 | `scripts/prepare-pdfium.mjs` → `src-tauri/pdfium/{libpdfium.dylib \| pdfium.dll \| libpdfium.so}`（gitignore；`beforeDevCommand` / `beforeBuildCommand` 都会跑 `pnpm pdfium:stage`） |
-| 来源优先级 | `PDFIUM_LIB_PATH` → 平台缓存 `<cache>/pdfium-rs/<tag>/<asset>/` → 从 pdfium-binaries release 下载 |
+| 来源优先级 | `PDFIUM_LIB_PATH` → 平台缓存 `<cache>/pdfium-rs/<tag>/<asset>/` → 从 pdfium-binaries release 下载（5xx 重试，仍失败则改走 release asset API） |
 | macOS 打包 | `bundle.macOS.frameworks` → `Contents/Frameworks/libpdfium.dylib`（tauri-bundler 会把它登记为 codesign target，公证需要） |
 | Windows / Linux 打包 | `bundle.resources: ["pdfium/*"]` → exe 同级 `pdfium/`，deb/AppImage 为 `/usr/lib/agentero/pdfium/` |
 | 运行时定位 | `pdf_parse::bundled_pdfium_dir()` 从 `current_exe` 探测上述位置，作为 `PDFIUM_LIB_PATH` 传给解析子进程；外部已设置该环境变量时不覆盖 |
@@ -130,23 +177,25 @@ liteparse 在**运行时 `dlopen`** PDFium，而 `liteparse-pdfium-sys` 的 buil
 - iOS/Android 不打包 PDFium：正文解析走配对的桌面 Host，平台 config 已清空 `resources`。
 - 子进程 stderr 落到 worker 临时目录的 `stderr.log`；拿不到 response 时其尾部会拼进错误消息。
 - **升级 `liteparse` 依赖时**，必须同步 `scripts/prepare-pdfium.mjs` 里的
-  `PDFIUM_RELEASE_TAG` 与 `.github/workflows/ci.yml` 的 Provision PDFium 步骤，
-  保持与 `liteparse-pdfium-sys` build script 的 tag 一致。
+  `PDFIUM_RELEASE_TAG`，保持与 `liteparse-pdfium-sys` build script 的 tag 一致。
+  CI 与 release 的 CLI 任务都调用该脚本（CI 用 `--extract`），不再各自固定 tag。
 
 ## 本地 PDF
 
-- 魔棒多选或拖到 `papers/` 组织夹 → **即时导入**：复制 PDF + catalog + NOTES shell 立刻完成（秒级），论文马上出现在树/论文库；元数据识别在后台进行（见下），识别完成后自动改名/补全。
+- 魔棒多选或拖到 `papers/` 组织夹 → **即时导入**：复制 PDF + catalog + NOTES shell 立刻完成（秒级）。论文库只重读 catalog 行，文件树只刷新涉及的目录，双链只更新新论文目录和被改写的笔记；同一批导入（含后台识别改名）合并成一次刷新，不按篇数重扫整个库。元数据识别在后台进行（见下），识别完成后自动改名/补全。外部放进 `papers/` 且能对应到单篇目录时补一行 catalog；对不上单篇时才整库 rescan。
 - PDF 拖入窗口其它区域也入库到当前 Papers 目标，避免 WebView 导航；识别与版面分析在后台继续。
-- 标识符去重与合并（#406）：导入前按对话框给出的 `id` / DOI / arXiv / PMID / ISBN 查 catalog；命中已有条目时不新建文件夹——原条目缺主 PDF `{id}.pdf` 时，本 PDF 直接成为主 PDF（常见于 PMID 入库后手动补全文）；否则放入 `{paper}/attachments/`（同名自动 `-2` 后缀），并回填 catalog 缺失的标识符列；前端返回 `status: "deduped"` 并 Toast 提示。
+- 标识符去重与合并（#406）：导入前按规范 ID / DOI / arXiv / PMID / ISBN 查 catalog，不凭本地文件名占位 ID 合并（#937 / #938）；命中已有条目时不新建文件夹——原条目缺主 PDF `{id}.pdf` 时，本 PDF 直接成为主 PDF（常见于 PMID 入库后手动补全文）；否则放入 `{paper}/attachments/`（同名自动 `-2` 后缀），并回填 catalog 缺失的标识符列；前端返回 `status: "deduped"` 并 Toast 提示。
 
 ### 文件夹自动收录（auto-ingest，#549）
 
+直接放到 `papers/` 根目录的独立 PDF 也会自动收录（含应用关闭期间放入的文件）。等待文件尺寸稳定后，为它创建与文件名同名的资料文件夹，再移动原 PDF 并复用 `adopt_paper_folder`：NOTES、Catalog、元数据识别及后续正文/版面解析与已有导入流程一致，使用设置中的解析引擎；成功的版面结果写入 `source/layout.json`，重开时复用。已有同名文件夹不会被合并或覆盖，新目录追加 `-2` 等后缀。此流程同样受 `auto_ingest` 开关控制；移动失败只清理本次创建的空目录，后续收录失败保留文件夹供重试。`notes/` 等目录中的普通 PDF 不受影响。
+
 在 `papers/` 下直接新建文件夹并拖入 PDF（含外部文件管理器操作），应用会就地收录为论文条目，无需走导入对话框：
 
-- **触发**：vault FS watcher 收到 create/rename 批次且路径归属 `papers/` 直接子文件夹（`src-tauri/src/features/paper/ingest/`）；应用未运行期间创建的文件夹由前端 `vault:opened` 时 fire-and-forget 调 `paper_ingest_reconcile` 补扫。
+- **触发**：vault FS watcher 收到 create/rename 批次且路径为 `papers/` 根目录的独立 PDF、直接子文件夹或文件夹内文件（`src-tauri/src/features/paper/ingest/`）；根目录的 `index.md` 等非 PDF 文件不触发收录。应用未运行期间创建的文件夹和独立 PDF 由前端 `vault:opened` 时 fire-and-forget 调 `paper_ingest_reconcile` 补扫。
 - **稳定探测**：两次间隔 700ms 的 PDF 尺寸快照相等才算拷贝完成（上限 8s）；仍在写入则等下一批 watcher 事件重试，绝不收录半个 PDF。`.crdownload`/`.part` 等临时下载后缀不算 PDF。
 - **分类即护栏**：core 内核 `auto_ingest::classify_papers_subfolder` 依次判定——有 `metadata.json` sidecar 或 catalog 行（已托管）、有 NOTES.md/PAPER.md/内部子目录（已是论文单元）、含嵌套论文单元（组织夹）、裸 PDF 文件夹（可收录）；收录写入的 sidecar/NOTES.md 使分类自然翻转，杜绝循环。
-- **收录动作**（`adopt_paper_folder`，就地、零拷贝）：主 PDF（与 id 同名优先，否则取最大文件）改名为 `{id}.pdf`，其余 PDF 移入 `attachments/`，写 NOTES shell、upsert catalog（`meta_source=local`）、emit `paper:imported`，并 spawn 后台元数据识别（识别命中标识符后照常经 wiki rename 改名为规范 id）。占位 id 取文件夹名 slug（中文等非 ASCII 名回退首个 PDF 文件名 stem）。
+- **收录动作**（`adopt_paper_folder`，就地、零拷贝）：主 PDF（与 id 同名优先，否则取最大文件）改名为 `{id}.pdf`，其余 PDF 移入 `attachments/`，写 NOTES shell、upsert catalog（`meta_source=local`）、emit `paper:imported`，并 spawn 后台元数据识别（识别命中标识符后照常经 wiki rename 改名为规范 id）。占位 ID 取保留中文的文件夹名 slug，全库冲突加路径短哈希；纯中文目录下首个 PDF 若以已知 arXiv 编号命名，仍优先保留该编号，普通 `paper.pdf` 不覆盖中文目录名（#937）。
 - **失败安全**：收录失败不回滚删除用户文件夹（与 `paper_commit` 的 remove_dir_all 回滚刻意不同），留在原地等待重试。
 - **开关**：设置 `auto_ingest`（默认开）同时门控 watcher 触发与启动补扫。
 
@@ -172,7 +221,7 @@ liteparse 在**运行时 `dlopen`** PDFium，而 `liteparse-pdfium-sys` 的 buil
 - **arXiv 链整体限流（HTTP 429）**：Zotero Recognizer 常只返回 arXiv id、不带 title；随后 arXiv 兜底链（Atom→S2→alphaXiv）**整条**被限流时（链内已自动 2s 冷却重试一趟）才保留文件名占位标题，并在 `recognizeMetadata` job 的 `params.warning=arxiv_rate_limited` 上让前端 Toast——链内单源 429 会被下一优先级源静默承接，不再触发警告。
 - **用户抢先编辑**：识别完成时若 `meta_source=manual`（Edit-Metadata 手改），识别结果整体放弃；其余来源（含 Connector 兜底的 `zotero-connector` 与未解决的 `local-unresolved`）允许识别结果按字段级合并覆盖非空值。
 
-时序约定：`paper_commit` 以 `defer_parse_jobs: true` 跳过 commit 期的 ParseBody/ParseRefs spawn，且 Host 调度器对处于 `RecognizeMetadata` 阶段的论文直接延后/跳过 `ParseBody`、`ParseRefs`、`LayoutAnalyze` 与 `reconcile` 命令，由 RecognizeMetadata runner 在目录名尘埃落定后统一按最终路径编排 PAPER.md / refs / layout，避免改名前抢跑产生重复解析与目录移动冲突。
+时序约定：`paper_commit` 以 `defer_parse_jobs: true` 让返回的 `PreparationPlan` 不含 ParseBody/ParseRefs（commit 不再调用 `HostHooks` spawn）。桌面命令按计划入队；Host 调度器对处于 `RecognizeMetadata` 阶段的论文直接延后/跳过 `ParseBody`、`ParseRefs`、`LayoutAnalyze` 与 `reconcile` 命令，由 RecognizeMetadata runner 在目录名尘埃落定后统一按最终路径编排 PAPER.md / refs / layout，避免改名前抢跑产生重复解析与目录移动冲突。
 
 - 实现：识别链路 `src-tauri/src/features/paper/import/recognize/pdf_recognize.rs`（payload 组装 + HTTP client + `map_crossref_work`）；probe worker 变体在 `pdf_parse/mod.rs`（`--agentero-internal-pdf-recognize-worker`）；job 编排 `import/job_runners.rs::recognize_metadata_runner`。
 - payload 结构复刻 Zotero document-worker `getRecognizerData`：`word = [xMin,yMin,xMax,yMax,fontSize,spaceAfter,baseline,rotation,0,bold,italic,0,fontIndex,text]`，行来自 liteparse 投影行（竖排 arXiv stamp 落到独立行，服务端可重建）。
@@ -194,3 +243,7 @@ liteparse 在**运行时 `dlopen`** PDFium，而 `liteparse-pdfium-sys` 的 buil
 
 `src-tauri/src/features/import/`  
 前端 UI：[../frontend/paper-import.md](../frontend/paper-import.md)
+
+### 远程版面 PDF 请求预处理
+
+Host `features/paper/analyze/layout/hosted` 为 MinerU 与 Paddle 共用 PDF 上传预处理：空输入检查、96 MiB base64 字符数上限、base64 解码和空文件名回退 `paper.pdf`。供应商请求、进度通知及结果解析仍由各自引擎负责。

@@ -4,11 +4,18 @@ import { NotebookPen } from "lucide-react";
 import { memo, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { MessageResponse } from "@/components/ai-elements/message";
+import { MessageResponse } from "@/components/agent/message";
 import { EmbedStatus } from "@/components/editor/embeds/embed-status";
 import { useMarkdownExportMode } from "@/components/editor/markdown-export-mode-context";
+import { AnnotationQuoteBlock } from "@/components/selection/annotation-quote-block";
 import { createKeyedCache } from "@/lib/core/keyed-cache";
 import { cn } from "@/lib/core/utils";
+
+/** Cited excerpt: location, quote, and its translation. */
+const EMBED_SOURCE_TEXT = "text-[length:var(--wiki-embed-font-size,13px)]";
+/** Notes follow the editor body size. Beats MessageResponse's `text-base`. */
+const EMBED_NOTE_TEXT = "!text-[length:inherit]";
+
 import { visualTraceImageAssetRelPath } from "@/lib/pdf/agent-trace/image";
 import {
 	type AnnotationRef,
@@ -16,11 +23,11 @@ import {
 	lookupAnnotationRef,
 	paperAbsFromWikiTarget,
 } from "@/lib/pdf/annotation-ref";
+import type { HighlightColor } from "@/lib/pdf/highlight/palette";
 import {
-	type HighlightColor,
-	swatchBorderClass,
-	swatchColorClass,
-} from "@/lib/pdf/highlight/palette";
+	annotationTranslateSidecarPath,
+	readAnnotationTranslation,
+} from "@/lib/pdf/layout/annotation-translate-display";
 import {
 	getPaperOutline,
 	outlineLocationLabelForPaper,
@@ -98,6 +105,7 @@ export function annotationEmbedWatchPaths(
 			joinVaultPath(paperAbs, MARKS_FOLDER),
 			visualTraceImageAssetRelPath(annotationId, "image/png"),
 		),
+		annotationTranslateSidecarPath(paperAbs),
 	];
 }
 
@@ -213,6 +221,32 @@ export const WikiAnnotationEmbed = memo(function WikiAnnotationEmbed({
 		};
 	}, [requestKey, vaultPath, targetPath, annotationId]);
 
+	const highlightQuote =
+		state.kind === "ready" && state.ref.kind === "highlight"
+			? (state.ref.quote?.trim() ?? "")
+			: "";
+	const [translation, setTranslation] = useState<{
+		key: string;
+		text: string | null;
+	}>({ key: "", text: null });
+	useEffect(() => {
+		// Sidecar writes bump marksRevision without changing the stored quote.
+		void marksRevision;
+		if (!paperAbs || !highlightQuote) return;
+		const key = `${paperAbs}\n${highlightQuote}`;
+		let cancelled = false;
+		void readAnnotationTranslation(paperAbs, highlightQuote).then((text) => {
+			if (!cancelled) setTranslation({ key, text });
+		});
+		return () => {
+			cancelled = true;
+		};
+	}, [paperAbs, highlightQuote, marksRevision]);
+	const pairedTranslation =
+		paperAbs && translation.key === `${paperAbs}\n${highlightQuote}`
+			? translation.text
+			: null;
+
 	const resolvedKind = state.kind === "ready" ? state.ref.kind : null;
 	useEffect(() => {
 		if (resolvedKind) onResolvedKind?.(resolvedKind);
@@ -262,41 +296,20 @@ export const WikiAnnotationEmbed = memo(function WikiAnnotationEmbed({
 	// (same as markdown / attachment embeds) so selection & scroll stay usable.
 	return (
 		<div className={cn("block w-full px-3 py-2 text-left", className)}>
-			{/* Location: outline breadcrumb or page fallback */}
-			<div className="flex items-center gap-1.5">
-				{isVisual ? null : (
-					<span
-						className={cn(
-							"size-2 shrink-0 rounded-full",
-							swatchColorClass(color),
-						)}
-						aria-hidden
-					/>
-				)}
-				<span
-					className="min-w-0 truncate font-medium text-caption text-muted-foreground tracking-wide"
-					title={locationLabel ?? undefined}
-				>
-					{locationLabel}
-				</span>
-			</div>
-
-			{hasQuote ? (
-				<blockquote
-					className={cn(
-						"mt-1.5 border-l-2 pl-2.5 text-xs leading-relaxed text-muted-foreground whitespace-pre-wrap break-words",
-						swatchBorderClass(color),
-					)}
-				>
-					{ref.quote}
-				</blockquote>
-			) : null}
+			<AnnotationQuoteBlock
+				quote={hasQuote ? ref.quote : null}
+				translation={pairedTranslation && !isVisual ? pairedTranslation : null}
+				locationLabel={locationLabel}
+				color={color}
+				showSwatch={!isVisual}
+				textClassName={EMBED_SOURCE_TEXT}
+			/>
 
 			{/* Visual note: icon + text above the crop (annotation, not chat). */}
 			{isVisual && hasComment ? (
 				<div
 					className={cn(
-						"flex min-w-0 items-start gap-1.5 text-sm text-foreground/90 leading-relaxed",
+						"flex min-w-0 items-start gap-1.5 text-foreground/90 leading-relaxed",
 						hasQuote ? "mt-2" : "mt-1.5",
 					)}
 				>
@@ -304,9 +317,14 @@ export const WikiAnnotationEmbed = memo(function WikiAnnotationEmbed({
 						className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
 						aria-hidden
 					/>
-					<span className="min-w-0 whitespace-pre-wrap break-words">
-						{ref.comment.trim()}
-					</span>
+					<MessageResponse
+						className={cn(
+							"min-w-0 flex-1 leading-relaxed [&_p]:my-0",
+							EMBED_NOTE_TEXT,
+						)}
+					>
+						{ref.comment}
+					</MessageResponse>
 				</div>
 			) : null}
 
@@ -327,11 +345,11 @@ export const WikiAnnotationEmbed = memo(function WikiAnnotationEmbed({
 			{ref.kind === "highlight" && hasComment ? (
 				<div
 					className={cn(
-						"min-w-0 text-sm text-foreground/85 leading-relaxed",
+						"min-w-0 text-foreground/85 leading-relaxed",
 						hasQuote || hasImage ? "mt-2" : "mt-1.5",
 					)}
 				>
-					<MessageResponse className="text-sm leading-relaxed">
+					<MessageResponse className={cn("leading-relaxed", EMBED_NOTE_TEXT)}>
 						{ref.comment}
 					</MessageResponse>
 				</div>
@@ -349,7 +367,7 @@ export const WikiAnnotationEmbed = memo(function WikiAnnotationEmbed({
 						<div
 							key={m.id}
 							className={cn(
-								"min-w-0 rounded-md px-2.5 py-1.5 text-sm leading-relaxed",
+								"min-w-0 rounded-md px-2.5 py-1.5 leading-relaxed",
 								m.role === "user"
 									? "bg-primary/10 text-foreground/90"
 									: "bg-muted/70 text-foreground/85",
@@ -360,7 +378,9 @@ export const WikiAnnotationEmbed = memo(function WikiAnnotationEmbed({
 									? t("embed.annotationRoleUser")
 									: t("embed.annotationRoleAssistant")}
 							</div>
-							<MessageResponse className="text-sm leading-relaxed">
+							<MessageResponse
+								className={cn("leading-relaxed", EMBED_NOTE_TEXT)}
+							>
 								{m.content}
 							</MessageResponse>
 						</div>

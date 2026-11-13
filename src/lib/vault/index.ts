@@ -10,14 +10,17 @@ export {
 	writeVaultBytes,
 	writeVaultFile,
 } from "@/lib/vault/fs";
+export type { VaultRenamePlan } from "@/lib/vault/path";
 export {
 	collectDirectoryRelPaths,
 	collectMarkdownRelPaths,
+	hasVaultFileExtension,
 	isPapersParent,
 	isValidVaultEntryName,
 	joinVaultPath,
 	normalizePathKey,
 	paperRelFromNotes,
+	planVaultRename,
 	resolveCreateParent,
 	treeFindNode,
 	vaultDisplayName,
@@ -44,6 +47,7 @@ export {
 	collectTreeRefreshTargets,
 	collectWikiTargetRelPaths,
 	compareVaultTreeNodes,
+	directoryIsLoaded,
 	isEagerTreeRel,
 	isPathMissingError,
 	listVaultDirChildren,
@@ -53,5 +57,6 @@ export {
 	replaceTreeNodeChildren,
 	shouldIgnoreTreeName,
 	treeHasPendingChildren,
+	upsertTreeChild,
 } from "@/lib/vault/tree";
 export type { FileNode } from "@/lib/vault/types";

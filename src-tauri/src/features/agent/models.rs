@@ -5,19 +5,22 @@ use std::collections::HashMap;
 #[serde(rename_all = "kebab-case")]
 pub enum AgentTemplate {
     Opencode,
-    /// OpenClaw native ACP (`openclaw acp`).
-    /// Docs: https://docs.openclaw.ai/cli/acp
-    OpenClaw,
     /// Hermes Agent native ACP (`hermes acp`).
     /// Docs: https://github.com/NousResearch/hermes-agent
     Hermes,
     ClaudeAcp,
     CodexAcp,
+    /// Cursor Agent CLI with native ACP (`cursor-agent acp`).
+    /// Docs: https://cursor.com/docs/cli
+    CursorAgent,
     /// Google Antigravity's official ACP server (separate from the retired `agy-acp` adapter).
     AntigravityAcp,
     /// Qoder CLI native ACP (`qodercli --acp`).
     /// Docs: https://docs.qoder.com/en/cli/acp
     QoderCli,
+    /// Qoder CN CLI (mainland build) with native ACP (`qodercn --acp`).
+    /// Docs: https://docs.qoder.cn/cli/acp
+    QoderCn,
     /// Grok Build native ACP (`grok agent stdio`).
     /// Docs: https://zed.dev/acp/agent/grok-build
     GrokBuild,
@@ -38,8 +41,26 @@ pub enum AgentTemplate {
     /// MiniMax Code CLI with native ACP (`mcode acp`).
     /// Docs: https://agent.minimax.io/docs/cli/quick-start
     MinimaxCode,
+    /// Xiaomi MiMo Code CLI (an OpenCode fork) with native ACP (`mimo acp`).
+    /// Docs: https://mimo.xiaomi.com · npm package `mimocode`
+    MimoCode,
+    /// Tencent CodeBuddy Code CLI with native ACP (`codebuddy --acp`).
+    /// Docs: https://www.codebuddy.ai/docs/cli/acp · npm package `@tencent-ai/codebuddy-code`
+    Codebuddy,
+    /// 内置「知乎」Agent：Host 内建，不 spawn 外部进程，直连知乎开放平台
+    /// （直答 + 标题检索）。凭证来自 App settings。
+    Zhihu,
     Custom,
 }
+
+/// 内建 Agent（Host 内建适配器，无外部 ACP 进程）。前端聊天气泡、Settings
+/// 卡片等按此区分：这些 Agent 不经 ACP spawn / probe / session list。
+pub fn is_builtin_template(template: &AgentTemplate) -> bool {
+    matches!(template, AgentTemplate::Zhihu)
+}
+
+/// 内置「知乎」Agent 的稳定 registry id。
+pub const ZHIHU_AGENT_ID: &str = "builtin-zhihu";
 
 impl<'de> serde::Deserialize<'de> for AgentTemplate {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -49,18 +70,25 @@ impl<'de> serde::Deserialize<'de> for AgentTemplate {
         let s = String::deserialize(deserializer)?;
         Ok(match s.as_str() {
             "opencode" => Self::Opencode,
-            "openclaw" => Self::OpenClaw,
+            // Legacy OpenClaw preset (removed): keep old registries loading as
+            // a custom agent instead of failing the whole registry parse.
+            "openclaw" => Self::Custom,
             "hermes" => Self::Hermes,
             "claude-acp" => Self::ClaudeAcp,
             "codex-acp" => Self::CodexAcp,
+            "cursor-agent" => Self::CursorAgent,
             "antigravity-acp" => Self::AntigravityAcp,
             "qodercli" => Self::QoderCli,
+            "qoder-cn" => Self::QoderCn,
             "grok-build" => Self::GrokBuild,
             "pi" => Self::Pi,
             "dsh" => Self::Dsh,
             "kimi-code" => Self::KimiCode,
             "zcode" => Self::Zcode,
             "minimax-code" => Self::MinimaxCode,
+            "mimo-code" => Self::MimoCode,
+            "codebuddy" => Self::Codebuddy,
+            "zhihu" => Self::Zhihu,
             "custom" => Self::Custom,
             other => {
                 return Err(serde::de::Error::custom(format!(
@@ -75,18 +103,22 @@ impl AgentTemplate {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Opencode => "opencode",
-            Self::OpenClaw => "openclaw",
             Self::Hermes => "hermes",
             Self::ClaudeAcp => "claude-acp",
             Self::CodexAcp => "codex-acp",
+            Self::CursorAgent => "cursor-agent",
             Self::AntigravityAcp => "antigravity-acp",
             Self::QoderCli => "qodercli",
+            Self::QoderCn => "qoder-cn",
             Self::GrokBuild => "grok-build",
             Self::Pi => "pi",
             Self::Dsh => "dsh",
             Self::KimiCode => "kimi-code",
             Self::Zcode => "zcode",
             Self::MinimaxCode => "minimax-code",
+            Self::MimoCode => "mimo-code",
+            Self::Codebuddy => "codebuddy",
+            Self::Zhihu => "zhihu",
             Self::Custom => "custom",
         }
     }
@@ -171,6 +203,34 @@ pub fn default_agent_proxy_url() -> String {
     DEFAULT_AGENT_PROXY_URL.to_string()
 }
 
+/// Loopback hosts that never go through the agent proxy. OpenCode's ACP CLI
+/// reaches its own `opencode serve` child over 127.0.0.1 HTTP, and local
+/// proxies (Clash & friends) refuse to forward loopback destinations (502 →
+/// ClientError → session/new fails, model list stays empty), so this bypass
+/// must accompany every proxy injection (store / remote / lifecycle).
+pub(crate) const PROXY_LOOPBACK_BYPASS: &[&str] = &["127.0.0.1", "localhost", "::1"];
+
+/// Merge the loopback bypass into an existing NO_PROXY value (dedup, keep
+/// user entries first). Shared by every site that injects proxy env vars.
+pub(crate) fn merge_no_proxy(existing: Option<&String>) -> String {
+    let mut entries: Vec<String> = existing
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    for host in PROXY_LOOPBACK_BYPASS {
+        if !entries.iter().any(|entry| entry.eq_ignore_ascii_case(host)) {
+            entries.push(host.to_string());
+        }
+    }
+    entries.join(",")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentListResponse {
@@ -231,6 +291,12 @@ pub struct CatalogEntry {
     /// Host CLI OAuth/login command from the template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_command: Option<String>,
+    /// Interactive host CLI for the Settings "open in terminal" action.
+    /// Locally this is the resolved absolute path when the binary is available
+    /// (may differ from `resolved_path`, e.g. Antigravity `agy`); `None` hides
+    /// the action. Remote scans leave it `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_command: Option<String>,
     /// Host CLI present but ACP entrypoint missing — Settings may offer ACP install.
     #[serde(default)]
     pub offer_install: bool,
@@ -395,6 +461,17 @@ pub struct RunOnceRequest {
     /// (paper-reader and other non-composer workflows).
     #[serde(default)]
     pub hide_from_chat_history: bool,
+    /// Selection, open paper, and @ mentions for this turn.
+    /// The host resolver writes the minimum evidence into the prompt and, for a
+    /// local session, attaches the session-scoped `agentero-context` MCP.
+    /// Omit when the turn has no vault anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<agentero_core::features::context::ContextRequest>,
+    /// Earlier on-screen turns. The host inserts them only when the context
+    /// fingerprint refuses to resume `session_id`. Omit when the prompt already
+    /// contains that transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_transcript: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
@@ -750,6 +827,20 @@ pub struct AcpHistoryLine {
     pub sources: Vec<String>,
 }
 
+/// Response for `agent_delete_session`.
+///
+/// The id is always hidden from later `session/list` results. `deleted_on_agent`
+/// is true only when the agent accepted `session/delete`. `agent_error` is set
+/// when that RPC was attempted and failed; the local hide still stands.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpDeleteSessionResult {
+    pub session_id: String,
+    pub deleted_on_agent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_error: Option<String>,
+}
+
 /// Response for `agent_load_session`.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -794,6 +885,14 @@ pub struct PermissionResponded {
     pub resolved: bool,
 }
 
+/// Form field response: a scalar selection/text or multiple selected values.
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(untagged)]
+pub enum ElicitationFieldValue {
+    String(String),
+    StringArray(Vec<String>),
+}
+
 /// Request payload for `agent_respond_elicitation`.
 #[derive(Debug, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -801,9 +900,9 @@ pub struct ElicitationResponseRequest {
     pub request_id: String,
     /// accept | decline | cancel
     pub action: String,
-    /// Field id → string value (accept only).
+    /// Field id → string or selected string values (accept only).
     #[serde(default)]
-    pub content: Option<std::collections::BTreeMap<String, String>>,
+    pub content: Option<std::collections::BTreeMap<String, ElicitationFieldValue>>,
 }
 
 /// Request payload for `agent_respond_ask_user`.

@@ -1,25 +1,39 @@
 /**
  * Sticky header row for the papers library table.
  *
- * Per-column sort button, title-header inline search, metadata refresh,
- * and the tags-filter popover; right-click customizes column order +
+ * Per-column sort button, title-header inline search, one publication sync
+ * action, and the tags-filter popover; right-click customizes column order +
  * visibility. When `compact` (table is actively scrolling), search +
  * action icons hide so only column labels remain; row height stays
- * fixed (`h-9`). Transient drag state (dragKey/dragOverKey) lives here —
+ * fixed (`h-10`). Transient drag state (dragKey/dragOverKey) lives here —
  * the parent only receives committed reorder events. Memoized so
  * scrolling the virtualized body does not re-render the header unless
  * compact/props change.
  */
-import { Award, ListFilter, RefreshCw, Search, X } from "lucide-react";
+import {
+	Check,
+	ListFilter,
+	MoreHorizontal,
+	Plus,
+	RefreshCw,
+	Search,
+	X,
+} from "lucide-react";
 import { memo, useEffect, useState } from "react";
+import {
+	CreatePropertyDialog,
+	DeletePropertyDialog,
+	RenamePropertyDialog,
+} from "@/components/library/custom-property-dialogs";
 import { LibraryColumnResizeHandle } from "@/components/library/library-column-resize-handle";
-import { COLUMN_META, SortIcon } from "@/components/library/library-columns";
+import { getColumnMeta, SortIcon } from "@/components/library/library-columns";
 import type {
 	CellT,
 	SortDir,
 	SortKey,
 } from "@/components/library/library-row-utils";
 import { PaperTagChip } from "@/components/library/paper-tag-chip";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
 	ContextMenu,
 	ContextMenuCheckboxItem,
@@ -40,18 +54,13 @@ import {
 	TooltipContent,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { errorMessage, notifyError, notifySuccess } from "@/lib/core/notify";
 import { cn } from "@/lib/core/utils";
 import {
-	buildEasyScholarTags,
-	fetchEasyScholarRank,
-	mergeEasyScholarTags,
-} from "@/lib/easyscholar";
-import type { PaperMetadata } from "@/lib/paper";
-import { libraryStore, setLibraryPaperTags } from "@/lib/paper/library-store";
+	type CustomProperty,
+	useCustomProperties,
+} from "@/lib/paper/custom-properties-store";
 import type { PaperTag } from "@/lib/paper/tags";
 import type { LibraryColumnPref } from "@/lib/settings";
-import { getVaultPath } from "@/lib/vault/store";
 
 type LibraryTableHeaderProps = {
 	t: CellT;
@@ -71,9 +80,9 @@ type LibraryTableHeaderProps = {
 	searchEnabled: boolean;
 	inputValue: string;
 	onInputChange: (value: string) => void;
-	/** Metadata refresh (local vault only). */
-	canRefreshMetadata: boolean;
-	onRefreshMetadata: () => void;
+	/** Publication sync (metadata + Host tag/metrics projection). */
+	canSyncPublication: boolean;
+	onSyncPublication: () => void;
 	/** Tags-column filter popover. */
 	availableTags: PaperTag[];
 	tagFilterSet: Set<string>;
@@ -86,10 +95,12 @@ type LibraryTableHeaderProps = {
 	onResetColumns: () => void;
 	onColumnReorder: (fromKey: SortKey, toKey: SortKey) => void;
 	onColumnResize: (key: SortKey, width: number | null, commit: boolean) => void;
-	/** Vault path for EasyScholar batch tag fetch. */
 	vaultPath?: string | null;
-	/** Papers currently visible in the library scope. */
-	papers: PaperMetadata[];
+	/** Selection mode: leading select-all checkbox column is drawn. */
+	showSelection: boolean;
+	allSelected: boolean;
+	someSelected: boolean;
+	onToggleAll: (next: boolean) => void;
 };
 
 export const LibraryTableHeader = memo(function LibraryTableHeader({
@@ -103,8 +114,8 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 	searchEnabled,
 	inputValue,
 	onInputChange,
-	canRefreshMetadata,
-	onRefreshMetadata,
+	canSyncPublication,
+	onSyncPublication,
 	availableTags,
 	tagFilterSet,
 	tagFilterActive,
@@ -116,71 +127,32 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 	onColumnReorder,
 	onColumnResize,
 	vaultPath,
-	papers,
+	showSelection,
+	allSelected,
+	someSelected,
+	onToggleAll,
 }: LibraryTableHeaderProps) {
 	// --- Column customization (order + visibility) ---
 	const [dragKey, setDragKey] = useState<SortKey | null>(null);
 	const [dragOverKey, setDragOverKey] = useState<SortKey | null>(null);
 	const [tagFilterOpen, setTagFilterOpen] = useState(false);
-	const [rankBusy, setRankBusy] = useState(false);
+	// Custom Property Dialog states
+	const customProps = useCustomProperties();
+	const [createPropOpen, setCreatePropOpen] = useState(false);
+	const [renamePropTarget, setRenamePropTarget] =
+		useState<CustomProperty | null>(null);
+	const [deletePropTarget, setDeletePropTarget] =
+		useState<CustomProperty | null>(null);
 
 	useEffect(() => {
 		if (compact) setTagFilterOpen(false);
 	}, [compact]);
 
 	const showActions = !compact;
-	/** Fade chrome in place (keeps h-9); hide instantly, restore with fade-in. */
+	/** Fade chrome in place (keeps h-10); hide instantly, restore with fade-in. */
 	const chromeFadeClass = showActions
 		? "opacity-100 duration-300"
 		: "pointer-events-none opacity-0 duration-0";
-	const canFetchRanks = Boolean(vaultPath) && !rankBusy && papers.length > 0;
-
-	const fetchAllRanks = async () => {
-		if (!vaultPath || rankBusy) return;
-		setRankBusy(true);
-		let updated = 0;
-		let failed = 0;
-		let empty = 0;
-		try {
-			for (const paper of papers) {
-				const title = paper.publication?.trim();
-				if (!title || !paper.path) continue;
-				try {
-					const response = await fetchEasyScholarRank(title);
-					const data = response.data?.officialRank?.all;
-					if (!data || Object.keys(data).length === 0) {
-						empty += 1;
-						continue;
-					}
-					const newTags = buildEasyScholarTags(title, data);
-					// The request may take seconds: merge with edits made while it was in flight.
-					if (getVaultPath() !== vaultPath) break;
-					const current = libraryStore
-						.getState()
-						.papers.find((row) => row.path === paper.path);
-					if (!current) continue;
-					await setLibraryPaperTags(
-						vaultPath,
-						paper.path,
-						mergeEasyScholarTags(current.tags, newTags),
-					);
-					updated += 1;
-				} catch {
-					failed += 1;
-					// Continue with the next paper; summarize at the end.
-				}
-			}
-			notifySuccess(
-				t("papersLibrary.easyScholar.batchDone", { updated, failed, empty }),
-			);
-		} catch (err) {
-			notifyError(t("papersLibrary.easyScholar.fetchFailed"), {
-				description: errorMessage(err),
-			});
-		} finally {
-			setRankBusy(false);
-		}
-	};
 
 	return (
 		<ContextMenu>
@@ -190,8 +162,28 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 					className="sticky top-0 z-[1] select-none border-b border-transparent bg-background/72 shadow-[0_1px_0_0_color-mix(in_oklch,var(--border)_55%,transparent)] backdrop-blur-xl backdrop-saturate-150 supports-backdrop-blur:bg-background/60"
 				>
 					<tr className="text-muted-foreground text-xs tracking-wide">
+						{showSelection ? (
+							<th className="w-8 min-w-8 p-0 font-normal">
+								<div className="flex h-10 items-center justify-center">
+									<Checkbox
+										checked={
+											allSelected
+												? true
+												: someSelected
+													? "indeterminate"
+													: false
+										}
+										aria-label={t("papersLibrary.selection.selectAll")}
+										title={t("papersLibrary.selection.selectAll")}
+										onClick={(e) => e.stopPropagation()}
+										onMouseDown={(e) => e.stopPropagation()}
+										onCheckedChange={(next) => onToggleAll(next === true)}
+									/>
+								</div>
+							</th>
+						) : null}
 						{visibleColumns.map((col) => {
-							const meta = COLUMN_META[col.key];
+							const meta = getColumnMeta(col.key);
 							const active = sortKey === col.key;
 							const isDragOver = dragOverKey === col.key && dragKey !== col.key;
 							const isTitle = col.key === "title";
@@ -247,22 +239,28 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 										setDragOverKey(null);
 									}}
 								>
-									{/* Fixed h-9 so compact fade never changes header height. */}
-									<div className="flex h-9 min-w-0 items-center gap-1 px-3">
+									{/* Fixed h-10 so compact fade never changes header height. */}
+									<div className="flex h-10 min-w-0 items-center gap-1.5 px-3.5">
 										<button
 											type="button"
 											className={cn(
-												"flex min-w-0 shrink items-center gap-1 py-0.5 text-left cursor-grab active:cursor-grabbing",
+												"flex min-w-0 shrink items-center gap-1 py-1 text-left cursor-grab active:cursor-grabbing",
 												"hover:text-foreground",
 												"focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
 												active && "text-foreground",
 											)}
 											onClick={() => onSort(col.key)}
 											aria-label={t("papersLibrary.sortBy", {
-												column: t(meta.labelKey),
+												column: col.key.startsWith("prop:")
+													? meta.labelKey
+													: t(meta.labelKey),
 											})}
 										>
-											<span className="truncate">{t(meta.labelKey)}</span>
+											<span className="truncate">
+												{col.key.startsWith("prop:")
+													? meta.labelKey
+													: t(meta.labelKey)}
+											</span>
 											<span
 												className={cn(
 													"inline-flex transition-opacity ease-out",
@@ -295,7 +293,7 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 												aria-hidden={!showActions}
 											>
 												<Search
-													className="pointer-events-none absolute top-1/2 left-1.5 size-3 -translate-y-1/2 text-muted-foreground"
+													className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground"
 													aria-hidden
 												/>
 												<Input
@@ -304,14 +302,14 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 													onChange={(e) => onInputChange(e.target.value)}
 													aria-label={t("papersLibrary.search")}
 													tabIndex={showActions ? undefined : -1}
-													className="h-6 border-transparent bg-muted/70 pl-6 pr-1.5 text-xs shadow-none placeholder:text-muted-foreground/70 focus-visible:border-border/60 focus-visible:bg-card"
+													className="h-7 border-transparent bg-muted/70 pl-7 pr-2 text-xs shadow-none placeholder:text-muted-foreground/70 focus-visible:border-border/60 focus-visible:bg-card"
 													onMouseDown={(e) => e.stopPropagation()}
 													onClick={(e) => e.stopPropagation()}
 													onKeyDown={(e) => e.stopPropagation()}
 												/>
 											</div>
 										) : null}
-										{isPublication && canRefreshMetadata ? (
+										{isPublication && canSyncPublication ? (
 											<Tooltip>
 												<TooltipTrigger asChild>
 													<button
@@ -319,17 +317,17 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 														data-library-header-action
 														tabIndex={showActions ? undefined : -1}
 														className={cn(
-															"ml-1 flex size-6 shrink-0 items-center justify-center rounded-sm",
+															"ml-1 flex size-7 shrink-0 items-center justify-center rounded-md",
 															"hover:bg-muted/60 hover:text-foreground",
 															"focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
 															"transition-opacity ease-out",
 															chromeFadeClass,
 														)}
 														aria-hidden={!showActions}
-														aria-label={t("papersLibrary.refreshMetadata")}
+														aria-label={t("papersLibrary.syncPublication")}
 														onClick={(e) => {
 															e.stopPropagation();
-															onRefreshMetadata();
+															onSyncPublication();
 														}}
 														onMouseDown={(e) => e.stopPropagation()}
 													>
@@ -337,154 +335,169 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 													</button>
 												</TooltipTrigger>
 												<TooltipContent side="bottom">
-													{t("papersLibrary.refreshMetadata")}
+													{t("papersLibrary.syncPublication")}
 												</TooltipContent>
 											</Tooltip>
 										) : null}
 										{isTags ? (
-											<>
+											<Popover
+												open={tagFilterOpen}
+												onOpenChange={setTagFilterOpen}
+											>
 												<Tooltip>
 													<TooltipTrigger asChild>
-														<button
-															type="button"
-															data-library-header-action
-															disabled={!canFetchRanks}
-															tabIndex={showActions ? undefined : -1}
-															className={cn(
-																"ml-1 flex size-6 shrink-0 items-center justify-center rounded-sm",
-																"hover:bg-muted/60 hover:text-foreground",
-																"focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-																"disabled:pointer-events-none",
-																showActions && "disabled:opacity-50",
-																"transition-opacity ease-out",
-																chromeFadeClass,
-															)}
-															aria-hidden={!showActions}
-															aria-label={t(
-																"papersLibrary.easyScholar.fetchRank",
-															)}
-															title={t("papersLibrary.easyScholar.fetchRank")}
-															onClick={(e) => {
-																e.stopPropagation();
-																void fetchAllRanks();
-															}}
-															onMouseDown={(e) => e.stopPropagation()}
-														>
-															<Award className="size-3.5" aria-hidden />
-														</button>
+														<PopoverTrigger asChild>
+															<button
+																type="button"
+																data-library-header-action
+																tabIndex={showActions ? undefined : -1}
+																className={cn(
+																	"ml-auto flex size-7 shrink-0 items-center justify-center rounded-md",
+																	"hover:bg-muted/60 hover:text-foreground",
+																	"focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+																	"transition-opacity ease-out",
+																	chromeFadeClass,
+																	tagFilterActive &&
+																		showActions &&
+																		"bg-muted/60 text-foreground",
+																)}
+																aria-hidden={!showActions}
+																aria-label={t("papersLibrary.filterTags")}
+																aria-pressed={tagFilterActive}
+																onClick={(e) => e.stopPropagation()}
+																onMouseDown={(e) => e.stopPropagation()}
+															>
+																<ListFilter className="size-3.5" aria-hidden />
+															</button>
+														</PopoverTrigger>
 													</TooltipTrigger>
 													<TooltipContent side="bottom">
-														{t("papersLibrary.easyScholar.fetchRank")}
+														{t("papersLibrary.filterTags")}
 													</TooltipContent>
 												</Tooltip>
-												<Popover
-													open={tagFilterOpen}
-													onOpenChange={setTagFilterOpen}
+												<PopoverContent
+													align="start"
+													className="w-56 p-1.5"
+													onOpenAutoFocus={(e) => e.preventDefault()}
 												>
-													<Tooltip>
-														<TooltipTrigger asChild>
+													{availableTags.length === 0 ? (
+														<p className="px-1 py-2 text-muted-foreground text-xs">
+															{t("papersLibrary.filterTagsEmpty")}
+														</p>
+													) : (
+														<div className="flex max-h-56 flex-col gap-0.5 overflow-y-auto">
+															{availableTags.map((tag) => {
+																const selected = tagFilterSet.has(tag.name);
+																return (
+																	<button
+																		key={tag.name}
+																		type="button"
+																		className={cn(
+																			"flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs",
+																			"hover:bg-muted/60",
+																			selected && "bg-muted/50",
+																		)}
+																		aria-pressed={selected}
+																		onClick={() => onToggleTagFilter(tag.name)}
+																	>
+																		<span
+																			className={cn(
+																				"flex size-4 shrink-0 items-center justify-center rounded-[4px] border",
+																				selected
+																					? "border-primary bg-primary text-primary-foreground"
+																					: "border-muted-foreground/40",
+																			)}
+																			aria-hidden
+																		>
+																			{selected ? (
+																				<Check className="size-3.5" />
+																			) : null}
+																		</span>
+																		<PaperTagChip tag={tag} />
+																	</button>
+																);
+															})}
+														</div>
+													)}
+													{tagFilterActive ? (
+														<>
+															<div className="my-1.5 h-px bg-border" />
+															<button
+																type="button"
+																className="flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-muted-foreground text-xs hover:bg-muted/60 hover:text-foreground"
+																onClick={onClearTagFilter}
+															>
+																<X className="size-3" aria-hidden />
+																{t("papersLibrary.clearTagFilter")}
+															</button>
+														</>
+													) : null}
+												</PopoverContent>
+											</Popover>
+										) : null}
+										{col.key.startsWith("prop:")
+											? (() => {
+													const propId = col.key.slice(5);
+													const prop = customProps.find((p) => p.id === propId);
+													if (!prop) return null;
+													return (
+														<Popover>
 															<PopoverTrigger asChild>
 																<button
 																	type="button"
 																	data-library-header-action
-																	tabIndex={showActions ? undefined : -1}
 																	className={cn(
-																		"ml-auto flex size-6 shrink-0 items-center justify-center rounded-sm",
+																		"flex size-5 shrink-0 items-center justify-center rounded p-0.5 text-muted-foreground",
 																		"hover:bg-muted/60 hover:text-foreground",
 																		"focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
 																		"transition-opacity ease-out",
 																		chromeFadeClass,
-																		tagFilterActive &&
-																			showActions &&
-																			"bg-muted/60 text-foreground",
 																	)}
-																	aria-hidden={!showActions}
-																	aria-label={t("papersLibrary.filterTags")}
-																	aria-pressed={tagFilterActive}
 																	onClick={(e) => e.stopPropagation()}
 																	onMouseDown={(e) => e.stopPropagation()}
 																>
-																	<ListFilter
+																	<MoreHorizontal
 																		className="size-3.5"
 																		aria-hidden
 																	/>
 																</button>
 															</PopoverTrigger>
-														</TooltipTrigger>
-														<TooltipContent side="bottom">
-															{t("papersLibrary.filterTags")}
-														</TooltipContent>
-													</Tooltip>
-													<PopoverContent
-														align="start"
-														className="w-56 p-2"
-														onOpenAutoFocus={(e) => e.preventDefault()}
-													>
-														{availableTags.length === 0 ? (
-															<p className="px-1 py-2 text-muted-foreground text-xs">
-																{t("papersLibrary.filterTagsEmpty")}
-															</p>
-														) : (
-															<div className="flex max-h-56 flex-col gap-0.5 overflow-y-auto">
-																{availableTags.map((tag) => {
-																	const selected = tagFilterSet.has(tag.name);
-																	return (
-																		<button
-																			key={tag.name}
-																			type="button"
-																			className={cn(
-																				"flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-xs",
-																				"hover:bg-muted/60",
-																				selected && "bg-muted/50",
-																			)}
-																			aria-pressed={selected}
-																			onClick={() =>
-																				onToggleTagFilter(tag.name)
-																			}
-																		>
-																			<span
-																				className={cn(
-																					"flex size-3.5 shrink-0 items-center justify-center rounded-sm border",
-																					selected
-																						? "border-primary bg-primary text-primary-foreground"
-																						: "border-muted-foreground/40",
-																				)}
-																				aria-hidden
-																			>
-																				{selected ? (
-																					<span className="text-caption leading-none">
-																						✓
-																					</span>
-																				) : null}
-																			</span>
-																			<PaperTagChip tag={tag} />
-																		</button>
-																	);
-																})}
-															</div>
-														)}
-														{tagFilterActive ? (
-															<>
-																<div className="my-1.5 h-px bg-border" />
+															<PopoverContent
+																align="start"
+																className="w-40 p-1.5 text-xs"
+																onClick={(e) => e.stopPropagation()}
+															>
 																<button
 																	type="button"
-																	className="flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-muted-foreground text-xs hover:bg-muted/60 hover:text-foreground"
-																	onClick={onClearTagFilter}
+																	className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-left hover:bg-muted"
+																	onClick={() => setRenamePropTarget(prop)}
 																>
-																	<X className="size-3" aria-hidden />
-																	{t("papersLibrary.clearTagFilter")}
+																	{t(
+																		"papersLibrary.customProperties.renameProperty",
+																	)}
 																</button>
-															</>
-														) : null}
-													</PopoverContent>
-												</Popover>
-											</>
-										) : null}
+																<div className="my-0.5 border-t" />
+																<button
+																	type="button"
+																	className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-destructive text-left hover:bg-destructive/10"
+																	onClick={() => setDeletePropTarget(prop)}
+																>
+																	{t(
+																		"papersLibrary.customProperties.deleteProperty",
+																	)}
+																</button>
+															</PopoverContent>
+														</Popover>
+													);
+												})()
+											: null}
 									</div>
 									{canCustomizeColumns ? (
 										<LibraryColumnResizeHandle
 											label={t("papersLibrary.resizeColumn", {
-												column: t(meta.labelKey),
+												column: col.key.startsWith("prop:")
+													? meta.labelKey
+													: t(meta.labelKey),
 											})}
 											onResize={(width, commit) =>
 												onColumnResize(col.key, width, commit)
@@ -494,6 +507,30 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 								</th>
 							);
 						})}
+						<th className="w-9 min-w-9 p-0 text-center">
+							<div className="flex h-10 items-center justify-center">
+								<Tooltip>
+									<TooltipTrigger asChild>
+										<button
+											type="button"
+											onClick={() => setCreatePropOpen(true)}
+											className={cn(
+												"flex size-7 items-center justify-center rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted/80 hover:text-foreground",
+												chromeFadeClass,
+											)}
+											aria-label={t(
+												"papersLibrary.customProperties.addProperty",
+											)}
+										>
+											<Plus className="size-3.5" />
+										</button>
+									</TooltipTrigger>
+									<TooltipContent side="bottom">
+										{t("papersLibrary.customProperties.addProperty")}
+									</TooltipContent>
+								</Tooltip>
+							</div>
+						</th>
 					</tr>
 				</thead>
 			</ContextMenuTrigger>
@@ -509,9 +546,16 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 						onSelect={(e) => e.preventDefault()}
 						onCheckedChange={() => onToggleColumn(col.key)}
 					>
-						{t(COLUMN_META[col.key].labelKey)}
+						{col.key.startsWith("prop:")
+							? getColumnMeta(col.key).labelKey
+							: t(getColumnMeta(col.key).labelKey)}
 					</ContextMenuCheckboxItem>
 				))}
+				<ContextMenuSeparator />
+				<ContextMenuItem onSelect={() => setCreatePropOpen(true)}>
+					<Plus className="size-3.5 mr-1.5" />
+					{t("papersLibrary.customProperties.addProperty")}
+				</ContextMenuItem>
 				<ContextMenuSeparator />
 				<ContextMenuItem
 					disabled={!canCustomizeColumns}
@@ -520,6 +564,21 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 					{t("papersLibrary.resetColumns")}
 				</ContextMenuItem>
 			</ContextMenuContent>
+			<CreatePropertyDialog
+				open={createPropOpen}
+				onOpenChange={setCreatePropOpen}
+				vaultPath={vaultPath}
+			/>
+			<RenamePropertyDialog
+				property={renamePropTarget}
+				open={Boolean(renamePropTarget)}
+				onOpenChange={(open) => !open && setRenamePropTarget(null)}
+			/>
+			<DeletePropertyDialog
+				property={deletePropTarget}
+				open={Boolean(deletePropTarget)}
+				onOpenChange={(open) => !open && setDeletePropTarget(null)}
+			/>
 		</ContextMenu>
 	);
 });

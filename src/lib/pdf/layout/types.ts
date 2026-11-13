@@ -1,4 +1,5 @@
 import type { PdfAskNormalizedRect } from "@/lib/pdf/ask/types";
+import type { LayoutSourceStyle } from "@/lib/pdf/layout/source-style";
 
 /**
  * Layout kinds we may store from PP-DocLayoutV3.
@@ -19,6 +20,17 @@ export type PdfLayoutKind =
 	| "abstract"
 	/** Paragraph / body text — blocker for formula merge, never sidebar. */
 	| "text";
+
+/** Minimal raw region shape shared by anchor enumeration and reading order. */
+export type DocumentAnchorRegion = {
+	id: string;
+	pageIndex: number;
+	kind: string;
+	title?: string;
+	text?: string;
+	readingOrder?: number;
+	bbox?: { x: number; y: number; w: number; h: number };
+};
 
 /**
  * One detected region after layout analysis.
@@ -55,11 +67,16 @@ export type PdfLayoutRegion = {
 	 * this region's bbox (not used for figure-caption merge).
 	 */
 	text?: string;
+	/** Dominant source style, preserved through cache and translation. */
+	sourceStyle?: LayoutSourceStyle;
 	/**
 	 * Normalized caption box (before union into bbox), if a title was attached.
 	 * For formulas: the model `formula_number` box geometry (no text parse).
 	 */
 	titleBbox?: PdfAskNormalizedRect;
+	/** Caption on another page; never union these coordinates into the figure. */
+	captionPageIndex?: number;
+	captionBbox?: PdfAskNormalizedRect;
 	/**
 	 * Semantic role of a caption box (from text / geometry).
 	 * Used so "Table 2: …" mislabeled as figure_title still binds to tables,
@@ -91,15 +108,44 @@ export type PdfLayoutDocumentResult = {
 	counts: Record<PdfLayoutKind, number>;
 };
 
+/**
+ * One English sentence and its translation inside a layout block.
+ * `quote` is the text-layer slice (hyphens kept). `source` is the normalized
+ * string sent to the engine. `translated` is the whole sentence. `display` is
+ * the slice painted in this block when the sentence continues in another box.
+ */
+export type LayoutTranslateSentence = {
+	quote: string;
+	source: string;
+	translated: string;
+	display?: string;
+};
+
 /** Reading-order region extracted as one translatable source unit. */
 export type LayoutTranslateRegion = {
+	/** Character-level source; regenerated from the PDF, not duplicated in cache. */
+	reflow?: import("@/lib/pdf/reflow/types").Paragraph;
+	reflowFallback?: "protected-spans";
+	/** Shared page preview rendered from the same PDF bytes used for export. */
+	reflowPreview?: string;
+	/** Output versions that contain this page preview. Transient renderer state. */
+	reflowPreviewSources?: WeakSet<
+		import("@/lib/pdf/reflow/output-version").ReflowOutputVersion
+	>;
+	reflowLayout?: import("@/lib/pdf/reflow/types").ParagraphLayout;
 	id: string;
 	pageIndex: number;
 	bbox: PdfLayoutRegion["bbox"];
 	kind: PdfLayoutRegion["kind"];
 	readingOrder: number;
-	/** Source PDF text (trimmed, possibly truncated for the API). */
+	sourceStyle?: LayoutSourceStyle;
+	/** Complete normalized source; request limits apply only to transport. */
 	source: string;
+	/**
+	 * Text-layer string before hyphen healing. Sentence quotes are cut from
+	 * this. Not written to the sidecar.
+	 */
+	raw?: string;
 };
 
 export type LayoutTranslateItemStatus =
@@ -111,9 +157,13 @@ export type LayoutTranslateItemStatus =
 
 export type LayoutTranslateItem = LayoutTranslateRegion & {
 	status: LayoutTranslateItemStatus;
+	/** Transient settled sentence share while a paragraph is still translating. */
+	progress?: number;
 	/** Translated text when status is done (or partial). */
 	translated?: string;
 	error?: string;
+	/** Sentence pairs for this block. Absent when the block was not paired. */
+	sentences?: LayoutTranslateSentence[];
 };
 
 export type LayoutAnalysisUiStatus =

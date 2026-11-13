@@ -1,8 +1,8 @@
 # 用 MCP 连接外部 Agent
 
-设置里打开 **MCP server** 后，ChatGPT / Codex / MCP Inspector 可以调用当前 Vault 的论文库（列表、入库、写 NOTES），不必把 MCP 暴露到公网。
+设置里打开 **MCP server** 后，ChatGPT / Codex / MCP Inspector 可以调用本地 Vault 的论文库（列表、入库、写 NOTES、移动/删除文件），不必把 MCP 暴露到公网。默认操作打开的 Vault；先用 `vault_list` 可查看并切换到其它打开过的本地 Vault。
 
-应用必须开着。远端 Vault 不可用。应用内 Agent 面板走 ACP（[接入 Agent](agents.md)）；本篇是给 **外部** MCP 客户端用的。协议与工具表：[backend/mcp.md](../backend/mcp.md)。
+桌面路径下应用必须开着。远端 Vault 不可用。无桌面的服务器用 `agentero mcp serve`（见文末），不必开 App。应用内 Agent 面板走 ACP（[接入 Agent](agents.md)）；本篇是给 **外部** MCP 客户端用的。协议与工具表：[backend/mcp.md](../backend/mcp.md)。
 
 接到 ChatGPT 时，按设置页从上到下做，不要先装客户端：
 
@@ -23,6 +23,8 @@ Agentero 是 **无 OAuth 的 loopback HTTP MCP**，对应 quickstart 的 sample 
 2. **Settings → General → MCP server** 打开开关。默认地址 `http://127.0.0.1:8765/mcp`；端口旁绿点表示正在监听。
 
 本机 Inspector、能打 loopback 的客户端到这里就可以用这个地址。后面的 API key、隧道和 client 只服务 ChatGPT。
+
+外部 Agent 保存图片等二进制文件时，使用 `file_write`，把文件编码成标准 Base64 放进 `content`，并传 `encoding: "base64"` 和 Vault 相对 `path`（例如 `assets/figure.png`）。不带 `data:` 前缀；仅支持替换，覆盖前需确认，解码后最多 2 MiB。普通文本写入无需传 `encoding`，仍支持追加；`file_read` 仍只读文本。
 
 ## 2. 获取 Runtime API key
 
@@ -140,10 +142,12 @@ tunnel-client run --profile agentero
 
 - `paper_list` / `paper_get` — 论文 metadata（list 默认瘦字段；`fields` / `full` 按需）
 - `paper_set_read` — 标记已读/未读
+- `paper_set_meta` — 更新论文元数据（所属会议/期刊、标题、日期、DOI 等）
 - `import_id` — arXiv / DOI / URL 入库
 - `paper_notes_get` / `paper_notes_write` — 读写该篇 `NOTES.md`
 - `paper_tag_add` / `paper_tag_rm` — 标签
 - `layout_list` / `layout_get` — 侧栏图/表/公式索引（需先在 App 跑版面分析）
+- `vault_search {"query":"transformer attention","limit":10}` — 只读全库 Markdown 关键词 AND 搜索，非语义检索。返回相对 path、snippet、1-based line 和 truncated；用 `file_read {"path": hit.path}` 回读定位。不读 PDF，不服务 Remote Vault。
 - `file_list` / `file_read` / `file_write` — 读改 Vault 里 `papers/` 以外的文本，例如自己的 `drafts/main.tex`。一次只列一层目录；不碰 `.agentero`、PDF 和 `NOTES.md`（笔记仍用 `paper_notes_write`）
 - Resources：`agentero://vault`、`agentero://agent-invariants`、`agentero://skills/agentero-cli`
 
@@ -159,3 +163,13 @@ tunnel-client run --profile agentero
 | Homebrew 装错包 | `openai/tools/tunnel-client`，不是 `tunnel` |
 
 官方帮助：`tunnel-client help oauth`、`help plugin`、`help troubleshooting`。
+
+## 无桌面服务器
+
+文献库已经在 Linux 服务器上时，不用开笔记本上的 App。在服务器上前台启动同一套 MCP，只绑本机：
+
+```sh
+agentero mcp serve --vault /path/to/vault --listen 127.0.0.1:8765
+```
+
+客户端和这个进程在同一台机器上时，直接连 `http://127.0.0.1:8765/mcp`。笔记本上的客户端经 SSH 本地转发再连。需要把 PDF 正文交给客户端时加上 `--expose-paper-text`。不要把端口绑到公网：这里没有鉴权。OpenAI 隧道仍然只在桌面设置里启动。

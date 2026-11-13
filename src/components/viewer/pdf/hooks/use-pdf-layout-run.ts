@@ -26,14 +26,26 @@ import {
 	enqueuePaperLayoutAnalysis,
 	getLayoutDocumentResult,
 	layoutAnalysisStore,
+	layoutDocumentKey,
 	readLayoutSidecar,
 	runDocumentLayoutAnalysis,
 	setLayoutOverlayVisible,
 } from "@/lib/pdf/layout";
-import { layoutSidecarPath } from "@/lib/pdf/layout/io";
+import {
+	layoutSidecarNeedsViewerReload,
+	layoutSidecarPath,
+} from "@/lib/pdf/layout/io";
+import { openSettingsWindow } from "@/lib/shell/settings-window";
 import { listenVaultFileChangedGated } from "@/lib/vault/file-change-gate";
 import type { VaultFileChangedPayload } from "@/lib/vault/fs-watch";
 import { normalizePathKey } from "@/lib/vault/path";
+
+/**
+ * `generatedAt` of the sidecar already merged into a viewer document.
+ * Headless force re-runs write a new timestamp under another document id
+ * and then drop that id, so the open tab must notice the change itself.
+ */
+const appliedLayoutSidecarAt = new Map<string, string>();
 
 /** In-flight EmbedPDF layout task (abortable, at most one per document). */
 export type LayoutAnalysisTask = Awaited<
@@ -117,6 +129,20 @@ export function usePdfLayoutRun({
 	const layoutTaskRef = useRef<LayoutAnalysisTask | null>(null);
 	const totalPagesRef = useRef(totalPages);
 	totalPagesRef.current = totalPages;
+
+	/** Failure toast that points at the provider settings (issue #656). */
+	const notifyLayoutFailure = useCallback(
+		(message: string) => {
+			notifyError(t("pdf.layout.failed"), {
+				description: message,
+				action: {
+					label: t("pdf.layout.openSettings"),
+					onClick: () => openSettingsWindow("layout"),
+				},
+			});
+		},
+		[t],
+	);
 
 	/**
 	 * Run layout analysis for this document.
@@ -281,8 +307,7 @@ export function usePdfLayoutRun({
 				).catch((e) => {
 					if (isBackgroundTaskCancelledError(e)) return;
 					if (opts?.notifyOnError !== false) {
-						const message = errorText(e);
-						notifyError(t("pdf.layout.failed"), { description: message });
+						notifyLayoutFailure(errorText(e));
 					}
 				});
 				return;
@@ -291,8 +316,7 @@ export function usePdfLayoutRun({
 			void runCore().catch((e) => {
 				if (isBackgroundTaskCancelledError(e)) return;
 				if (opts?.notifyOnError === false) return;
-				const message = errorText(e);
-				notifyError(t("pdf.layout.failed"), { description: message });
+				notifyLayoutFailure(errorText(e));
 			});
 		},
 		[
@@ -300,6 +324,7 @@ export function usePdfLayoutRun({
 			paperAbsPath,
 			paperRelPath,
 			t,
+			notifyLayoutFailure,
 			layoutCapRef,
 			docCap,
 			docCapRef,
@@ -319,35 +344,26 @@ export function usePdfLayoutRun({
 		enqueuePaperLayoutAnalysis({ paperAbsPath });
 	}, [translationPane, isRemotePaper, paperAbsPath]);
 
-	// Active viewer: pull layout into the tab store once sidecar exists.
-	// Headless may still be writing it for this paper (or a sibling tab).
+	// Active viewer: pull layout into the tab store once sidecar exists, and
+	// again whenever that file's parse is replaced. A force re-run writes the
+	// new sidecar from a headless document id, then drops it; without this
+	// reload the figures rail keeps the previous in-memory result until restart.
 	// Loose PDFs (no paper folder) still analyze in-viewer.
 	const layoutAutoStartedForDocRef = useRef<string | null>(null);
 	useEffect(() => {
 		if (translationPane || isRemotePaper || plainViewer) return;
 		if (!isActive) return;
 		if (!layoutCap || totalPages <= 0) return;
-		if (getLayoutDocumentResult(docId)) return;
 		if (!docCap?.isDocumentOpen(docId)) return;
 		if (!layoutCap.forDocument(docId)) return;
 
 		let cancelled = false;
 		let unlisten: (() => void) | null = null;
+		let pullTicket = 0;
 		const sidecarKey = paperAbsPath
 			? normalizePathKey(layoutSidecarPath(paperAbsPath))
 			: null;
-
-		const loadSilent = () => {
-			if (layoutAutoStartedForDocRef.current === docId) return;
-			layoutAutoStartedForDocRef.current = docId;
-			startLayoutAnalysis({
-				force: false,
-				openFigures: false,
-				showOverlay: false,
-				asBackgroundTask: false,
-				notifyOnError: false,
-			});
-		};
+		const appliedKey = layoutDocumentKey(docId);
 
 		const eventHitsSidecar = (payload: VaultFileChangedPayload) => {
 			if (!sidecarKey) return false;
@@ -358,18 +374,49 @@ export function usePdfLayoutRun({
 			return paths.some((path) => normalizePathKey(path) === sidecarKey);
 		};
 
+		const pullSidecar = async () => {
+			if (!paperAbsPath || cancelled) return;
+			const ticket = ++pullTicket;
+			const sidecar = await readLayoutSidecar(paperAbsPath);
+			if (cancelled || ticket !== pullTicket) return;
+			const next = sidecar
+				? {
+						generatedAt: sidecar.source.generatedAt,
+						regionCount: sidecar.regions.length,
+					}
+				: null;
+			if (
+				!sidecar ||
+				!layoutSidecarNeedsViewerReload(
+					getLayoutDocumentResult(docId)
+						? appliedLayoutSidecarAt.get(appliedKey)
+						: undefined,
+					next,
+				)
+			) {
+				return;
+			}
+			appliedLayoutSidecarAt.set(appliedKey, sidecar.source.generatedAt);
+			startLayoutAnalysis({
+				force: false,
+				openFigures: false,
+				showOverlay: false,
+				asBackgroundTask: false,
+				notifyOnError: false,
+			});
+		};
+
 		const tryLoad = async () => {
 			if (cancelled) return;
-			if (getLayoutDocumentResult(docId)) return;
 
 			try {
 				if (paperAbsPath) {
-					const hasSidecar = Boolean(await readLayoutSidecar(paperAbsPath));
-					if (cancelled) return;
-					if (getLayoutDocumentResult(docId)) return;
-					if (hasSidecar) loadSilent();
+					// Also when memory already has a result: the sidecar may have
+					// been replaced while this tab was inactive and not listening.
+					await pullSidecar();
 					return;
 				}
+				if (getLayoutDocumentResult(docId)) return;
 
 				// No paper folder (loose PDF): only the active tab can run in-viewer.
 				if (layoutAutoStartedForDocRef.current === docId) return;
@@ -391,7 +438,7 @@ export function usePdfLayoutRun({
 		if (paperAbsPath && isTauri()) {
 			unlisten = listenVaultFileChangedGated((payload) => {
 				if (cancelled || !eventHitsSidecar(payload)) return;
-				void tryLoad();
+				void pullSidecar();
 			});
 		}
 		void tryLoad();

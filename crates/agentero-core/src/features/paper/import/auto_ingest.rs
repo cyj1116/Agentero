@@ -1,5 +1,7 @@
 //! Auto-ingest (watch folder): adopt bare user-created folders under `papers/`
 //! into the library, in place.
+//! Loose `papers/*.pdf` files first get a collision-safe folder via
+//! [`prepare_loose_pdf`], then follow the same adoption pipeline.
 //!
 //! A folder that appeared as a direct child of `papers/`, holds at least one
 //! settled PDF, and is not already a paper unit / org folder / managed entry is
@@ -225,19 +227,22 @@ pub async fn adopt_paper_folder(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "paper".into());
 
-    // Placeholder id: slug of the user's folder name; when that strips to
-    // nothing (e.g. CJK-only name → "paper" fallback), prefer the first PDF's
-    // stem so `{id}.pdf` still carries something recognizable.
-    let mut id = slug_from_stem(&folder_name);
-    if id == "paper" {
-        if let Some(stem) = pdfs
+    // A placeholder is local to this folder, not evidence that another
+    // directory with the same slug represents the same logical paper.
+    let mut base = slug_from_stem(&folder_name);
+    // Keep the existing identifier-filename preference for CJK folders;
+    // generic names such as `paper.pdf` must not replace the Unicode title.
+    if !folder_name.chars().any(|c| c.is_ascii_alphanumeric()) {
+        if let Some(arxiv) = pdfs
             .first()
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
+            .and_then(super::extract_arxiv_id)
         {
-            id = slug_from_stem(stem);
+            base = slug_from_stem(&arxiv);
         }
     }
+    let id = papers::allocate_local_id(vault, &base, &rel)?;
 
     // Main-PDF heuristic among several: a PDF named after the folder (or
     // already `{id}.pdf`) is the obvious paper; otherwise the largest file —
@@ -287,12 +292,13 @@ pub async fn adopt_paper_folder(
     write_paper_shell_opts(dir, vault, &meta, opts.note_mode, false).await?;
     let record = meta.at_path(&rel);
     papers::upsert_paper(vault, &record)?;
+    super::code_repo::fill_code_repo_from_pdf(vault, &rel).await;
 
     if let Some(cache) = opts.cache {
         cache.invalidate(vault, &rel);
     }
-    crate::features::lifecycle::emit_paper_imported(opts.app, vault, &record.id);
-    crate::features::lifecycle::emit_paper_assets_ready(opts.app, vault, &record.id);
+    crate::features::lifecycle::emit_paper_imported(opts.app, vault, &record.id, &record.path);
+    crate::features::lifecycle::emit_paper_assets_ready(opts.app, vault, &record.id, &record.path);
     // Deferred recognition owns the follow-ups (rename/merge + parse), exactly
     // like picker/drop imports without dialog metadata.
     if let Some(app) = opts.app {
@@ -312,12 +318,61 @@ pub async fn adopt_paper_folder(
     })
 }
 
-/// Size snapshot of the real PDFs directly inside `dir` (settle probing).
+/// Size snapshot of one candidate file or PDFs directly inside a directory.
 pub fn pdf_snapshot(dir: &Path) -> Vec<(PathBuf, u64)> {
-    direct_pdfs(dir)
-        .into_iter()
+    let pdfs = if dir.is_file() {
+        vec![dir.to_path_buf()]
+    } else {
+        direct_pdfs(dir)
+    };
+    pdfs.into_iter()
         .filter_map(|p| std::fs::metadata(&p).ok().map(|m| (p, m.len())))
         .collect()
+}
+
+/// Give a loose `papers/*.pdf` its own folder before normal adoption. Never
+/// merge into an existing folder or overwrite another file. On later adoption
+/// failure the bare folder remains discoverable by startup reconciliation.
+pub fn prepare_loose_pdf(vault: &Path, pdf: &Path) -> Result<PathBuf, AppError> {
+    let canonical = crate::fs::canonicalize_best_effort(vault);
+    let parent = pdf.parent();
+    if (parent != Some(vault.join("papers").as_path())
+        && parent != Some(canonical.join("papers").as_path()))
+        || pdf.is_symlink()
+        || !pdf.is_file()
+        || !pdf
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        || !pdf
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| !name.starts_with('.') && !is_temp_download(name))
+    {
+        return Err(AppError::message("not a loose papers PDF"));
+    }
+    let stem = pdf.file_stem().unwrap().to_string_lossy();
+    let parent = pdf.parent().unwrap();
+    for suffix in 1.. {
+        let name = if suffix == 1 {
+            stem.to_string()
+        } else {
+            format!("{stem}-{suffix}")
+        };
+        let folder = parent.join(name);
+        match std::fs::create_dir(&folder) {
+            Ok(()) => {
+                if let Err(error) = std::fs::rename(pdf, folder.join(pdf.file_name().unwrap())) {
+                    // Only remove the empty directory this attempt created.
+                    let _ = std::fs::remove_dir(&folder);
+                    return Err(error.into());
+                }
+                return Ok(folder);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!()
 }
 
 /// True when two snapshots agree (same files, same sizes): the copy finished.
@@ -366,6 +421,70 @@ mod tests {
     fn write(path: &Path, bytes: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, bytes).unwrap();
+    }
+
+    #[tokio::test]
+    async fn loose_pdf_uses_normal_adoption_without_overwriting_existing_folder() {
+        let vault = tmp_vault("loose-pdf");
+        let pdf = vault.join("papers/Book.PDF");
+        write(&pdf, b"%PDF-1.4 book");
+        write(&vault.join("papers/Book/NOTES.md"), b"existing notes");
+        let folder = prepare_loose_pdf(&vault, &pdf).unwrap();
+        assert_eq!(folder, vault.join("papers/Book-2"));
+        assert!(!pdf.exists());
+        let result = adopt_paper_folder(
+            &vault,
+            &folder,
+            AdoptOptions {
+                note_mode: NoteShellMode::TitleOnly,
+                cache: None,
+                app: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read(folder.join(format!("{}.pdf", result.id))).unwrap(),
+            b"%PDF-1.4 book"
+        );
+        assert!(folder.join("NOTES.md").is_file());
+        assert!(papers::get_by_path(&vault, &result.path).unwrap().is_some());
+        assert_eq!(
+            fs::read(vault.join("papers/Book/NOTES.md")).unwrap(),
+            b"existing notes"
+        );
+        assert!(prepare_loose_pdf(&vault, &pdf).is_err());
+        let _ = fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn loose_pdf_preparation_rejects_other_locations_and_file_types() {
+        let vault = tmp_vault("loose-guard");
+        for rel in [
+            "notes/book.pdf",
+            "papers/topic/book.pdf",
+            "papers/book.txt",
+            "papers/.book.pdf",
+            "papers/~$book.pdf",
+        ] {
+            let file = vault.join(rel);
+            write(&file, b"keep");
+            assert!(prepare_loose_pdf(&vault, &file).is_err());
+            assert_eq!(fs::read(&file).unwrap(), b"keep");
+        }
+        let _ = fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn loose_pdf_settle_snapshot_tracks_only_the_candidate() {
+        let vault = tmp_vault("loose-settle");
+        let pdf = vault.join("papers/book.pdf");
+        write(&pdf, b"first");
+        let before = pdf_snapshot(&pdf);
+        write(&pdf, b"copy still growing");
+        assert!(!snapshots_settled(&before, &pdf_snapshot(&pdf)));
+        assert!(!pdf_snapshot(&pdf).is_empty());
+        let _ = fs::remove_dir_all(vault);
     }
 
     #[test]
@@ -490,9 +609,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adopt_keeps_identifier_named_pdf_and_uses_pdf_stem_for_cjk_folder() {
+    async fn chinese_papers_are_independently_visible_after_adoption_and_rescan() {
+        let vault = tmp_vault("chinese-library");
+        for name in [
+            "舞蹈概论",
+            "舞蹈学中国学派的构成及其方向",
+            "舞蹈 概论",
+            "舞蹈_概论",
+        ] {
+            let dir = vault.join("papers").join(name);
+            write(&dir.join(format!("{name}.pdf")), b"%PDF-1.4 Chinese paper");
+            let result = adopt_paper_folder(
+                &vault,
+                &dir,
+                AdoptOptions {
+                    note_mode: NoteShellMode::TitleOnly,
+                    cache: None,
+                    app: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_ne!(result.id, "paper");
+            assert!(dir.join(format!("{}.pdf", result.id)).is_file());
+            assert_eq!(
+                papers::get_by_path(&vault, &result.path)
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                result.id
+            );
+        }
+        let before = papers::list_all_unique_by_id(&vault).unwrap();
+        assert_eq!(before.len(), 4);
+        let ids: std::collections::HashSet<_> = before.iter().map(|r| &r.id).collect();
+        assert_eq!(ids.len(), 4);
+        assert_eq!(papers::rebuild_from_disk(&vault).unwrap(), 0);
+        assert_eq!(papers::list_all_unique_by_id(&vault).unwrap().len(), 4);
+        let _ = fs::remove_dir_all(vault);
+    }
+
+    #[tokio::test]
+    async fn adopt_keeps_identifier_named_pdf_for_cjk_folder() {
         let vault = tmp_vault("adopt-cjk");
-        // CJK folder name strips to the slug fallback; the PDF stem takes over.
+        // A known arXiv filename still takes precedence over a CJK folder name.
         write(&vault.join("papers/我的论文/2401.12345.pdf"), b"%PDF-1.4");
         let result = adopt_paper_folder(
             &vault,

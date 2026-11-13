@@ -12,6 +12,8 @@
 - 成功后：局部刷新 `papers/` 子树、Wiki、Library；**不**自动打开论文（并行入库时抢焦点会让文件树反复跳转），批量也**不**自动连跑精读。
 - 同一条 identifier lookup 管线可由其它入口复用（References 面板、Plaza 入库、Zotero 迁移）。
 - 调度：每个输入一个 JobCenter `import` job（Normal lane；并发取 `batchImportConcurrency`；`params` = `mode` + 来源标识并参与去重，同一 URL 不重复入队）。编排仍在渲染端执行器（`src/lib/paper/import/import-tasks.ts` 按 `params.mode` 分发），job id 兼作 Host `task_id`：字节进度经 `job:progress` 写回投影行，协作取消查 JobCenter 按 task id 索引的 cancel token。
+- **提交即入队**：`lookupSubmit` 会等整批入库结束（引用卡 spinner 依赖这个语义，#434）；魔棒改用 `enqueueLookup` / `enqueueLookupBatch`，入队成功就清空输入但**保留弹层**，因此前一批还在下载时可以直接继续粘贴下一条；`Esc` 关闭弹层。弹层里的「添加中…」只覆盖解析与入队。
+- **队列可见**：有 `import` 任务在排队或运行时，魔棒按钮显示进行中数量徽标（>9 记 `9+`），弹层底部是限高、可滚动的队列列表：每行一个任务（左侧把手 / 运行中转圈，中部来源标识、批头与当前阶段，右侧运行百分比，最右复选框可全选）。勾选后「移除」「前置」出现在「添加」左侧：移除取消所选任务，前置把未开始的任务移到队首。未开始的 item 也可直接拖拽调整次序；前端先调 `job_reorder` 让 Host JobCenter 改写 lane 队列，再把本地行序镜像回来（已在执行的 item 不参与）。单条标识符入库在拿到首个下载字节前从 5% 起步，之后跟随字节进度，进度条不回退。
 - Host：`lookup_import_batch` 等。
 
 ## References 侧栏导入
@@ -46,9 +48,17 @@
 | 拖到 Library 表 | 仅一个或多个 PDF 时显示虚线 overlay；松手后直接后台导入。目标：当前文件夹作用域，或全库时的树选中 Papers 夹 / `papers/`（[#309](https://github.com/poco-ai/Agentero/issues/309)） |
 | 拖到窗口其它区域 | 按当前 Papers 目标目录直接后台导入；识别元数据、重命名和版面分析继续在后台运行 |
 
+- Linux 主窗口启用 Tauri 原生 GTK 文件拖放，复用 Library / 文件树 / 全局落点的原生路径处理，避免 WebKitGTK 在 Files（Nautilus）拖入时提供空 `dataTransfer.files`（[上游回归](https://bugs.webkit.org/show_bug.cgi?id=323277)）。窗口配置在 Host 启动时按平台调整；Windows/macOS 保持 HTML5 拖放配置。Linux 内部文件树移动、tab 拖拽仍走 HTML5。
 - 即时导入：`paper_commit` 立刻复制 PDF + 建目录 + 落 catalog，`paper:imported` 让论文马上出现在树/论文库；`RecognizeMetadata` job 在后台跑识别链路（见 [../backend/paper-import.md](../backend/paper-import.md)），返回值 `recognizePending=true` 时前端跳过自己的 layout enqueue（runner 统一在改名后编排 PAPER.md / refs / layout）。
-- 识别落地：改名/合并通过 `paper:renamed` 事件通知前端 —— handler 抑制 watcher 的外部 rename 修复（`trackInternalRenamePaths`）、remap 打开的 tab/标注、定向刷新树（新旧两个路径）与 Library；`outcome=merged` 时 Toast「识别后的 PDF 已合入已有条目」。仅元数据更新走 `job:changed` 终态 → Library 刷新，树行标签随 `paperMetaByRelPath` 自动更新。
+- 识别落地：改名/合并通过 `paper:renamed` 事件通知前端 —— handler 抑制 watcher 的外部 rename 修复（`trackInternalRenamePaths`）、remap 打开的 tab/标注。树、论文库和双链与 `paper:imported` 合成一轮：导入或识别任务还在跑就继续合并，结束后论文库走 `paper_list`（不 `paper_rescan`），树只列新旧路径，双链走 `graph_apply_paths`。`outcome=merged` 时 Toast「识别后的 PDF 已合入已有条目」。仅元数据更新走 `job:changed` 终态 → 同一轮论文库列表刷新，树行标签随 `paperMetaByRelPath` 自动更新。
 - PDF 解析最多等待 120 秒，取消任务会终止当前解析子进程。解析失败或超时时，后台入库任务仍会结束，已复制的 PDF、`NOTES.md` 与 catalog 记录保持可用；用户可稍后通过 CLI `paper parse` 重试派生正文。
+
+## 广场（Cool Papers / ModelScope / Papers with Code）
+
+- 卡片上的「入库」先弹出文件夹选择，复用文件树移动目标的同一张卡片（`MoveDestinationPicker`）：`papers/…` 组织夹、新建文件夹、当前目标高亮。
+- 选中的目录随 `importPlazaPaper(request, parentDir)` 传入 lookup / `paper_pwc_import` / `paper_coolpapers_import`；未手动选择时跟随当前树选中的 Papers 文件夹，连续入库记住上一次选择。
+- 点击空白处或 Esc 关闭选择时，该行恢复为可重试的「入库」；选择后行进入「入库中」，完成后显示「已入库」。
+- Host 侧 iframe 会把按钮位置以未缩放的 frame 坐标回传；弹层锚点渲染到 `document.body`，避免 Dockview 的 transform / `contain` 改变 `position: fixed` 的参照系。
 
 ## Zotero
 
@@ -57,9 +67,13 @@
 | 欢迎页迁移 | 读 `zotero.sqlite` + `storage/` 整库迁移 |
 | Connector | 设置开启后浏览器扩展保存；见 [../backend/connector.md](../backend/connector.md)、[../usage/zotero.md](../usage/zotero.md) |
 
+欢迎页迁移先选择新的 Agentero 知识库目录，再选择 Zotero 来源。新知识库目录检查会向上查找 `zotero.sqlite`，防止把知识库放进 Zotero 数据目录；父目录超出 Tauri 文件访问范围时停止查找。所选目录本身的访问失败和其他检查错误仍会通过错误 Toast 报告。
+
 ## 补资源 / 精读触发
 
-- Download：缺 PDF 或无正文资源时。
+- Download：缺主 PDF、无可读正文，或缺可获取的 arXiv LaTeX 源码时；已有 OCR `PAPER.md`
+  不再隐藏缺源码提示。PDF-only 不反复提示源码缺失；临时失败仍显示「缺少 arXiv LaTeX 源码」，
+  手动下载可重试。Host 提供有效 TeX 与源码缺失标志，前端不靠 catalog 来源标签推测文件存在。
 - 手动精读 / 自动精读：见 [agent.md](agent.md)。
 
 ## 代码

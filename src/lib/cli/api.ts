@@ -3,7 +3,7 @@
  * Install may use a local/dev binary or download the same app version from GitHub Releases.
  */
 
-import { commands } from "@/lib/core/bindings";
+import { commands, type UiRequestPayload } from "@/lib/core/bindings";
 import { callApi } from "@/lib/core/ipc";
 import { logger } from "@/lib/core/logger";
 import { isTauri } from "@/lib/core/tauri";
@@ -62,8 +62,10 @@ export type CliSyncOutcome = "synced" | "skipped";
  * version, so the old process cannot pre-install the next CLI during an app
  * update. Instead the fresh app syncs on startup: when the user has a managed
  * CLI entry (`installed`) whose version drifted (`!shimCurrent`), re-run the
- * install so binary + shim match this build. Never throws; callers surface
- * failures ("failed" outcome) with a toast.
+ * install so binary + shim match this build. Never throws; callers can retry
+ * a transient release-asset/network failure and surface a final failure with
+ * a toast. A missing CLI is always skipped: app updates never opt a user into
+ * installing a command-line tool they did not previously install.
  */
 export async function syncInstalledCliWithApp(): Promise<
 	CliSyncOutcome | "failed"
@@ -131,5 +133,13 @@ export async function takePendingVaultOpen(): Promise<string | null> {
 	const res = await commands.vaultOpenTakePending();
 	if (!res.ok) return null;
 	// `data: null` means no pending path (not a failure).
+	return res.data ?? null;
+}
+
+/** Consume a Host-queued workspace UI request from a cold start (null if none). */
+export async function takePendingUiRequest(): Promise<UiRequestPayload | null> {
+	if (!isTauri()) return null;
+	const res = await commands.uiRequestTakePending();
+	if (!res.ok) return null;
 	return res.data ?? null;
 }

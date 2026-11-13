@@ -1,7 +1,7 @@
 /**
  * Plaza feed subscriptions — Host IPC + paper import.
  *
- * @see docs/development/plaza-feeds.md
+ * @see docs/backend/api.md §3.10.4
  */
 
 import { commands, type FeedItem, type FeedSub } from "@/lib/core/bindings";
@@ -13,7 +13,7 @@ import { lookupSubmit } from "@/lib/paper/import-actions";
 /** Wire shapes from the generated bindings (feeds.sqlite rows). */
 export type { FeedItem, FeedSub };
 
-export type FeedFilter = "all" | "paper" | "other";
+export type FeedFilter = "all" | "paper" | "other" | "unread";
 
 export const ARXIV_FEED_CHIPS = [
 	"cs.AI",
@@ -197,9 +197,33 @@ const META_PREFIXES = [
 	"abstract:",
 ] as const;
 
-/** Drop arXiv RSS headers so cards show the abstract, not the id / type. */
-export function cleanFeedSummary(raw: string): string {
-	let rest = raw.replace(/<[^>]+>/g, " ").trim();
+/**
+ * Relative ("3 hours ago") then short-date feed timestamp. Kept next to the
+ * feed display helpers so the list card and the Agent preview agree.
+ */
+export function formatFeedWhen(iso: string | null, locale: string): string {
+	if (!iso) return "";
+	const date = new Date(iso);
+	if (Number.isNaN(date.getTime())) return "";
+	const diffSec = Math.round((date.getTime() - Date.now()) / 1000);
+	const abs = Math.abs(diffSec);
+	const rtf = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+	if (abs < 60) return rtf.format(diffSec, "second");
+	if (abs < 3600) return rtf.format(Math.round(diffSec / 60), "minute");
+	if (abs < 86400) return rtf.format(Math.round(diffSec / 3600), "hour");
+	if (abs < 86400 * 7) return rtf.format(Math.round(diffSec / 86400), "day");
+	return new Intl.DateTimeFormat(locale, {
+		month: "short",
+		day: "numeric",
+	}).format(date);
+}
+
+/**
+ * Drop arXiv RSS headers so cards show the abstract, not the id / type.
+ * Line breaks are preserved for callers that keep paragraph structure.
+ */
+export function stripFeedMeta(raw: string): string {
+	let rest = raw.trim();
 	for (;;) {
 		const lower = rest.toLowerCase();
 		const hit = META_PREFIXES.find((prefix) => lower.startsWith(prefix));
@@ -212,7 +236,15 @@ export function cleanFeedSummary(raw: string): string {
 		const skip = after.search(/\s/);
 		rest = (skip === -1 ? "" : after.slice(skip)).trimStart();
 	}
-	return stripTrailingEllipsis(rest.replace(/\s+/g, " ").trim());
+	return rest;
+}
+
+export function cleanFeedSummary(raw: string): string {
+	return stripTrailingEllipsis(
+		stripFeedMeta(raw.replace(/<[^>]+>/g, " "))
+			.replace(/\s+/g, " ")
+			.trim(),
+	);
 }
 
 /** Drop RSS teaser tails (`[...]`, `…`) from cards and the detail body. */
@@ -338,9 +370,9 @@ export function compareFeedSubs(a: FeedSub, b: FeedSub): number {
 	return a.addedAt.localeCompare(b.addedAt);
 }
 
-/** Import via the magic wand. Resolves true when the paper is in the library. */
-export function importFeedPaper(item: FeedItem): Promise<boolean> {
-	const url = item.paperUrl?.trim();
+/** Import a paper or webpage via the existing URL lookup flow. */
+export function importFeedItem(item: FeedItem): Promise<boolean> {
+	const url = item.paperUrl?.trim() || item.url?.trim();
 	if (!url) return Promise.resolve(false);
 	return new Promise<boolean>((resolve) => {
 		let settled = false;
@@ -403,4 +435,13 @@ export function hostErrorKey(message: string): FeedErrorKey | null {
 	return code in FEED_ERROR_KEYS
 		? FEED_ERROR_KEYS[code as keyof typeof FEED_ERROR_KEYS]
 		: null;
+}
+
+export async function feedsSetRead(
+	id: string,
+	read: boolean,
+): Promise<FeedItem> {
+	return callApi(() => commands.feedsSetRead({ id, read }), {
+		fallback: "feeds.markFailed",
+	});
 }

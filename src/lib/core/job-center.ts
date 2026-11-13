@@ -36,6 +36,7 @@ import {
 	type JobReportArgs,
 	type JobSnapshot,
 	type JobState,
+	type Json,
 } from "@/lib/core/bindings";
 import { errorText } from "@/lib/core/error";
 import { callApiResult } from "@/lib/core/ipc";
@@ -147,6 +148,7 @@ export async function jobReport(args: {
 	phase?: string | null;
 	error?: string | null;
 	state?: JobState | null;
+	params?: Json | null;
 }): Promise<void> {
 	await callApiResult(() =>
 		commands.jobReport({
@@ -155,6 +157,7 @@ export async function jobReport(args: {
 			phase: args.phase ?? null,
 			error: args.error ?? null,
 			state: args.state ?? null,
+			params: args.params ?? null,
 		} satisfies JobReportArgs),
 	);
 }
@@ -167,11 +170,11 @@ export type JobChangedSnapshot = JobSnapshot;
 
 /**
  * Job kinds projected into the background-tasks panel (§7.6). Kinds absent
- * here (pageCount / wikiReindex / layoutTranslate) stay silent to avoid
- * idle-lane noise.
+ * here (pageCount / wikiReindex) stay silent to avoid idle-lane noise.
  */
 const PROJECTED_JOB_KINDS: ReadonlySet<JobKind> = new Set([
 	"layoutAnalyze",
+	"layoutTranslate",
 	"parseRefs",
 	"parseBody",
 	"downloadAssets",
@@ -183,6 +186,7 @@ const PROJECTED_JOB_KINDS: ReadonlySet<JobKind> = new Set([
 	"libraryIo",
 	"metadataRefresh",
 	"latexCompile",
+	"jevSmartHighlights",
 ]);
 
 /**
@@ -192,6 +196,7 @@ const PROJECTED_JOB_KINDS: ReadonlySet<JobKind> = new Set([
 function importRowIcon(params: unknown): BackgroundTaskIcon {
 	switch (jobParams(params).mode) {
 		case "lookup":
+		case "lookupBatch":
 		case "plaza":
 			return "search";
 		case "coolNotes":
@@ -207,6 +212,7 @@ function jobRowIcon(job: JobChangedSnapshot): BackgroundTaskIcon | undefined {
 	if (job.kind === "libraryIo") {
 		return jobParams(job.params).op === "export" ? "package" : "fileUp";
 	}
+	if (job.kind === "jevSmartHighlights") return "search";
 	return undefined;
 }
 
@@ -253,6 +259,8 @@ function jobPanelTitle(job: JobChangedSnapshot): string {
 			return i18n.t("app:tasks.recognizeMeta");
 		case "modelDownload":
 			return i18n.t("app:tasks.layoutModelDownload");
+		case "layoutTranslate":
+			return i18n.t("app:tasks.layoutTranslate");
 		case "citingScan":
 			return i18n.t("app:tasks.citingScan");
 		case "metadataRefresh":
@@ -263,6 +271,8 @@ function jobPanelTitle(job: JobChangedSnapshot): string {
 				: i18n.t("app:tasks.libraryImport");
 		case "latexCompile":
 			return i18n.t("app:tasks.latexCompile");
+		case "jevSmartHighlights":
+			return i18n.t("app:tasks.jevSmartHighlights");
 		default:
 			return i18n.t("app:tasks.layoutAnalysis");
 	}
@@ -276,6 +286,7 @@ function jobPanelTitle(job: JobChangedSnapshot): string {
 type JobParams = {
 	mode?: string;
 	text?: string;
+	texts?: string[];
 	title?: string;
 	id?: string;
 	detail?: string;
@@ -301,6 +312,8 @@ function importPanelTitle(params: unknown): string {
 			return i18n.t("app:plazaImport.taskTitle");
 		case "coolNotes":
 			return i18n.t("app:coolPapers.fetchTask");
+		case "lookupBatch":
+			return i18n.t("sidebar:lookup.batchTask");
 		default:
 			return i18n.t("app:tasks.lookupImport");
 	}
@@ -313,6 +326,13 @@ function importPanelDetail(job: JobChangedSnapshot): string | undefined {
 			// Prefer a resolved title once the executor reports it via params;
 			// never surface the raw identifier / URL as the row subject.
 			return p.title?.trim().slice(0, 80) || undefined;
+		case "lookupBatch":
+			// Executor reports the imported count as the phase; the checklist
+			// size stays in params.texts for the panel.
+			return (
+				p.title?.trim().slice(0, 80) ||
+				(p.texts ? `${p.texts.length}` : undefined)
+			);
 		case "plaza":
 			return (p.title?.trim() || "").slice(0, 80) || undefined;
 		case "coolNotes":

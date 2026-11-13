@@ -4,6 +4,8 @@
  */
 
 import { getPlatformOS } from "@/lib/core/tauri";
+import type { ShortcutOverrides } from "@/lib/settings/shortcut-bindings";
+import { loadSettings } from "@/lib/settings/store";
 
 export type ShortcutId =
 	| "settings"
@@ -25,11 +27,12 @@ export type ShortcutId =
 	| "quickOpen"
 	/** ⇧⌘P — run app commands */
 	| "commandPalette"
+	| "toggleMarkdownSource"
 	| "toggleSidebar"
 	| "toggleChat"
 	/** ⌘K — in-page Quick chat (Ask) from the live selection */
 	| "quickChat"
-	/** ⇧⌘A — pin the live selection into the Agent context and focus the composer */
+	/** ⇧⌘L — pin the live selection into the Agent context and focus the composer */
 	| "addSelectionToChat"
 	| "closeSheet"
 	| "focusSidebar"
@@ -41,6 +44,10 @@ export type ShortcutId =
 	| "splitPane"
 	| "nextTab"
 	| "prevTab"
+	/** ⌃Tab — next tab within the active dock group */
+	| "nextGroupTab"
+	/** ⌃⇧Tab — previous tab within the active dock group */
+	| "prevGroupTab"
 	| "zoomIn"
 	| "zoomOut"
 	| "zoomReset"
@@ -51,7 +58,7 @@ export type ShortcutId =
 	/** F11 — borderless fullscreen (Windows only). */
 	| "toggleFullscreen";
 
-export type ShortcutGroup = "App" | "Navigation" | "Vault";
+export type ShortcutGroup = "App" | "Navigation" | "Vault" | "Editor";
 
 export type ShortcutPlatform = "windows" | "macos" | "linux";
 
@@ -230,6 +237,13 @@ export const SHORTCUTS: ShortcutDef[] = [
 		// No whenSettingsClosed: same key dismisses while palette is open.
 	},
 	{
+		id: "toggleMarkdownSource",
+		group: "Editor",
+		key: "/",
+		meta: true,
+		whenSettingsClosed: true,
+	},
+	{
 		id: "toggleSidebar",
 		group: "Navigation",
 		// Apple Mail / Preview family uses ⌥⌘S; many Mac productivity apps use ⌘B.
@@ -242,7 +256,7 @@ export const SHORTCUTS: ShortcutDef[] = [
 	{
 		id: "toggleChat",
 		group: "Navigation",
-		// ⌘L — with a selection: Add to chat (pin + open Agent); else toggle rail.
+		// ⌘L — toggle the right sidebar independently of the selection.
 		key: "l",
 		meta: true,
 		whenSettingsClosed: true,
@@ -258,8 +272,8 @@ export const SHORTCUTS: ShortcutDef[] = [
 	{
 		id: "addSelectionToChat",
 		group: "Navigation",
-		// ⇧⌘A — pin the live selection as Agent context and focus the composer.
-		key: "a",
+		// ⇧⌘L — pin the live selection as Agent context and focus the composer.
+		key: "l",
 		meta: true,
 		shift: true,
 		whenSettingsClosed: true,
@@ -329,6 +343,23 @@ export const SHORTCUTS: ShortcutDef[] = [
 		whenSettingsClosed: true,
 	},
 	{
+		id: "nextGroupTab",
+		group: "Navigation",
+		// ⌃Tab — next tab in the active dock group only (⌥⌘→ cycles panels).
+		key: "Tab",
+		ctrl: true,
+		whenSettingsClosed: true,
+	},
+	{
+		id: "prevGroupTab",
+		group: "Navigation",
+		// ⌃⇧Tab — previous tab in the active dock group only.
+		key: "Tab",
+		ctrl: true,
+		shift: true,
+		whenSettingsClosed: true,
+	},
+	{
 		id: "visualAnnotation",
 		group: "App",
 		// ⌘. — toggle PDF visual annotation region select (active PDF tab)
@@ -391,14 +422,41 @@ export type ShortcutDisplay = Pick<
 	"key" | "meta" | "ctrl" | "alt" | "shift"
 >;
 
+/** Let text controls keep editor-native keys, including the sidebar's ⌘B alias. */
+export function shortcutBelongsToTextField(
+	id: ShortcutId,
+	event: Pick<KeyboardEvent, "key" | "target">,
+): boolean {
+	const binding = getShortcut(id);
+	const optionTyping = binding?.alt && !binding.meta && !binding.ctrl;
+	if (
+		!optionTyping &&
+		id !== "deleteTreeItem" &&
+		id !== "collapseTreeCurrent" &&
+		id !== "collapseTreeDefault" &&
+		id !== "cutTreeItem" &&
+		id !== "pasteTreeItem" &&
+		id !== "layoutTranslate" &&
+		!(id === "toggleSidebar" && event.key.toLowerCase() === "b")
+	) {
+		return false;
+	}
+	const target = event.target as {
+		closest?: (selector: string) => Element | null;
+	} | null;
+	return Boolean(
+		target?.closest?.(
+			"input, textarea, select, [contenteditable='true'], [role='textbox']",
+		),
+	);
+}
+
 /**
  * Platform-aware shortcut label for UI.
  * macOS: Apple symbols (⌘X); Windows/Linux: Ctrl+X style.
  * Not i18n — modifier names follow the OS, not the app language.
  */
 export function formatShortcut(def: ShortcutDisplay): string {
-	if (def.key === "Escape") return "Esc";
-
 	const isMac =
 		typeof navigator !== "undefined" &&
 		/Mac|iPhone|iPad|iPod/.test(navigator.platform);
@@ -439,15 +497,28 @@ export function formatModShortcut(
 
 /** Format the primary shortcut for an id (platform-aware) for tooltip interpolation. */
 export function formatShortcutById(id: ShortcutId): string {
-	const def = SHORTCUTS.find((s) => s.id === id);
+	const def = getShortcut(id);
 	return def ? formatShortcut(def) : "";
 }
 
-export function matchShortcut(event: KeyboardEvent, def: ShortcutDef): boolean {
+export type ShortcutKeyEvent = Pick<
+	KeyboardEvent,
+	"key" | "code" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey"
+>;
+
+/** Local find handlers share the shell's exact macOS modifier matching. */
+export function isFindShortcut(event: ShortcutKeyEvent): boolean {
+	return matchShortcut(event, { key: "f", meta: true });
+}
+
+export function matchShortcut(
+	event: ShortcutKeyEvent,
+	def: Pick<ShortcutDef, "key" | "meta" | "ctrl" | "alt" | "shift">,
+): boolean {
 	const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
 	const defKey = def.key.length === 1 ? def.key.toLowerCase() : def.key;
 	// macOS composes ⌥+letter into a single character (⌥A → "å"), so event.key
-	// never equals the def letter. Alt-only letter shortcuts fall back to the
+	// never equals the def letter. Option letter shortcuts fall back to the
 	// physical key (event.code), which stays stable across layouts.
 	const physicalKey = /^Key[A-Z]$/.test(event.code)
 		? event.code.slice(3).toLowerCase()
@@ -455,7 +526,7 @@ export function matchShortcut(event: KeyboardEvent, def: ShortcutDef): boolean {
 	if (
 		key !== defKey &&
 		event.key !== def.key &&
-		!(def.alt && !def.meta && physicalKey === defKey)
+		!(def.alt && physicalKey === defKey)
 	)
 		return false;
 
@@ -464,20 +535,26 @@ export function matchShortcut(event: KeyboardEvent, def: ShortcutDef): boolean {
 	const wantShift = Boolean(def.shift);
 	const wantCtrl = Boolean(def.ctrl);
 
-	// On Windows/Linux, treat Ctrl as ⌘ equivalent when meta is required.
-	const metaOrCtrl = event.metaKey || event.ctrlKey;
-	if (wantMeta) {
-		if (!metaOrCtrl) return false;
-	} else if (event.metaKey) {
-		return false;
+	const isMac = getPlatformOS() === "macos";
+	if (isMac) {
+		if (wantMeta !== event.metaKey) return false;
+		if (wantCtrl !== event.ctrlKey) return false;
+	} else {
+		// On Windows/Linux, treat Ctrl as ⌘ equivalent when meta is required.
+		const metaOrCtrl = event.metaKey || event.ctrlKey;
+		if (wantMeta) {
+			if (!metaOrCtrl) return false;
+		} else if (event.metaKey) {
+			return false;
+		}
+
+		if (wantCtrl && !wantMeta && !event.ctrlKey) return false;
+		// When meta maps to ctrl on non-Mac, ignore pure ctrl-only false positives
+		if (!wantMeta && !wantCtrl && event.ctrlKey) return false;
 	}
 
-	if (wantCtrl && !wantMeta && !event.ctrlKey) return false;
 	if (wantAlt !== event.altKey) return false;
 	if (wantShift !== event.shiftKey) return false;
-
-	// When meta maps to ctrl on non-Mac, ignore pure ctrl-only false positives
-	if (!wantMeta && !wantCtrl && event.ctrlKey) return false;
 
 	return true;
 }
@@ -489,10 +566,15 @@ export function resolveShortcutId(
 		settingsOpen: boolean;
 	},
 ): ShortcutId | null {
+	if (event.isComposing || event.key === "Dead" || event.key === "Process")
+		return null;
 	const overlayOpen = opts.settingsOpen;
+	const overrides = loadSettings().shortcutOverrides ?? {};
 	const candidates = SHORTCUTS.flatMap((def) => {
-		const aliases = ALIASES[def.id] ?? [];
-		return [def, ...aliases];
+		const effective = getShortcut(def.id, overrides);
+		if (!effective) return [];
+		const aliases = getShortcutAliases(def.id, overrides);
+		return [effective, ...aliases];
 	});
 
 	for (const def of candidates) {
@@ -508,11 +590,221 @@ export function shortcutsByGroup(): {
 	group: ShortcutGroup;
 	items: ShortcutDef[];
 }[] {
-	const order = ["App", "Vault", "Navigation"] as const;
+	const order = ["App", "Vault", "Navigation", "Editor"] as const;
 	return order.map((group) => ({
 		group,
 		items: SHORTCUTS.filter(
 			(s) => s.group === group && shortcutAvailableOnPlatform(s),
 		),
 	}));
+}
+
+/** A custom binding replaces the primary chord and its built-in aliases. */
+export function getShortcut(
+	id: ShortcutId,
+	overrides: ShortcutOverrides = loadSettings().shortcutOverrides ?? {},
+): ShortcutDef | null {
+	const def = SHORTCUTS.find((item) => item.id === id);
+	if (!def || !shortcutAvailableOnPlatform(def)) return null;
+	if (!Object.hasOwn(overrides, id)) return def;
+	const binding = overrides[id];
+	if (binding === null) return null;
+	if (!binding || !validateShortcutBinding(binding, id)) return null;
+	return {
+		...def,
+		meta: false,
+		ctrl: false,
+		alt: false,
+		shift: false,
+		...binding,
+	};
+}
+
+export function getShortcutAliases(
+	id: ShortcutId,
+	overrides: ShortcutOverrides = loadSettings().shortcutOverrides ?? {},
+): ShortcutDef[] {
+	return Object.hasOwn(overrides, id) ? [] : (ALIASES[id] ?? []);
+}
+
+function chordEvent(binding: ShortcutDisplay): ShortcutKeyEvent {
+	const mac = getPlatformOS() === "macos";
+	return {
+		key: binding.key,
+		code: "",
+		metaKey: mac && Boolean(binding.meta),
+		ctrlKey: Boolean(binding.ctrl || (!mac && binding.meta)),
+		altKey: Boolean(binding.alt),
+		shiftKey: Boolean(binding.shift),
+	};
+}
+
+const NATIVE_MENU_SHORTCUTS: ReadonlySet<ShortcutId> = new Set([
+	"settings",
+	"newWindow",
+	"openVault",
+	"createVault",
+	"refreshTree",
+	"closeTab",
+	"toggleSidebar",
+	"splitPane",
+	"toggleChat",
+]);
+
+/** Native menu accelerators overlap every scope; renderer-only actions keep overlay scopes. */
+export function findShortcutConflict(
+	id: ShortcutId,
+	binding: ShortcutDisplay,
+	overrides: ShortcutOverrides = loadSettings().shortcutOverrides ?? {},
+): ShortcutId | null {
+	const own = SHORTCUTS.find((item) => item.id === id);
+	if (!own) return null;
+	for (const item of SHORTCUTS) {
+		if (item.id === id) continue;
+		if (
+			!(
+				getPlatformOS() === "macos" &&
+				(NATIVE_MENU_SHORTCUTS.has(id) || NATIVE_MENU_SHORTCUTS.has(item.id))
+			) &&
+			((own.whenSettingsOpen && item.whenSettingsClosed) ||
+				(own.whenSettingsClosed && item.whenSettingsOpen))
+		)
+			continue;
+		const effective = getShortcut(item.id, overrides);
+		if (!effective) continue;
+		for (const candidate of [
+			effective,
+			...getShortcutAliases(item.id, overrides),
+		]) {
+			if (
+				matchShortcut(chordEvent(binding), candidate) ||
+				matchShortcut(chordEvent(candidate), binding)
+			)
+				return item.id;
+		}
+	}
+	return null;
+}
+
+const NON_CHARACTER_KEYS = new Set([
+	"Escape",
+	"Enter",
+	"Tab",
+	"Backspace",
+	"Delete",
+	"ArrowLeft",
+	"ArrowRight",
+	"ArrowUp",
+	"ArrowDown",
+	"Home",
+	"End",
+	"PageUp",
+	"PageDown",
+	"Insert",
+]);
+
+/** Keep typing, native text editing, and OS window controls available. */
+export function validateShortcutBinding(
+	binding: ShortcutDisplay,
+	id?: ShortcutId,
+): boolean {
+	if (
+		!(
+			binding.key.length === 1 ||
+			NON_CHARACTER_KEYS.has(binding.key) ||
+			/^F([1-9]|1\d|2[0-4])$/.test(binding.key)
+		)
+	)
+		return false;
+	if (
+		/\s/.test(binding.key) ||
+		[...binding.key].some(
+			(key) => key.charCodeAt(0) < 32 || key.charCodeAt(0) === 127,
+		)
+	)
+		return false;
+	if (
+		!binding.meta &&
+		!binding.ctrl &&
+		!binding.alt &&
+		binding.key !== "Escape" &&
+		!/^F([1-9]|1\d|2[0-4])$/.test(binding.key)
+	)
+		return false;
+	const mac = getPlatformOS() === "macos";
+	if (
+		(id === "toggleMarkdownSource" ||
+			(mac && id && NATIVE_MENU_SHORTCUTS.has(id))) &&
+		binding.alt &&
+		!binding.meta &&
+		!binding.ctrl
+	)
+		return false;
+	const primary = mac
+		? binding.meta && !binding.ctrl
+		: binding.meta || binding.ctrl;
+	if (primary && !binding.alt) {
+		const key = binding.key.toLowerCase();
+		const reserved = binding.shift
+			? ["z", "s", "q"]
+			: ["a", "c", "x", "v", "z", "f", "g", "s", "b", "i", "u", "q", "h", "m"];
+		if (reserved.includes(key)) {
+			return (
+				(key === "x" && id === "cutTreeItem") ||
+				(key === "v" && id === "pasteTreeItem")
+			);
+		}
+	}
+	if (mac && binding.meta) {
+		if (binding.key === "Tab" || binding.key === " ") return false;
+		if (binding.alt && binding.key === "Escape") return false;
+		if (
+			binding.ctrl &&
+			!binding.alt &&
+			!binding.shift &&
+			binding.key.toLowerCase() === "f"
+		)
+			return false;
+	}
+	if (
+		!mac &&
+		binding.alt &&
+		!binding.meta &&
+		!binding.ctrl &&
+		(binding.key === "F4" || binding.key === "Tab")
+	)
+		return false;
+	return true;
+}
+
+/** Normalize platform primary modifiers and composed macOS Option letters. */
+export function shortcutFromEvent(
+	event: ShortcutKeyEvent & { isComposing?: boolean; repeat?: boolean },
+): ShortcutDisplay | null {
+	if (
+		event.isComposing ||
+		event.repeat ||
+		[
+			"Dead",
+			"Process",
+			"Unidentified",
+			"Alt",
+			"Control",
+			"Meta",
+			"Shift",
+			"AltGraph",
+		].includes(event.key)
+	)
+		return null;
+	let key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+	if (event.altKey && /^Key[A-Z]$/.test(event.code))
+		key = event.code.slice(3).toLowerCase();
+	const mac = getPlatformOS() === "macos";
+	return {
+		key,
+		meta: mac ? event.metaKey : event.ctrlKey || event.metaKey,
+		ctrl: mac && event.ctrlKey,
+		alt: event.altKey,
+		shift: event.shiftKey,
+	};
 }

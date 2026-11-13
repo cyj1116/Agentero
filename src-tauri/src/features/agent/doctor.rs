@@ -3,11 +3,17 @@ use crate::features::agent::acp::client::{
     effective_local_agent_env, resolve_command_in_agent_env,
 };
 use crate::features::agent::models::{AgentDescriptor, AgentTemplate};
+use crate::features::agent::registry::lifecycle::{
+    emit_lifecycle_progress, lifecycle_cancel_requested,
+};
 use crate::features::agent::registry::{template_info, AgentRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+use tauri::AppHandle;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::Command;
 
 const HOST_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -23,13 +29,6 @@ pub enum NodeInstallOutcome {
     Failed,
     NoPackageManager,
 }
-
-/// Doctor spawns `<tool> --version` probes for every host runtime and registered
-/// Agent. The app ships as a GUI subsystem binary, so a console child without
-/// this flag makes Windows allocate a visible console window — one black window
-/// per probed tool on every Doctor refresh.
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, specta::Type)]
 #[serde(rename_all = "kebab-case")]
@@ -130,7 +129,7 @@ fn codex_descriptor(registry: &AgentRegistry) -> Result<AgentDescriptor, AppErro
 
 fn diagnostic_command(path: &Path, args: &[&str]) -> Command {
     let mut command = base_command(path, args);
-    hide_console_window(&mut command);
+    crate::core::process::hide_console_window_tokio(&mut command);
     command
 }
 
@@ -162,23 +161,21 @@ fn base_command(path: &Path, args: &[&str]) -> Command {
     command
 }
 
-fn hide_console_window(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = command;
-    }
-}
-
 async fn run_command(
     path: &Path,
     args: &[&str],
     environment: &HashMap<String, String>,
 ) -> Result<CommandOutput, String> {
     run_command_with_timeout(path, args, environment, HOST_PROBE_TIMEOUT).await
+}
+
+/// Replace the inherited environment with `environment`, minus the loader
+/// overrides an AppImage runtime injects. Doctor children include the user's
+/// own `node`/`npm`/adapter, which must load the distro's libraries (#1002).
+fn set_child_environment(command: &mut Command, environment: &HashMap<String, String>) {
+    let mut environment = environment.clone();
+    crate::core::process::strip_appimage_library_env(&mut environment);
+    command.env_clear().envs(environment);
 }
 
 async fn run_command_with_timeout(
@@ -188,8 +185,8 @@ async fn run_command_with_timeout(
     timeout: Duration,
 ) -> Result<CommandOutput, String> {
     let mut command = diagnostic_command(path, args);
-    command.env_clear().envs(environment).kill_on_drop(true);
-    let output = tokio::time::timeout(timeout, command.output())
+    set_child_environment(&mut command, environment);
+    let output = tokio::time::timeout(timeout, crate::core::process::command_output(&mut command))
         .await
         .map_err(|_| format!("timed out after {}s", timeout.as_secs()))?
         .map_err(|error| format!("failed to start: {error}"))?;
@@ -199,6 +196,69 @@ async fn run_command_with_timeout(
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+/// Result of a cancellable package-manager run.
+enum CancellableOutcome {
+    Output(CommandOutput),
+    /// The caller asked to cancel the background task.
+    Cancelled,
+}
+
+/// Run a package manager with progress events and cooperative cancellation.
+///
+/// The child is owned by a spawned task. Aborting that task drops the process
+/// tree, which on Windows also kills launcher descendants such as `node.exe`.
+async fn run_installer_cancellable(
+    path: &Path,
+    args: &[String],
+    environment: &HashMap<String, String>,
+    app: Option<&AppHandle>,
+    task_id: Option<&str>,
+    phase: &str,
+) -> Result<CancellableOutcome, String> {
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut command = diagnostic_command(path, &arg_refs);
+    set_child_environment(&mut command, environment);
+    let mut joined =
+        tokio::spawn(async move { crate::core::process::command_output(&mut command).await });
+    let started = Instant::now();
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    loop {
+        tokio::select! {
+            result = &mut joined => {
+                let output = result
+                    .map_err(|error| format!("installer task failed: {error}"))?
+                    .map_err(|error| format!("failed to start: {error}"))?;
+                return Ok(CancellableOutcome::Output(CommandOutput {
+                    success: output.status.success(),
+                    code: output.status.code(),
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                }));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(150)) => {
+                if task_id.is_some_and(lifecycle_cancel_requested) {
+                    joined.abort();
+                    return Ok(CancellableOutcome::Cancelled);
+                }
+                if started.elapsed() >= INSTALL_TIMEOUT {
+                    joined.abort();
+                    return Err(format!("timed out after {}s", INSTALL_TIMEOUT.as_secs()));
+                }
+                if last_emit.elapsed() >= Duration::from_millis(750) {
+                    let elapsed_secs = started.elapsed().as_secs().min(30) as u8;
+                    emit_lifecycle_progress(
+                        app,
+                        task_id,
+                        phase,
+                        Some((5 + elapsed_secs * 2).min(65)),
+                    );
+                    last_emit = Instant::now();
+                }
+            }
+        }
+    }
 }
 
 fn first_output_line(output: &CommandOutput) -> Option<String> {
@@ -235,10 +295,14 @@ pub(crate) async fn diagnose_tool(
             status: HostToolStatus::Unusable,
             resolved_path,
             version: None,
-            detail: Some(match output.code {
-                Some(code) => format!("exited with status {code}"),
-                None => "terminated without an exit status".to_string(),
-            }),
+            // A dynamic-loader/symbol error is the actionable part; the exit
+            // status alone would send users looking for a missing Node (#1002).
+            detail: Some(
+                first_output_line(&output).unwrap_or_else(|| match output.code {
+                    Some(code) => format!("exited with status {code}"),
+                    None => "terminated without an exit status".to_string(),
+                }),
+            ),
         },
         Err(detail) => HostToolDiagnostic {
             status: HostToolStatus::Unusable,
@@ -306,6 +370,84 @@ async fn run_auth_status(
     }
 }
 
+async fn codex_app_server_result(
+    lines: &mut Lines<BufReader<tokio::process::ChildStdout>>,
+    id: i64,
+) -> Option<serde_json::Value> {
+    loop {
+        let line = lines.next_line().await.ok()??;
+        let response: serde_json::Value = serde_json::from_str(&line).ok()?;
+        if response.get("id").and_then(serde_json::Value::as_i64) == Some(id) {
+            return response.get("result").cloned();
+        }
+    }
+}
+
+/// The CLI login command checks OpenAI credentials even when Codex is configured
+/// to use a provider that does not require them. Ask the same Codex CLI used by
+/// the ACP adapter whether OpenAI authentication is needed for this environment.
+async fn codex_account_auth_status(
+    adapter: &Path,
+    environment: &HashMap<String, String>,
+) -> Option<CodexAuthDiagnostic> {
+    let mut command = diagnostic_command(adapter, &["cli", "app-server"]);
+    set_child_environment(&mut command, environment);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    tokio::time::timeout(HOST_PROBE_TIMEOUT, async {
+        let mut child = command.spawn().ok()?;
+        let mut stdin = child.stdin.take()?;
+        let stdout = child.stdout.take()?;
+        let mut lines = BufReader::new(stdout).lines();
+
+        let initialize = serde_json::json!({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "Agentero",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": null,
+            },
+        });
+        stdin
+            .write_all(format!("{initialize}\n").as_bytes())
+            .await
+            .ok()?;
+        codex_app_server_result(&mut lines, 1).await?;
+        stdin
+            .write_all(
+                b"{\"id\":2,\"method\":\"account/read\",\"params\":{\"refreshToken\":false}}\n",
+            )
+            .await
+            .ok()?;
+        let account = codex_app_server_result(&mut lines, 2).await?;
+        let required = account.get("requiresOpenaiAuth")?.as_bool()?;
+        let has_account = !account.get("account")?.is_null();
+        drop(stdin);
+        let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+
+        Some(CodexAuthDiagnostic {
+            status: if !required {
+                CodexAuthStatus::NotApplicable
+            } else if has_account {
+                CodexAuthStatus::Authenticated
+            } else {
+                CodexAuthStatus::Unauthenticated
+            },
+            method: None,
+            detail: None,
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 async fn diagnose_codex_auth_in_env(
     desc: &AgentDescriptor,
     environment: &HashMap<String, String>,
@@ -320,14 +462,34 @@ async fn diagnose_codex_auth_in_env(
 
     let adapter_result =
         run_auth_status(adapter.as_path(), &["cli", "login", "status"], environment).await;
-    if adapter_result.status != CodexAuthStatus::Unknown {
+    if adapter_result.status == CodexAuthStatus::Authenticated {
         return adapter_result;
+    }
+    if let Some(status) = codex_account_auth_status(adapter.as_path(), environment).await {
+        return status;
+    }
+    if adapter_result.status == CodexAuthStatus::Unauthenticated {
+        // A failed account/read cannot distinguish missing OpenAI login from a
+        // custom provider that does not require it.
+        return CodexAuthDiagnostic {
+            status: CodexAuthStatus::Unknown,
+            method: None,
+            detail: Some("Codex app-server account status unavailable".to_string()),
+        };
     }
 
     let Some(codex) = resolve_command_in_agent_env("codex", environment) else {
         return adapter_result;
     };
-    run_auth_status(codex.as_path(), &["login", "status"], environment).await
+    let native_result = run_auth_status(codex.as_path(), &["login", "status"], environment).await;
+    if native_result.status == CodexAuthStatus::Unauthenticated {
+        return CodexAuthDiagnostic {
+            status: CodexAuthStatus::Unknown,
+            method: None,
+            detail: Some("Codex app-server account status unavailable".to_string()),
+        };
+    }
+    native_result
 }
 
 pub(crate) async fn diagnose_codex_auth(desc: &AgentDescriptor) -> CodexAuthDiagnostic {
@@ -512,7 +674,15 @@ fn refresh_path_from_registry(_environment: &mut HashMap<String, String>) {}
 /// a fresh host probe. Linux is intentionally excluded: it has no single
 /// package manager and installs need sudo, so the UI falls back to manual
 /// guidance there.
-pub async fn install_node(registry: &AgentRegistry) -> Result<NodeInstallResult, AppError> {
+///
+/// `app` / `task_id` surface progress and cooperative cancel
+/// (`agent_lifecycle_cancel`) through the shared Agent lifecycle channel; both
+/// the Doctor button and the npm-not-found toast use the background runner.
+pub async fn install_node(
+    registry: &AgentRegistry,
+    app: Option<&AppHandle>,
+    task_id: Option<&str>,
+) -> Result<NodeInstallResult, AppError> {
     let descriptor = codex_descriptor(registry)?;
     let mut environment = effective_local_agent_env(&descriptor);
 
@@ -531,17 +701,29 @@ pub async fn install_node(registry: &AgentRegistry) -> Result<NodeInstallResult,
             "resolved {installer} but failed to start it: {error}"
         ))
     })?;
-    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let install_error =
-        match run_command_with_timeout(&path, &arg_refs, &environment, INSTALL_TIMEOUT).await {
-            Ok(output) if output.success => None,
-            Ok(output) => Some(format!(
-                "{} install failed: {}",
-                installer,
-                first_output_line(&output).unwrap_or_else(|| "no output".to_string())
-            )),
-            Err(detail) => Some(format!("{installer} install failed: {detail}")),
-        };
+    let install_error = match run_installer_cancellable(
+        &path,
+        &args,
+        &environment,
+        app,
+        task_id,
+        "agent-lifecycle-install",
+    )
+    .await
+    {
+        // Propagate user-initiated cancel as the stable cancel message so the
+        // UI suppresses the error toast and marks the task cancelled.
+        Ok(CancellableOutcome::Cancelled) => {
+            return Err(AppError::message("background task cancelled"));
+        }
+        Ok(CancellableOutcome::Output(output)) if output.success => None,
+        Ok(CancellableOutcome::Output(output)) => Some(format!(
+            "{} install failed: {}",
+            installer,
+            first_output_line(&output).unwrap_or_else(|| "no output".to_string())
+        )),
+        Err(detail) => Some(format!("{installer} install failed: {detail}")),
+    };
     let outcome = match install_error {
         Some(_) => NodeInstallOutcome::Failed,
         None => NodeInstallOutcome::Installed,
@@ -621,6 +803,89 @@ mod tests {
             result.detail.as_deref(),
             Some("status command exited with 7")
         );
+    }
+
+    fn fake_codex_auth(
+        requires_openai_auth: Option<bool>,
+    ) -> (tempfile::TempDir, HashMap<String, String>) {
+        let bin = tempfile::tempdir().unwrap();
+        let response = match requires_openai_auth {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "null",
+        };
+        #[cfg(windows)]
+        {
+            std::fs::write(
+                bin.path().join("codex-acp.cmd"),
+                "@echo off\r\nif \"%~1\"==\"cli\" if \"%~2\"==\"app-server\" (\r\nset /p init=\r\necho {\"id\":1,\"result\":{}}\r\nset /p account=\r\necho {\"id\":2,\"result\":{\"account\":null,\"requiresOpenaiAuth\":__REQUIRED__}}\r\nexit /b 0\r\n)\r\necho Not logged in 1>&2\r\nexit /b 1\r\n"
+                    .replace("__REQUIRED__", response),
+            )
+            .unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let adapter = bin.path().join("codex-acp");
+            std::fs::write(
+                &adapter,
+                "#!/bin/sh\nif [ \"$1\" = cli ] && [ \"$2\" = app-server ]; then\n  IFS= read -r init\n  printf '%s\\n' '{\"id\":1,\"result\":{}}'\n  IFS= read -r account\n  printf '%s\\n' '{\"id\":2,\"result\":{\"account\":null,\"requiresOpenaiAuth\":__REQUIRED__}}'\n  exit 0\nfi\necho 'Not logged in' >&2\nexit 1\n"
+                    .replace("__REQUIRED__", response),
+            )
+            .unwrap();
+            std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut environment: HashMap<_, _> = std::env::vars().collect();
+        let path = std::env::join_paths(
+            std::iter::once(bin.path().to_path_buf()).chain(
+                environment
+                    .get("PATH")
+                    .into_iter()
+                    .flat_map(std::env::split_paths),
+            ),
+        )
+        .unwrap();
+        environment.insert("PATH".to_string(), path.to_string_lossy().into_owned());
+        (bin, environment)
+    }
+
+    fn fake_codex_descriptor() -> AgentDescriptor {
+        AgentDescriptor {
+            id: "catalog-codex-acp".into(),
+            name: "Codex".into(),
+            template: AgentTemplate::CodexAcp,
+            command: "codex-acp".into(),
+            args: vec![],
+            env: HashMap::new(),
+            available: true,
+            last_error: None,
+            last_probe_ok: None,
+            last_probe_agent_name: None,
+            last_probe_error: None,
+            last_probed_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_custom_provider_does_not_require_openai_login() {
+        let (_bin, environment) = fake_codex_auth(Some(false));
+        let result = diagnose_codex_auth_in_env(&fake_codex_descriptor(), &environment).await;
+        assert_eq!(result.status, CodexAuthStatus::NotApplicable);
+    }
+
+    #[tokio::test]
+    async fn codex_openai_provider_still_requires_login() {
+        let (_bin, environment) = fake_codex_auth(Some(true));
+        let result = diagnose_codex_auth_in_env(&fake_codex_descriptor(), &environment).await;
+        assert_eq!(result.status, CodexAuthStatus::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn codex_unavailable_account_query_is_not_assumed_logged_out() {
+        let (_bin, environment) = fake_codex_auth(None);
+        let result = diagnose_codex_auth_in_env(&fake_codex_descriptor(), &environment).await;
+        assert_eq!(result.status, CodexAuthStatus::Unknown);
     }
 
     #[test]

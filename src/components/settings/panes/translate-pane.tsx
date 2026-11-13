@@ -1,4 +1,4 @@
-import { ExternalLink } from "lucide-react";
+import { ExternalLink, Info, RotateCcw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -16,8 +16,8 @@ import {
 	PageTitle,
 	SettingsGroup,
 	SettingsRow,
+	SettingsSectionLabel,
 } from "@/components/settings/settings-layout";
-import { useBuiltinProviderAvailable } from "@/components/settings/use-builtin-provider";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -35,7 +35,9 @@ import {
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { BUILTIN_PROVIDER_ID } from "@/lib/core/builtin";
+import { notifyError } from "@/lib/core/notify";
 import { openExternalUrl } from "@/lib/core/open-external";
+import { hasSecret, isSecretMask, maskSecret } from "@/lib/core/secret-mask";
 import { isTauri } from "@/lib/core/tauri";
 import type {
 	AppSettings,
@@ -54,17 +56,20 @@ import {
 	FREE_MT_PROVIDER_IDS,
 	type FreeMtProbeMap,
 	type FreeMtProbeStatus,
-	hasTranslateApiKey,
 	isCommercialProviderConfigured,
 	isCommercialTranslateProvider,
 	isFreeMtProvider,
-	isTranslateApiKeyMask,
 	listSelectableProviders,
-	maskTranslateApiKey,
 	probeCommercialMtProvider,
 	probeFreeMtProviders,
+	translateSystemTemplateIssue,
+	translateUserTemplateIssue,
 } from "@/lib/translate";
-import { EMPTY_TRANSLATE_PROVIDER_CONFIG } from "@/lib/translate/defaults";
+import {
+	DEFAULT_TRANSLATE_SETTINGS,
+	EMPTY_TRANSLATE_PROVIDER_CONFIG,
+} from "@/lib/translate/defaults";
+import { extraRequestBodyIssue } from "@/lib/translate/request-options";
 import type { ProbeStatus } from "@/lib/ui/probe-status";
 
 /** Resolve API key for save/probe: draft wins; otherwise keep stored (may be mask). */
@@ -114,12 +119,30 @@ export function TranslatePane({
 }) {
 	const { t } = useTranslation("settings");
 	const tr = settings.translate;
-	const builtinAvailable = useBuiltinProviderAvailable();
+	const storedSystem = tr.customSystem || tr.customPrompt;
+	const [systemDraft, setSystemDraft] = useState(storedSystem);
+	const [userDraft, setUserDraft] = useState(tr.customUser);
+	const [systemError, setSystemError] = useState<string | null>(null);
+	const [userError, setUserError] = useState<string | null>(null);
+	useEffect(() => {
+		setSystemDraft(tr.customSystem || tr.customPrompt);
+		setSystemError(null);
+	}, [tr.customSystem, tr.customPrompt]);
+	useEffect(() => {
+		setUserDraft(tr.customUser);
+		setUserError(null);
+	}, [tr.customUser]);
 	const patchTranslate = useCallback(
 		(partial: Partial<typeof tr>) =>
 			patch({ translate: { ...tr, ...partial } }),
 		[patch, tr],
 	);
+	// The built-in channel stays implemented, but it is no longer offered here.
+	// A stored selection is moved to the free default so the picker is not blank.
+	useEffect(() => {
+		if (tr.provider !== BUILTIN_PROVIDER_ID) return;
+		patchTranslate({ provider: DEFAULT_TRANSLATE_SETTINGS.provider });
+	}, [tr.provider, patchTranslate]);
 	const showAgent = tr.provider === "agent";
 	const getProviderConfig = useCallback(
 		(id: CommercialTranslateProviderId): TranslateProviderConfig =>
@@ -128,20 +151,17 @@ export function TranslatePane({
 	);
 	/**
 	 * Free MT + Agent always; commercial only when configured (or currently
-	 * selected). The built-in shows only when its key is compiled in, or when it
-	 * is the stored selection (so a carried-over setting stays visible/disable-able).
+	 * selected). The built-in channel is omitted from this picker.
 	 */
 	const providers = useMemo(
 		() =>
 			listSelectableProviders().filter((s) => {
-				if (s.id === BUILTIN_PROVIDER_ID) {
-					return builtinAvailable || tr.provider === s.id;
-				}
+				if (s.id === BUILTIN_PROVIDER_ID) return false;
 				if (!isCommercialTranslateProvider(s.id)) return true;
 				if (tr.provider === s.id) return true;
 				return isCommercialProviderConfigured(s.id, getProviderConfig(s.id));
 			}),
-		[builtinAvailable, getProviderConfig, tr.provider],
+		[getProviderConfig, tr.provider],
 	);
 	/** Free-MT probe status (Agent never probed here). */
 	const [probeMap, setProbeMap] = useState<FreeMtProbeMap>({});
@@ -197,7 +217,6 @@ export function TranslatePane({
 
 		const initial: FreeMtProbeMap = {};
 		for (const id of FREE_MT_PROVIDER_IDS) {
-			// The built-in is never probed; its availability comes from the Host.
 			if (id === BUILTIN_PROVIDER_ID) continue;
 			initial[id] = "probing";
 		}
@@ -277,14 +296,21 @@ export function TranslatePane({
 				...draft,
 				apiKey: draftOrStored,
 			};
+			if (providerId === "openaiCompatible") {
+				const issue = extraRequestBodyIssue(toSave.extraRequestBody);
+				if (issue) {
+					notifyError(t(`translate.providerConfig.extraRequestBody.${issue}`));
+					return;
+				}
+			}
 			if (!isCommercialProviderConfigured(providerId, toSave)) {
 				setCommercialProbeMap((prev) => ({ ...prev, [providerId]: "idle" }));
 				return;
 			}
 
-			const displayMask = isTranslateApiKeyMask(toSave.apiKey)
+			const displayMask = isSecretMask(toSave.apiKey)
 				? toSave.apiKey
-				: maskTranslateApiKey(toSave.apiKey);
+				: maskSecret(toSave.apiKey);
 			const nextTranslate = {
 				...tr,
 				providerConfigs: {
@@ -326,7 +352,15 @@ export function TranslatePane({
 
 			runCommercialProbe(providerId, maskedCfg);
 		},
-		[configDrafts, getProviderConfig, patch, runCommercialProbe, settings, tr],
+		[
+			configDrafts,
+			getProviderConfig,
+			patch,
+			runCommercialProbe,
+			settings,
+			tr,
+			t,
+		],
 	);
 
 	/** Probe configured commercial engines when the default-service Select opens. */
@@ -369,23 +403,17 @@ export function TranslatePane({
 						</SelectTrigger>
 						<SelectContent className="max-h-72">
 							{providers.map((s) => {
-								const isBuiltin = s.id === BUILTIN_PROVIDER_ID;
-								// The built-in has no probe dot; availability comes from the Host.
-								const status: FreeMtProbeStatus | undefined = isBuiltin
-									? undefined
-									: isFreeMtProvider(s.id)
-										? (probeMap[s.id] ?? "idle")
-										: isCommercialTranslateProvider(s.id)
-											? (commercialProbeMap[s.id] ?? "idle")
-											: undefined;
+								const status: FreeMtProbeStatus | undefined = isFreeMtProvider(
+									s.id,
+								)
+									? (probeMap[s.id] ?? "idle")
+									: isCommercialTranslateProvider(s.id)
+										? (commercialProbeMap[s.id] ?? "idle")
+										: undefined;
 								const statusLabel =
 									status != null ? t(PROBE_LABEL_KEYS[status]) : null;
 								return (
-									<SelectItem
-										key={s.id}
-										value={s.id}
-										disabled={isBuiltin && !builtinAvailable}
-									>
+									<SelectItem key={s.id} value={s.id}>
 										<span className="flex min-w-0 items-center gap-1.5">
 											{status != null && statusLabel != null ? (
 												<ProviderStatusDot kind={status} label={statusLabel} />
@@ -421,6 +449,34 @@ export function TranslatePane({
 						</SelectContent>
 					</Select>
 				</SettingsRow>
+				<SettingsRow label={t("translate.displayMode.label")}>
+					<Select
+						value={tr.displayMode}
+						onValueChange={(v) =>
+							patchTranslate({
+								displayMode: v === "dualPane" ? "dualPane" : "overlay",
+							})
+						}
+					>
+						<SelectTrigger size="sm" className="min-w-[160px] max-w-[220px]">
+							<SelectValue />
+						</SelectTrigger>
+						<SelectContent>
+							<SelectItem value="overlay">
+								{t("translate.displayMode.overlay")}
+							</SelectItem>
+							<SelectItem value="dualPane">
+								{t("translate.displayMode.dualPane")}
+							</SelectItem>
+						</SelectContent>
+					</Select>
+				</SettingsRow>
+			</SettingsGroup>
+
+			<SettingsSectionLabel className="mt-4">
+				{t("translate.autoTranslation.section")}
+			</SettingsSectionLabel>
+			<SettingsGroup>
 				<SettingsRow
 					label={t("translate.autoSelection.label")}
 					htmlFor="translate-auto-selection"
@@ -434,21 +490,114 @@ export function TranslatePane({
 					/>
 				</SettingsRow>
 				<SettingsRow
-					label={t("translate.dualPane.label")}
-					htmlFor="translate-dual-pane"
+					label={t("translate.autoImport.label")}
+					description={t("translate.autoImport.description")}
+					htmlFor="translate-auto-import"
 				>
 					<Switch
-						id="translate-dual-pane"
-						checked={tr.dualPaneTranslate}
-						onCheckedChange={(v) => patchTranslate({ dualPaneTranslate: v })}
+						id="translate-auto-import"
+						checked={tr.autoTranslateImport}
+						onCheckedChange={(v) => patchTranslate({ autoTranslateImport: v })}
 					/>
 				</SettingsRow>
+				{tr.autoTranslateImport ? (
+					<SettingsRow
+						label={t("translate.autoImport.concurrency.label")}
+						htmlFor="translate-auto-import-concurrency"
+					>
+						<Input
+							id="translate-auto-import-concurrency"
+							type="number"
+							min={1}
+							max={5}
+							className="h-8 w-24"
+							defaultValue={tr.autoTranslateImportConcurrency}
+							onBlur={(e) => {
+								const parsed = Number(e.currentTarget.value);
+								const next = Number.isFinite(parsed)
+									? Math.min(5, Math.max(1, Math.round(parsed)))
+									: DEFAULT_TRANSLATE_SETTINGS.autoTranslateImportConcurrency;
+								e.currentTarget.value = String(next);
+								if (next !== tr.autoTranslateImportConcurrency) {
+									patchTranslate({ autoTranslateImportConcurrency: next });
+								}
+							}}
+						/>
+					</SettingsRow>
+				) : null}
 			</SettingsGroup>
 
 			<div className="mb-5">
-				<h3 className="mb-2 px-0.5 font-medium text-sm">
+				<div className="mb-2 flex items-center justify-between gap-2">
+					<SettingsSectionLabel className="mb-0">
+						<span className="flex items-center gap-1">
+							{t("translate.cache.section")}
+							<Tooltip>
+								<TooltipTrigger asChild>
+									<button
+										type="button"
+										aria-label={t("translate.cache.tip")}
+										className="inline-flex size-4 shrink-0 items-center justify-center rounded-full text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50"
+									>
+										<Info className="size-3.5" aria-hidden />
+									</button>
+								</TooltipTrigger>
+								<TooltipContent className="max-w-64">
+									{t("translate.cache.tip")}
+								</TooltipContent>
+							</Tooltip>
+						</span>
+					</SettingsSectionLabel>
+					<Button
+						type="button"
+						variant="outline"
+						size="xs"
+						disabled={
+							tr.cacheReflowIr === DEFAULT_TRANSLATE_SETTINGS.cacheReflowIr &&
+							tr.cacheReflowFinal ===
+								DEFAULT_TRANSLATE_SETTINGS.cacheReflowFinal
+						}
+						onClick={() =>
+							patchTranslate({
+								cacheReflowIr: DEFAULT_TRANSLATE_SETTINGS.cacheReflowIr,
+								cacheReflowFinal: DEFAULT_TRANSLATE_SETTINGS.cacheReflowFinal,
+							})
+						}
+					>
+						<RotateCcw aria-hidden data-icon="inline-start" />
+						{t("translate.cache.reset")}
+					</Button>
+				</div>
+				<SettingsGroup>
+					<SettingsRow
+						label={t("translate.cache.ir.label")}
+						description={t("translate.cache.ir.description")}
+						htmlFor="translate-cache-ir"
+					>
+						<Switch
+							id="translate-cache-ir"
+							checked={tr.cacheReflowIr}
+							onCheckedChange={(v) => patchTranslate({ cacheReflowIr: v })}
+						/>
+					</SettingsRow>
+					<SettingsRow
+						label={t("translate.cache.final.label")}
+						description={t("translate.cache.final.description")}
+						htmlFor="translate-cache-final"
+					>
+						<Switch
+							id="translate-cache-final"
+							checked={tr.cacheReflowFinal}
+							onCheckedChange={(v) => patchTranslate({ cacheReflowFinal: v })}
+						/>
+					</SettingsRow>
+				</SettingsGroup>
+			</div>
+
+			<div className="mb-5">
+				<SettingsSectionLabel>
 					{t("translate.providerConfig.section")}
-				</h3>
+				</SettingsSectionLabel>
 				<div className="grid gap-2">
 					{COMMERCIAL_MT_PROVIDER_IDS.map((id) => {
 						const cfg = getProviderConfig(id);
@@ -457,10 +606,10 @@ export function TranslatePane({
 						const displayApiKey =
 							draftKey !== undefined
 								? draftKey
-								: hasTranslateApiKey(cfg.apiKey)
-									? isTranslateApiKeyMask(cfg.apiKey)
+								: hasSecret(cfg.apiKey)
+									? isSecretMask(cfg.apiKey)
 										? cfg.apiKey
-										: maskTranslateApiKey(cfg.apiKey)
+										: maskSecret(cfg.apiKey)
 									: "";
 						const effectiveCfg: TranslateProviderConfig = {
 							...cfg,
@@ -532,11 +681,10 @@ export function TranslatePane({
 											onChange={(e) => {
 												const next = e.target.value;
 												const shownMask =
-													draftKey === undefined &&
-													hasTranslateApiKey(cfg.apiKey)
-														? isTranslateApiKeyMask(cfg.apiKey)
+													draftKey === undefined && hasSecret(cfg.apiKey)
+														? isSecretMask(cfg.apiKey)
 															? cfg.apiKey
-															: maskTranslateApiKey(cfg.apiKey)
+															: maskSecret(cfg.apiKey)
 														: null;
 												// Typing over the mask starts a fresh draft (not mask + chars).
 												if (
@@ -553,10 +701,7 @@ export function TranslatePane({
 											}}
 											onFocus={(e) => {
 												// Select mask so the next keystroke replaces it entirely.
-												if (
-													draftKey === undefined &&
-													hasTranslateApiKey(cfg.apiKey)
-												) {
+												if (draftKey === undefined && hasSecret(cfg.apiKey)) {
 													e.currentTarget.select();
 												}
 											}}
@@ -615,26 +760,53 @@ export function TranslatePane({
 										</ProviderFieldRow>
 									) : null}
 									{id === "openaiCompatible" ? (
-										<ProviderFieldRow
-											label={t("translate.providerConfig.model.label")}
-											htmlFor={`${inputPrefix}-model`}
-										>
-											<Input
-												id={`${inputPrefix}-model`}
-												value={effectiveCfg.model}
-												onChange={(e) =>
-													setDraftField(id, {
-														model: e.target.value,
-													})
-												}
-												placeholder={t(
-													"translate.providerConfig.model.placeholder",
+										<>
+											<ProviderFieldRow
+												label={t("translate.providerConfig.model.label")}
+												htmlFor={`${inputPrefix}-model`}
+											>
+												<Input
+													id={`${inputPrefix}-model`}
+													value={effectiveCfg.model}
+													onChange={(e) =>
+														setDraftField(id, {
+															model: e.target.value,
+														})
+													}
+													placeholder={t(
+														"translate.providerConfig.model.placeholder",
+													)}
+													className={PROVIDER_INPUT_CLASS}
+													spellCheck={false}
+													autoComplete="off"
+												/>
+											</ProviderFieldRow>
+											<ProviderFieldRow
+												label={t(
+													"translate.providerConfig.extraRequestBody.label",
 												)}
-												className={PROVIDER_INPUT_CLASS}
-												spellCheck={false}
-												autoComplete="off"
-											/>
-										</ProviderFieldRow>
+												htmlFor={`${inputPrefix}-extra-request-body`}
+											>
+												<Textarea
+													id={`${inputPrefix}-extra-request-body`}
+													value={effectiveCfg.extraRequestBody ?? ""}
+													onChange={(e) =>
+														setDraftField(id, {
+															extraRequestBody: e.target.value,
+														})
+													}
+													placeholder={'{ "temperature": 0.2 }'}
+													className="min-h-24 min-w-0 flex-1 font-mono text-xs"
+													spellCheck={false}
+													autoComplete="off"
+													aria-invalid={
+														extraRequestBodyIssue(
+															effectiveCfg.extraRequestBody,
+														) !== null
+													}
+												/>
+											</ProviderFieldRow>
+										</>
 									) : null}
 								</div>
 							</ProviderCard>
@@ -644,21 +816,26 @@ export function TranslatePane({
 			</div>
 
 			<div className="mb-5">
-				<div className="mb-2 flex items-center justify-between gap-2 px-0.5">
-					<h3 className="font-medium text-sm">
+				<div className="mb-2 flex items-center justify-between gap-2">
+					<SettingsSectionLabel className="mb-0">
 						{t("translate.customPrompt.label")}
-					</h3>
+					</SettingsSectionLabel>
 					<div className="flex items-center gap-1.5">
 						<Button
 							type="button"
 							variant="outline"
 							size="xs"
-							disabled={tr.customPrompt === DEFAULT_TRANSLATE_PROMPT_TEMPLATE}
-							onClick={() =>
-								patchTranslate({
-									customPrompt: DEFAULT_TRANSLATE_PROMPT_TEMPLATE,
-								})
+							disabled={
+								systemDraft.trim() === DEFAULT_TRANSLATE_PROMPT_TEMPLATE
 							}
+							onClick={() => {
+								setSystemError(null);
+								setSystemDraft(DEFAULT_TRANSLATE_PROMPT_TEMPLATE);
+								patchTranslate({
+									customSystem: DEFAULT_TRANSLATE_PROMPT_TEMPLATE,
+									customPrompt: "",
+								});
+							}}
 						>
 							{t("translate.customPrompt.seed")}
 						</Button>
@@ -666,34 +843,130 @@ export function TranslatePane({
 							type="button"
 							variant="outline"
 							size="xs"
-							disabled={!tr.customPrompt}
-							onClick={() => patchTranslate({ customPrompt: "" })}
+							disabled={
+								!tr.customPrompt &&
+								!tr.customSystem &&
+								!tr.customUser &&
+								!systemDraft.trim() &&
+								!userDraft.trim()
+							}
+							onClick={() => {
+								setSystemError(null);
+								setUserError(null);
+								setSystemDraft("");
+								setUserDraft("");
+								patchTranslate({
+									customPrompt: "",
+									customSystem: "",
+									customUser: "",
+								});
+							}}
 						>
 							{t("translate.customPrompt.reset")}
 						</Button>
 					</div>
 				</div>
 				<SettingsGroup>
-					<div className="flex flex-col gap-1.5 px-3.5 py-2.5">
-						<Textarea
-							id="translate-custom-prompt"
-							value={tr.customPrompt}
-							onChange={(e) =>
-								patchTranslate({
-									customPrompt: e.target.value.slice(0, 8000),
-								})
-							}
-							onBlur={() => {
-								const trimmed = tr.customPrompt.trim();
-								if (trimmed !== tr.customPrompt) {
-									patchTranslate({ customPrompt: trimmed });
-								}
-							}}
-							placeholder={t("translate.customPrompt.placeholder")}
-							rows={5}
-							className="min-h-[110px] resize-y font-mono text-xs placeholder:text-muted-foreground/50"
-							spellCheck={true}
-						/>
+					<div className="flex flex-col gap-3 px-3.5 py-2.5">
+						<label
+							className="flex flex-col gap-1.5"
+							htmlFor="translate-custom-system"
+						>
+							<span className="text-muted-foreground text-xs">
+								{t("translate.customPrompt.systemLabel")}
+							</span>
+							<Textarea
+								id="translate-custom-system"
+								value={systemDraft}
+								onChange={(e) => {
+									setSystemDraft(e.target.value.slice(0, 8000));
+									setSystemError(null);
+								}}
+								onBlur={() => {
+									const trimmed = systemDraft.trim().slice(0, 8000);
+									const issue = translateSystemTemplateIssue(trimmed);
+									if (issue?.kind === "unknown") {
+										setSystemError(
+											t("translate.customPrompt.unknownPlaceholder", {
+												name: issue.names.join(", "),
+											}),
+										);
+										return;
+									}
+									setSystemError(null);
+									setSystemDraft(trimmed);
+									const stored = tr.customSystem || tr.customPrompt;
+									// Leave an untouched legacy customPrompt in place.
+									// Editing it, or saving a customSystem, clears the legacy field.
+									if (
+										trimmed === stored &&
+										(!tr.customPrompt || !tr.customSystem)
+									) {
+										return;
+									}
+									patchTranslate({
+										customSystem: trimmed,
+										customPrompt: "",
+									});
+								}}
+								placeholder={t("translate.customPrompt.systemPlaceholder")}
+								rows={5}
+								aria-invalid={systemError ? true : undefined}
+								className="min-h-[110px] resize-y font-mono text-xs placeholder:text-muted-foreground/50"
+								spellCheck={true}
+							/>
+							{systemError ? (
+								<p className="text-destructive text-xs" role="alert">
+									{systemError}
+								</p>
+							) : null}
+						</label>
+						<label
+							className="flex flex-col gap-1.5"
+							htmlFor="translate-custom-user"
+						>
+							<span className="text-muted-foreground text-xs">
+								{t("translate.customPrompt.userLabel")}
+							</span>
+							<Textarea
+								id="translate-custom-user"
+								value={userDraft}
+								onChange={(e) => {
+									setUserDraft(e.target.value.slice(0, 8000));
+									setUserError(null);
+								}}
+								onBlur={() => {
+									const trimmed = userDraft.trim().slice(0, 8000);
+									const issue = translateUserTemplateIssue(trimmed);
+									if (issue?.kind === "unknown") {
+										setUserError(
+											t("translate.customPrompt.unknownPlaceholder", {
+												name: issue.names.join(", "),
+											}),
+										);
+										return;
+									}
+									if (issue?.kind === "missingText") {
+										setUserError(t("translate.customPrompt.userNeedsText"));
+										return;
+									}
+									setUserError(null);
+									setUserDraft(trimmed);
+									if (trimmed === tr.customUser) return;
+									patchTranslate({ customUser: trimmed });
+								}}
+								placeholder={t("translate.customPrompt.userPlaceholder")}
+								rows={3}
+								aria-invalid={userError ? true : undefined}
+								className="min-h-[72px] resize-y font-mono text-xs placeholder:text-muted-foreground/50"
+								spellCheck={true}
+							/>
+							{userError ? (
+								<p className="text-destructive text-xs" role="alert">
+									{userError}
+								</p>
+							) : null}
+						</label>
 					</div>
 				</SettingsGroup>
 			</div>

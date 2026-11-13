@@ -19,6 +19,7 @@ import {
 	type PromptImage,
 	runOnce,
 } from "@/lib/agent";
+import type { ContextRequest } from "@/lib/agent/context-request";
 import type { AgentRunRefs } from "@/lib/agent/run-attach";
 import { errorText } from "@/lib/core/error";
 import { notifyError } from "@/lib/core/notify";
@@ -150,6 +151,8 @@ export type RunAskTurnOptions = AgentRunRefs & {
 	images?: PromptImage[];
 	vaultPath?: string;
 	buildPrompt: (thread: PdfAskThread, latestUserQuestion: string) => string;
+	/** Host context plan for this turn. Web and plaza asks omit it. */
+	context?: ContextRequest;
 	/** Merge the turn's thread snapshot into the owning container. */
 	upsertThread: (thread: PdfAskThread) => void;
 	patchThread: AskTurnPatch;
@@ -174,6 +177,7 @@ export async function runAskTurn({
 	images,
 	vaultPath,
 	buildPrompt,
+	context,
 	upsertThread,
 	patchThread,
 	persist,
@@ -217,6 +221,7 @@ export async function runAskTurn({
 			modelId: agent?.modelId,
 			images,
 			vaultPath,
+			context,
 			workflow: "free",
 			permissionMode: "auto",
 			hideFromChatHistory: true,
@@ -240,7 +245,14 @@ export async function runAskTurn({
 			unsubsRef,
 			sessionRef,
 			activeSessionRef,
-			onArmed: () => upsertThread(withAssistant),
+			onArmed: () => {
+				upsertThread(withAssistant);
+				// The `withUser` write schedules a marks refresh. Persist the
+				// assistant placeholder (and its session id) too, otherwise that
+				// refresh reloads a snapshot without the message the stream and
+				// completed handlers below need to patch.
+				void persist?.(withAssistant);
+			},
 			onStream: (ev) =>
 				patchThread(threadId, (th) => {
 					const msgs = [...th.messages];

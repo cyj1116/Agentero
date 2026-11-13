@@ -2,8 +2,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { SettingsSection } from "@/components/settings/types";
 import { TrafficLightSpacer } from "@/components/shell/traffic-light-spacer";
 import { applyLocale } from "@/i18n";
-import { commands } from "@/lib/core/bindings";
+import { commands, events } from "@/lib/core/bindings";
+import { errorMessage, notifyError } from "@/lib/core/notify";
 import { isMacOS, isTauri } from "@/lib/core/tauri";
+import { listenEventSafe } from "@/lib/core/tauri-events";
 import {
 	applyDocumentChrome,
 	ensureSettingsLoaded,
@@ -11,7 +13,9 @@ import {
 	saveSettingsAsync,
 	subscribeSettings,
 } from "@/lib/settings";
+import { applyExternalSettings } from "@/lib/settings/store";
 import { closeCurrentWindow } from "@/lib/shell/close-window";
+import { resolveShortcutId } from "@/lib/shell/shortcuts";
 import { SettingsContent } from "./settings-content";
 
 function readSearchParams() {
@@ -73,17 +77,13 @@ export function SettingsNativeRoot() {
 
 	useEffect(() => {
 		const onKeyDown = (event: KeyboardEvent) => {
-			const isComma = event.key === "," || event.code === "Comma";
-			const isEsc = event.key === "Escape";
-			const isCloseWindow =
-				(event.key === "w" || event.code === "KeyW") &&
-				(event.metaKey || event.ctrlKey);
-			const metaOrCtrl = event.metaKey || event.ctrlKey;
 			if (
-				isEsc ||
-				(isCloseWindow && !event.altKey && !event.shiftKey) ||
-				(isComma && metaOrCtrl && !event.altKey && !event.shiftKey)
-			) {
+				event.defaultPrevented ||
+				document.querySelector("[data-shortcut-recording]")
+			)
+				return;
+			const id = resolveShortcutId(event, { settingsOpen: true });
+			if (id === "closeSheet" || id === "closeTab" || id === "settings") {
 				event.preventDefault();
 				closeCurrentWindow();
 			}
@@ -99,12 +99,40 @@ export function SettingsNativeRoot() {
 		window.history.replaceState(null, "", url.toString());
 	}, []);
 
+	useEffect(
+		() =>
+			listenEventSafe(events.settingsSectionRequested, (next) => {
+				handleSectionChange(next as SettingsSection);
+			}),
+		[handleSectionChange],
+	);
+
+	// The Settings window is a singleton: opening it from another Vault must
+	// retarget the panes (sync binds per Vault) instead of keeping the first
+	// opener's `vault_path`.
+	const handleVaultChange = useCallback((next: string) => {
+		const path = next.trim();
+		if (!path) return;
+		setSearchParams((prev) => ({ ...prev, vaultPath: path }));
+		const url = new URL(window.location.href);
+		url.searchParams.set("vault_path", path);
+		window.history.replaceState(null, "", url.toString());
+	}, []);
+
+	useEffect(
+		() => listenEventSafe(events.settingsVaultRequested, handleVaultChange),
+		[handleVaultChange],
+	);
+
 	const handleChange = useCallback(async (next: typeof settings) => {
+		const previous = loadSettings();
 		setSettings(next);
 		try {
 			await saveSettingsAsync(next);
 		} catch (e) {
-			console.warn("[settings-native-root] save failed", e);
+			applyExternalSettings(previous);
+			setSettings(previous);
+			notifyError(errorMessage(e));
 		}
 	}, []);
 

@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-
-import type { LayoutTranslateItem } from "@/lib/pdf/layout/layout-translate";
-import { runLayoutRegionTranslate } from "@/lib/pdf/layout/layout-translate";
+import {
+	applyLayoutTranslateSidecar,
+	type LayoutTranslateItem,
+	type LayoutTranslateSidecar,
+	runLayoutRegionTranslate,
+} from "@/lib/pdf/layout/layout-translate";
+import { runLayoutRegionTranslate as runPublicLayoutTranslate } from "@/lib/pdf/layout/layout-translate-reliable";
+import { paragraphFromCharacters } from "@/lib/pdf/reflow/extract";
+import { validReflowTranslation } from "@/lib/pdf/reflow/types";
 
 const runTranslate = vi.fn<(...args: unknown[]) => Promise<string>>();
 
@@ -45,6 +51,136 @@ describe("runLayoutRegionTranslate paragraph chains", () => {
 		runTranslate.mockReset();
 	});
 
+	it("keeps separate reflow sentence pairs with formulas and styles spanning sentences", async () => {
+		const reflow = paragraphFromCharacters(
+			"p",
+			0,
+			{ x: 0, y: 0, w: 100, h: 40 },
+			[],
+			[],
+			false,
+		);
+		reflow.source = "Use x here. Bold follows. Last sentence.";
+		reflow.protectedText =
+			"Use ⟪F0⟫ here. ⟪S0⟫Bold follows. Last sentence.⟪/S0⟫";
+		reflow.formulas = [
+			{
+				id: "0",
+				text: "x",
+				box: { x: 0, y: 0, w: 5, h: 5 },
+				characterIndexes: [4],
+				baselineOffset: 0,
+			},
+		];
+		reflow.styles = { "0": { ...reflow.style, bold: true } };
+		runTranslate.mockResolvedValueOnce(
+			"[[1]] 使用 ⟦0⟧。\n[[2]] ⟦0⟧接着是粗体。\n[[3]] 末句。⟦0⟧",
+		);
+		const [translated] = await runLayoutRegionTranslate({
+			items: [
+				{ ...item("p", reflow.protectedText, 0), raw: reflow.source, reflow },
+			],
+			onUpdate: () => {},
+		});
+		expect(translated.status).toBe("done");
+		expect(
+			translated.sentences?.map(({ quote, translated }) => [quote, translated]),
+		).toEqual([
+			["Use x here.", "使用 ⟪F0⟫。"],
+			["Bold follows.", "⟪S0⟫接着是粗体。"],
+			["Last sentence.", "末句。⟪/S0⟫"],
+		]);
+		expect(validReflowTranslation(reflow, translated.translated ?? "")).toBe(
+			true,
+		);
+
+		const sidecar: LayoutTranslateSidecar = {
+			schemaVersion: 2,
+			source: {
+				mode: "pdf-layout-translate",
+				generatedAt: "",
+				providerId: "googleapi",
+				sourceLang: "en",
+				targetLang: "zh-CN",
+				serviceKey: "",
+			},
+			items: [
+				{
+					...translated,
+					translated: translated.translated ?? "",
+					sentences: [
+						{
+							quote: reflow.source,
+							source: reflow.protectedText,
+							translated: translated.translated ?? "",
+						},
+					],
+				},
+			],
+		};
+		expect(
+			applyLayoutTranslateSidecar([translated], sidecar, {
+				requireReflowSentencePairs: true,
+			})[0],
+		).toMatchObject({
+			status: "pending",
+			translated: undefined,
+			sentences: undefined,
+		});
+		sidecar.items[0].sentences = translated.sentences;
+		expect(
+			applyLayoutTranslateSidecar([translated], sidecar, {
+				requireReflowSentencePairs: true,
+			})[0],
+		).toMatchObject({ status: "done", sentences: translated.sentences });
+	});
+
+	it("publishes valid batch results before a different paragraph finishes retrying", async () => {
+		let finishRetry!: (text: string) => void;
+		runTranslate.mockResolvedValueOnce("[[1]] 参见网址。\n\n[[2]] 第二段。");
+		runTranslate.mockImplementationOnce(
+			() =>
+				new Promise<string>((resolve) => {
+					finishRetry = resolve;
+				}),
+		);
+		const updates: LayoutTranslateItem[][] = [];
+		const run = runLayoutRegionTranslate({
+			items: [
+				item("retry", "See https://example.com/x for details.", 0),
+				item("ready", "Second standalone paragraph.", 0),
+			],
+			onUpdate: (items) => updates.push(items),
+		});
+		await vi.waitFor(() => expect(finishRetry).toBeTypeOf("function"));
+		expect(
+			updates.some(
+				(items) => items[1].status === "done" && items[0].status === "running",
+			),
+		).toBe(true);
+		finishRetry("参见 ⟦0⟧ 获取细节。");
+		expect((await run).map((item) => item.status)).toEqual(["done", "done"]);
+	});
+
+	it("preserves raw quotes and source styles through the public long-block path", async () => {
+		const raw = `A repre- sentation ${"with detail ".repeat(600)}ends here.`;
+		const source = raw.replace("repre- sentation", "representation");
+		runTranslate.mockImplementation(async (task) =>
+			(task as { text: string }).text.trim(),
+		);
+		const sourceStyle = { fontSize: 0.0125, bold: false, italic: false };
+		const out = await runPublicLayoutTranslate({
+			items: [{ ...item("long", source, 0), raw, sourceStyle }],
+			onUpdate: () => {},
+		});
+		expect(out).toHaveLength(1);
+		expect(out[0]?.id).toBe("long");
+		expect(out[0]?.kind).toBe("text");
+		expect(out[0]?.sourceStyle).toEqual(sourceStyle);
+		expect(out[0]?.sentences?.[0]?.quote).toBe(raw);
+		expect(out[0]?.translated).toContain("ends here.");
+	});
+
 	it("sends a cross-page paragraph as one request and splits the result back", async () => {
 		runTranslate.mockResolvedValue("智能体查询环境。随后它更新自己的策略。");
 		const items = [
@@ -61,6 +197,17 @@ describe("runLayoutRegionTranslate paragraph chains", () => {
 		expect(out.map((it) => it.status)).toEqual(["done", "done"]);
 		expect(out[0]?.translated).toBe("智能体查询环境。");
 		expect(out[1]?.translated).toBe("随后它更新自己的策略。");
+		const quote =
+			"the agent queries the environment and then updates its policy.";
+		expect(out[0]?.sentences?.[0]).toMatchObject({
+			quote,
+			translated: "智能体查询环境。随后它更新自己的策略。",
+			display: "智能体查询环境。",
+		});
+		expect(out[1]?.sentences?.[0]).toMatchObject({
+			quote,
+			display: "随后它更新自己的策略。",
+		});
 	});
 
 	it("skips chains already cached and keeps independent paragraphs separate", async () => {
@@ -89,15 +236,427 @@ describe("runLayoutRegionTranslate paragraph chains", () => {
 		]);
 	});
 
-	it("retries unmasked when the engine drops a placeholder", async () => {
+	it("retries with protection intact when the engine drops a placeholder", async () => {
 		runTranslate
 			.mockResolvedValueOnce("参见 网址 获取细节。")
-			.mockResolvedValueOnce("参见 https://example.com/x 获取细节。");
+			.mockResolvedValueOnce("参见 ⟦0⟧ 获取细节。");
 		const items = [item("a", "See https://example.com/x for details.", 0)];
 
 		const out = await runLayoutRegionTranslate({ items, onUpdate: () => {} });
 
 		expect(runTranslate).toHaveBeenCalledTimes(2);
+		expect(runTranslate.mock.calls[1]?.[0]).toMatchObject({
+			text: "See ⟦0⟧ for details.",
+		});
 		expect(out[0]?.translated).toBe("参见 https://example.com/x 获取细节。");
+		expect(out[0]?.sentences?.[0]?.quote).toBe(
+			"See https://example.com/x for details.",
+		);
+	});
+
+	it("does not publish a translation with damaged formulas after retry", async () => {
+		runTranslate.mockResolvedValue("公式 ⟦0⟧ ⟦0⟧");
+		const out = await runLayoutRegionTranslate({
+			items: [item("math", "Use $x^2$ now.", 0)],
+			onUpdate: () => {},
+		});
+		expect(runTranslate).toHaveBeenCalledTimes(2);
+		expect(out[0]?.status).toBe("error");
+		expect(out[0]?.translated).toBeUndefined();
+	});
+
+	it("sends all of a long sentence within the transport budget and retains its anchor", async () => {
+		const source = `${"longword ".repeat(1100)}END.`;
+		runTranslate.mockImplementation(async (task) =>
+			(task as { text: string }).text.trim(),
+		);
+		const out = await runLayoutRegionTranslate({
+			items: [item("long", source, 0)],
+			onUpdate: () => {},
+		});
+		expect(runTranslate.mock.calls.length).toBeGreaterThan(1);
+		for (const call of runTranslate.mock.calls)
+			expect((call[0] as { text: string }).text.length).toBeLessThanOrEqual(
+				4500,
+			);
+		expect(out[0]?.translated).toContain("END.");
+		expect(out[0]?.sentences?.[0]?.quote).toBe(source);
+		expect(out[0]?.status).toBe("done");
+	});
+
+	it("numbers each sentence and stores the pair on the block", async () => {
+		runTranslate.mockResolvedValue("[[1]] 第一句。\n\n[[2]] 第二句。");
+		const items = [item("a", "First sentence. Second sentence.", 0)];
+
+		const out = await runLayoutRegionTranslate({ items, onUpdate: () => {} });
+
+		const payload = runTranslate.mock.calls[0]?.[0] as { text: string };
+		expect(payload.text).toContain("[[1]] First sentence.");
+		expect(payload.text).toContain("[[2]] Second sentence.");
+		expect(out[0]?.status).toBe("done");
+		expect(out[0]?.translated).toBe("第一句。第二句。");
+		expect(out[0]?.sentences).toEqual([
+			{
+				quote: "First sentence.",
+				source: "First sentence.",
+				translated: "第一句。",
+			},
+			{
+				quote: "Second sentence.",
+				source: "Second sentence.",
+				translated: "第二句。",
+			},
+		]);
+	});
+
+	it("retries each sentence when markers are merged and skips pairs if one fails", async () => {
+		runTranslate
+			.mockResolvedValueOnce("第一句第二句。")
+			.mockResolvedValueOnce("第一句。")
+			.mockRejectedValueOnce(new Error("nope"));
+		const items = [item("a", "First sentence. Second sentence.", 0)];
+
+		const out = await runLayoutRegionTranslate({ items, onUpdate: () => {} });
+
+		expect(runTranslate).toHaveBeenCalledTimes(3);
+		expect(out[0]?.status).toBe("error");
+		expect(out[0]?.sentences).toBeUndefined();
+		expect(out[0]?.translated).toBeUndefined();
+	});
+
+	it("stops issuing requests once the provider is unreachable", async () => {
+		runTranslate.mockRejectedValue(
+			new Error(
+				"Tencent Transmart request failed: error sending request for url (https://transmart.qq.com/api/imt)",
+			),
+		);
+		const body = "Sentence ".repeat(300);
+		const items = Array.from({ length: 6 }, (_, index) =>
+			item(`dead-${index}`, `${index} ${body}`, 0),
+		);
+
+		const out = await runPublicLayoutTranslate({
+			items,
+			onUpdate: () => {},
+		});
+
+		// Three transport failures mark the endpoint dead; the remaining batches
+		// fail without a request and no retry round replays them.
+		expect(runTranslate.mock.calls.length).toBeGreaterThanOrEqual(3);
+		expect(runTranslate.mock.calls.length).toBeLessThan(8);
+		expect(out.every((translated) => translated.status === "error")).toBe(true);
+		expect(
+			out.every((translated) =>
+				translated.error?.includes("error sending request"),
+			),
+		).toBe(true);
+	});
+});
+
+it("retries structural formulas with nonnumeric placeholders when MT interprets token IDs as quantities", async () => {
+	runTranslate.mockReset();
+	const reflow = paragraphFromCharacters(
+		"p",
+		0,
+		{ x: 0, y: 0, w: 100, h: 30 },
+		[],
+		[],
+		false,
+	);
+	reflow.source = "Factor x";
+	reflow.protectedText = "Factor ⟪F0⟫";
+	reflow.formulas = [
+		{
+			id: "0",
+			text: "x",
+			box: { x: 0, y: 0, w: 5, h: 10 },
+			characterIndexes: [0],
+			baselineOffset: 0,
+		},
+	];
+	runTranslate
+		.mockResolvedValueOnce("倍数 0")
+		.mockImplementation(async (task) =>
+			(task as { text: string }).text.replace("Factor", "倍数"),
+		);
+	const out = await runLayoutRegionTranslate({
+		items: [{ ...item("p", reflow.protectedText, 0), reflow }],
+		onUpdate: () => {},
+	});
+	expect(out[0].status).toBe("done");
+	expect(out[0].translated).toContain("⟪F0⟫");
+	expect(runTranslate.mock.calls[1]?.[0]).toMatchObject({
+		text: "Factor ZXQAQXZ",
+	});
+});
+it.each([
+	false,
+	true,
+])("retains style order when prose batch markers are damaged: %s", async (damaged) => {
+	runTranslate.mockReset();
+	const reflow = paragraphFromCharacters(
+		"p",
+		0,
+		{ x: 0, y: 0, w: 100, h: 30 },
+		[],
+		[],
+		false,
+	);
+	reflow.source = ". A word";
+	reflow.protectedText = ". A ⟪S0⟫word⟪/S0⟫";
+	reflow.styles = { "0": { ...reflow.style, bold: true } };
+	runTranslate
+		.mockResolvedValueOnce("坏结果")
+		.mockResolvedValueOnce("坏结果")
+		.mockResolvedValueOnce(damaged ? "一个词" : "[[1]] 一个\n\n[[2]] 词")
+		.mockResolvedValueOnce("一个")
+		.mockResolvedValueOnce("词");
+	const out = await runLayoutRegionTranslate({
+		items: [{ ...item("p", reflow.protectedText, 0), reflow }],
+		onUpdate: () => {},
+	});
+	expect(out[0].status).toBe("done");
+	expect(out[0].reflowFallback).toBe("protected-spans");
+	expect(runTranslate).toHaveBeenCalledTimes(damaged ? 5 : 3);
+	expect(runTranslate.mock.calls[2]?.[0]).toMatchObject({
+		text: "[[1]] A \n\n[[2]] word",
+	});
+	expect(out[0].translated).toContain(". 一个");
+	expect(out[0].translated).toContain("⟪S0⟫ 词 ⟪/S0⟫");
+});
+
+describe("protected caption response recovery", () => {
+	const missingResponse = "Unexpected Tencent Transmart translation response";
+	function caption(styled = false) {
+		const reflow = paragraphFromCharacters(
+			"caption",
+			2,
+			{ x: 10, y: 20, w: 100, h: 30 },
+			[],
+			[],
+			false,
+		);
+		reflow.source = styled ? "mask" : "x mask y";
+		reflow.protectedText = styled ? "⟪S0⟫mask⟪/S0⟫" : "⟪F0⟫mask⟪F1⟫";
+		if (styled) reflow.styles = { "0": { ...reflow.style, bold: true } };
+		else
+			reflow.formulas = ["x", "y"].map((text, index) => ({
+				id: String(index),
+				text,
+				box: { x: index * 20, y: 0, w: 5, h: 10 },
+				characterIndexes: [index],
+				baselineOffset: 0,
+			}));
+		return {
+			...item("caption", reflow.protectedText, 2, "figure_title"),
+			raw: reflow.source,
+			reflow,
+		};
+	}
+	const requests = () =>
+		runTranslate.mock.calls.map(([task]) => (task as { text: string }).text);
+	const run = (items: LayoutTranslateItem[], signal?: AbortSignal) =>
+		runLayoutRegionTranslate({ items, signal, onUpdate: () => {} });
+
+	beforeEach(() => {
+		runTranslate.mockReset();
+	});
+
+	it.each([
+		"provider error",
+		"empty",
+		"styles",
+	])("recovers a short caption after %s without losing structure or anchors", async (mode) => {
+		const input = caption(mode === "styles");
+		if (mode === "empty") runTranslate.mockResolvedValueOnce(" ");
+		else runTranslate.mockRejectedValueOnce(new Error(missingResponse));
+		runTranslate.mockResolvedValueOnce("掩码");
+		const [out] = await run([input]);
+		expect(requests()).toEqual(["⟦0⟧mask⟦1⟧", "mask"]);
+		expect(out).toMatchObject({
+			id: input.id,
+			pageIndex: input.pageIndex,
+			bbox: input.bbox,
+			status: "done",
+			reflowFallback: "protected-spans",
+			error: undefined,
+			sentences: [{ quote: input.raw, source: input.source }],
+		});
+		expect(out.translated).toContain("掩码");
+		expect(validReflowTranslation(input.reflow, out.translated ?? "")).toBe(
+			true,
+		);
+	});
+
+	it("recovers when the nonnumeric placeholder retry also returns no translation", async () => {
+		runTranslate
+			.mockResolvedValueOnce("坏结果")
+			.mockRejectedValueOnce(new Error(missingResponse))
+			.mockResolvedValueOnce("掩码");
+		const [out] = await run([caption()]);
+		expect(requests()).toEqual(["⟦0⟧mask⟦1⟧", "ZXQAQXZmaskZXQBQXZ", "mask"]);
+		expect(out.status).toBe("done");
+		expect(validReflowTranslation(caption().reflow, out.translated ?? "")).toBe(
+			true,
+		);
+	});
+
+	it("also recovers protected links without a reflow paragraph", async () => {
+		runTranslate
+			.mockRejectedValueOnce(new Error(missingResponse))
+			.mockResolvedValueOnce("掩码");
+		const [out] = await run([
+			item("link-caption", "https://example.org mask", 0, "figure_title"),
+		]);
+		expect(requests()).toEqual(["⟦0⟧ mask", "mask"]);
+		expect(out.status).toBe("done");
+		expect(out.translated).toBe("https://example.org 掩码");
+	});
+
+	it("recovers a missing response during the normal protected-token retry", async () => {
+		runTranslate
+			.mockResolvedValueOnce("坏结果")
+			.mockRejectedValueOnce(new Error(missingResponse))
+			.mockResolvedValueOnce("掩码");
+		const [out] = await run([
+			item("link-caption", "https://example.org mask", 0, "figure_title"),
+		]);
+		expect(requests()).toEqual(["⟦0⟧ mask", "⟦0⟧ mask", "mask"]);
+		expect(out.translated).toBe("https://example.org 掩码");
+	});
+
+	it("retries a missing batch response per sentence and preserves independent body text", async () => {
+		runTranslate.mockImplementation(async (task) => {
+			const text = (task as { text: string }).text;
+			if (text.includes("⟦")) throw new Error(missingResponse);
+			return text === "mask" ? "掩码" : "正常正文。";
+		});
+		const [recovered, body] = await run([
+			caption(),
+			item("body", "Normal body.", 0),
+		]);
+		expect(requests()).toHaveLength(4);
+		expect(requests()[0]).toContain("[[1]] ⟦0⟧mask⟦1⟧");
+		expect(requests().slice(1)).toEqual(["⟦0⟧mask⟦1⟧", "mask", "Normal body."]);
+		expect(recovered.status).toBe("done");
+		expect(body.translated).toBe("正常正文。");
+	});
+
+	it("falls back to individual prose spans if their numbered payload returns no translation", async () => {
+		const input = caption();
+		input.reflow.source = "first x mask y";
+		input.source = input.reflow.protectedText = "first ⟪F0⟫mask⟪F1⟫";
+		input.raw = input.reflow.source;
+		runTranslate
+			.mockRejectedValueOnce(new Error(missingResponse))
+			.mockRejectedValueOnce(new Error(missingResponse))
+			.mockResolvedValueOnce("首先")
+			.mockResolvedValueOnce("掩码");
+		const [out] = await run([input]);
+		expect(requests()).toEqual([
+			"first ⟦0⟧mask⟦1⟧",
+			"[[1]] first \n\n[[2]] mask",
+			"first ",
+			"mask",
+		]);
+		expect(out.status).toBe("done");
+		expect(validReflowTranslation(input.reflow, out.translated ?? "")).toBe(
+			true,
+		);
+	});
+
+	it.each([
+		"error sending request: connection refused",
+		"Tencent Transmart failed (HTTP 401): invalid key",
+		"Tencent Transmart failed (HTTP 429): rate limited",
+		"Aborted",
+	])("does not add content-recovery requests for %s", async (message) => {
+		runTranslate.mockRejectedValue(new Error(message));
+		const [out] = await run([caption()]);
+		expect(requests()).toHaveLength(1);
+		expect(out).toMatchObject({ status: "error", error: message });
+	});
+
+	it("does not turn a missing plain-text response into a new fallback request", async () => {
+		runTranslate.mockRejectedValue(new Error(missingResponse));
+		const [out] = await run([item("plain", "mask", 0)]);
+		expect(requests()).toEqual(["mask"]);
+		expect(out.status).toBe("error");
+	});
+
+	it("does not retry a failed prose recovery or publish partial translated text", async () => {
+		runTranslate.mockRejectedValue(new Error(missingResponse));
+		const [out] = await run([caption()]);
+		expect(requests()).toEqual(["⟦0⟧mask⟦1⟧", "mask"]);
+		expect(out).toMatchObject({ status: "error", translated: undefined });
+		expect(out.sentences).toBeUndefined();
+	});
+
+	it("rejects protected markers invented in a prose-only response", async () => {
+		runTranslate
+			.mockRejectedValueOnce(new Error(missingResponse))
+			.mockResolvedValueOnce("掩码 ⟦7⟧");
+		const [out] = await run([caption()]);
+		expect(out).toMatchObject({ status: "error", translated: undefined });
+		expect(out.sentences).toBeUndefined();
+	});
+
+	it("keeps a multi-sentence caption untranslated if one prose recovery fails", async () => {
+		const input = caption();
+		input.raw = input.reflow.source = "x mask y. Another label.";
+		input.source = input.reflow.protectedText = "⟪F0⟫mask⟪F1⟫. Another label.";
+		runTranslate
+			.mockRejectedValueOnce(new Error(missingResponse))
+			.mockRejectedValueOnce(new Error(missingResponse))
+			.mockResolvedValueOnce("掩码")
+			.mockRejectedValueOnce(new Error(missingResponse));
+		const [out] = await run([input]);
+		expect(requests()).toHaveLength(4);
+		expect(out).toMatchObject({ status: "error", translated: undefined });
+		expect(out.sentences).toBeUndefined();
+	});
+
+	it("does not enter response recovery for a formula-only fragment", async () => {
+		const input = caption();
+		input.raw = input.reflow.source = "x y";
+		input.source = input.reflow.protectedText = "⟪F0⟫⟪F1⟫";
+		runTranslate.mockRejectedValueOnce(new Error(missingResponse));
+		const [out] = await run([input]);
+		expect(requests()).toEqual(["⟦0⟧⟦1⟧"]);
+		expect(out.status).toBe("error");
+	});
+
+	it("does not publish a late prose recovery after cancellation", async () => {
+		const controller = new AbortController();
+		runTranslate
+			.mockRejectedValueOnce(new Error(missingResponse))
+			.mockImplementationOnce(async () => {
+				controller.abort();
+				return "掩码";
+			});
+		const [out] = await run([caption()], controller.signal);
+		expect(requests()).toEqual(["⟦0⟧mask⟦1⟧", "mask"]);
+		expect(out.status).toBe("skipped");
+		expect(out.translated).toBeUndefined();
+	});
+
+	it("ignores a late missing response after cancellation", async () => {
+		const controller = new AbortController();
+		runTranslate.mockImplementationOnce(async () => {
+			controller.abort();
+			throw new Error(missingResponse);
+		});
+		const [out] = await run([caption()], controller.signal);
+		expect(requests()).toHaveLength(1);
+		expect(out.status).toBe("skipped");
+		expect(out.translated).toBeUndefined();
+	});
+
+	it("does not add requests to a successfully translated protected caption", async () => {
+		runTranslate.mockResolvedValueOnce("⟦0⟧掩码⟦1⟧");
+		const [out] = await run([caption()]);
+		expect(out.status).toBe("done");
+		expect(requests()).toHaveLength(1);
+		expect(out.reflowFallback).toBeUndefined();
 	});
 });

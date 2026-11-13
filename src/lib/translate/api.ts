@@ -1,14 +1,11 @@
-import {
-	commands,
-	type TranslateTextArgs,
-	type TranslateTextResult,
-} from "@/lib/core/bindings";
+import { commands } from "@/lib/core/bindings";
 import { isTauri } from "@/lib/core/tauri";
 
 /** Host marker for "the built-in provider has no compiled-in key". */
 export const ERR_TRANSLATE_NO_BUILTIN_KEY = "translate.no_builtin_key";
-
-export type { TranslateTextArgs, TranslateTextResult };
+export const ERR_TRANSLATE_EXTRA_INVALID = "translate.extra_parameters_invalid";
+export const ERR_TRANSLATE_EXTRA_RESERVED =
+	"translate.extra_parameters_reserved";
 
 /**
  * Host MT command via the generated typed binding (tauri-specta pilot).
@@ -24,6 +21,7 @@ export async function invokeTranslateText(args: {
 	baseUrl?: string;
 	region?: string;
 	model?: string;
+	extraRequestBody?: string;
 	/** Host request timeout (ms); clamped 1s–30s server-side. */
 	timeoutMs?: number;
 }): Promise<string> {
@@ -39,6 +37,7 @@ export async function invokeTranslateText(args: {
 		baseUrl: args.baseUrl?.trim() || null,
 		region: args.region?.trim() || null,
 		model: args.model?.trim() || null,
+		extraRequestBody: args.extraRequestBody?.trim() || null,
 		timeoutMs: args.timeoutMs ?? null,
 	});
 	if (!res.ok || !res.data) {
@@ -48,7 +47,9 @@ export async function invokeTranslateText(args: {
 		// users a bare code instead of the Host's human text.
 		const code = res.error?.code;
 		throw new Error(
-			code === ERR_TRANSLATE_NO_BUILTIN_KEY
+			code === ERR_TRANSLATE_NO_BUILTIN_KEY ||
+				code === ERR_TRANSLATE_EXTRA_INVALID ||
+				code === ERR_TRANSLATE_EXTRA_RESERVED
 				? code
 				: (res.error?.message ?? "translate failed"),
 		);

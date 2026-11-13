@@ -40,6 +40,54 @@ export function zoomPreviewTranslate(
 	return { x: (1 - scale) * localX, y: (1 - scale) * localY };
 }
 
+/** Keep a PDF page point under the gesture while real page sizes are changing. */
+export function zoomCommitPreviewTransform(
+	page: { left: number; top: number; width: number; height: number },
+	element: { left: number; top: number },
+	anchor: { x: number; y: number },
+	pointer: { x: number; y: number },
+	targetWidth: number,
+): { x: number; y: number; scale: number } {
+	const scale = targetWidth / page.width;
+	return {
+		x:
+			pointer.x -
+			element.left -
+			scale * (page.left + page.width * anchor.x - element.left),
+		y:
+			pointer.y -
+			element.top -
+			scale * (page.top + page.height * anchor.y - element.top),
+		scale,
+	};
+}
+
+/**
+ * Width left for the page after the viewport's symmetric padding. The
+ * page-outside comment rail is revealed separately by hover panning.
+ */
+export function zoomReadingWidth(
+	clientWidth: number,
+	paddingLeft: number,
+	paddingRight: number,
+): number {
+	if (!(clientWidth > 0)) return 0;
+	return Math.max(0, clientWidth - paddingLeft - paddingRight);
+}
+
+/**
+ * Center the gesture wrapper inside the symmetric reading area. Apply the
+ * settled margin before measuring the final zoom anchor so the wrapper's
+ * ResizeObserver cannot shift the page afterwards.
+ */
+export function zoomGestureCenteringMargin(
+	elementWidth: number,
+	readingWidth: number,
+): number {
+	if (!(elementWidth > 0) || !(readingWidth > elementWidth)) return 0;
+	return (readingWidth - elementWidth) / 2;
+}
+
 /**
  * Follow the reader's centered-page geometry while the document is narrower
  * than its reading area, then blend to the gesture point as it overflows.
@@ -61,6 +109,12 @@ export function zoomPreviewTranslateForViewport(
 		x: centeredX + (pointer.x - centeredX) * blend,
 		y: pointer.y,
 	};
+}
+
+/** Step the viewer zoom by 10 percentage points, staying inside the range. */
+export function stepPdfZoom(zoom: number, direction: -1 | 1): number {
+	const next = Math.round((zoom + direction * 0.1) * 100) / 100;
+	return Math.min(PDF_ZOOM_MAX, Math.max(PDF_ZOOM_MIN, next));
 }
 
 /** Keep one decimal place when needed without showing a trailing `.0`. */

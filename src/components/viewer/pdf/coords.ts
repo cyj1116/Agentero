@@ -25,6 +25,31 @@ export function pageElByIndex(
 	return host.querySelector<HTMLElement>(`[${EMBED_PAGE_ATTR}="${pageIndex}"]`);
 }
 
+/** Map the union of normalized selection rects to the viewport. */
+export function selectionBoundsOnScreen(
+	pageEl: HTMLElement | null,
+	rects: PdfAskNormalizedRect[],
+) {
+	if (!pageEl || !rects.length) return null;
+	const page = pageEl.getBoundingClientRect();
+	let left = 1;
+	let top = 1;
+	let right = 0;
+	let bottom = 0;
+	for (const rect of rects) {
+		left = Math.min(left, rect.x);
+		top = Math.min(top, rect.y);
+		right = Math.max(right, rect.x + rect.w);
+		bottom = Math.max(bottom, rect.y + rect.h);
+	}
+	return {
+		left: page.left + left * page.width,
+		top: page.top + top * page.height,
+		right: page.left + right * page.width,
+		bottom: page.top + bottom * page.height,
+	};
+}
+
 /**
  * Map a page-coordinate rect (PDF points) to a screen point. The rendered page
  * element is `points * zoom` CSS px, so a point offset maps to `offset * zoom`
@@ -42,15 +67,19 @@ export function rectTopCenterScreen(
 	};
 }
 
-export function rectRightScreen(
+export function rectBottomCenterScreen(
 	pageEl: HTMLElement,
 	rect: Rect,
 	zoom: number,
-): { x: number; y: number } {
+): { x: number; y: number; top: number; bottom: number } {
 	const box = pageEl.getBoundingClientRect();
+	const bottom = box.top + (rect.origin.y + rect.size.height) * zoom;
+	const top = box.top + rect.origin.y * zoom;
 	return {
-		x: box.left + (rect.origin.x + rect.size.width) * zoom + 8,
-		y: box.top + rect.origin.y * zoom,
+		x: box.left + (rect.origin.x + rect.size.width / 2) * zoom,
+		y: bottom,
+		top,
+		bottom,
 	};
 }
 
@@ -59,7 +88,8 @@ export function rectRightScreen(
  * EmbedPDF reports rects in PDF page coordinates (points); dividing by the page
  * size yields the 0–1 rects the Ask/Translate marks + pins use.
  *
- * Ask/Translate anchor to a single page. Use `preferredPageIndex` (e.g. the
+ * Cards anchor to a single page while retaining the full selection. Use
+ * `preferredPageIndex` (e.g. the
  * page where the cursor ended) when available; otherwise fall back to the first
  * page of the selection.
  */
@@ -70,26 +100,27 @@ export function anchorFromEmbedSelection(
 	trigger: PdfAskTrigger = "selection",
 	preferredPageIndex?: number,
 ): PdfAskAnchor | null {
-	const first = pages[0];
-	if (!first) return null;
+	const selectionPages = pages.flatMap((page) => {
+		const size = pageSizePoints(page.pageIndex);
+		if (!size || size.width <= 0 || size.height <= 0) return [];
+		const rects: PdfAskNormalizedRect[] = page.segmentRects
+			.filter((r) => r.size.width > 0 && r.size.height > 0)
+			.map((r) => ({
+				x: clamp01(r.origin.x / size.width),
+				y: clamp01(r.origin.y / size.height),
+				w: clamp01(r.size.width / size.width),
+				h: clamp01(r.size.height / size.height),
+			}));
+		return rects.length ? [{ page: page.pageIndex + 1, rects }] : [];
+	});
 	const page =
-		preferredPageIndex != null
-			? (pages.find((p) => p.pageIndex === preferredPageIndex) ?? first)
-			: first;
-	const size = pageSizePoints(page.pageIndex);
-	if (!size || size.width <= 0 || size.height <= 0) return null;
-	const rects: PdfAskNormalizedRect[] = page.segmentRects
-		.filter((r) => r.size.width > 0 && r.size.height > 0)
-		.map((r) => ({
-			x: clamp01(r.origin.x / size.width),
-			y: clamp01(r.origin.y / size.height),
-			w: clamp01(r.size.width / size.width),
-			h: clamp01(r.size.height / size.height),
-		}));
-	if (!rects.length) return null;
+		selectionPages.find(
+			(page) => page.page === (preferredPageIndex ?? -1) + 1,
+		) ?? selectionPages[0];
+	if (!page) return null;
 	return {
-		page: page.pageIndex + 1,
-		rects,
+		...page,
+		...(selectionPages.length > 1 ? { selectionPages } : {}),
 		quote: quote.trim() || undefined,
 		trigger,
 	};

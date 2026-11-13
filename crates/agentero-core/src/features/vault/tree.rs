@@ -93,7 +93,67 @@ const EAGER_ROOT_NAMES: &[&str] = &["papers", "notes", ".agents"];
 /// Any of these marks a directory as a paper unit whose `source/` is lazy.
 const PAPER_MARKER_FILES: &[&str] = &["NOTES.md", "PAPER.md"];
 
+/// Paper-internal directories (mirrors `src/lib/paper/paths.ts`). A folder
+/// holding one of them is a paper unit, so they are never scanned for nested
+/// papers.
+const PAPER_MARKER_DIRS: &[&str] = &["source", "assets", "marks"];
+
 const LAZY_PAPER_DIR: &str = "source";
+
+/// App-owned rebuildable sidecars written inside a paper's `source/` bucket
+/// (reference sidecar + PDF layout sidecars, see `docs/backend/api.md`). They
+/// are never user content, so the tree blinds itself to them: a paper's
+/// internals stay clean even for folders the tree does not classify as paper
+/// units — papers kept outside `papers/`, copied in, or left behind by a
+/// re-organization (#747).
+const PAPER_SOURCE_ARTIFACT_NAMES: &[&str] = &[
+    "agentero-cite.json",
+    "agentero-figures.json",
+    "agentero-source.json",
+    "layout.json",
+    "layout-index.json",
+    "layout-translate.json",
+];
+
+fn is_paper_source_artifact(name: &str) -> bool {
+    PAPER_SOURCE_ARTIFACT_NAMES.contains(&name)
+}
+
+/// Last segment of a vault-relative path (`""` for the vault root).
+fn last_rel_segment(rel: &str) -> &str {
+    rel.trim_matches('/').rsplit('/').next().unwrap_or("")
+}
+
+/// True when a vault-relative path sits at or below `papers/`.
+fn is_under_papers_rel(rel: &str) -> bool {
+    let r = rel.trim_matches('/');
+    r == "papers" || r.starts_with("papers/")
+}
+
+/// One-level probe: `dir` holds nothing but the app's own sidecars (ignored
+/// noise such as `.DS_Store` does not count as content). Early-exits on the
+/// first real entry, so arXiv e-print trees stay cheap.
+fn is_app_sidecar_only_dir(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    let mut saw_sidecar = false;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            return false;
+        };
+        if is_paper_source_artifact(name) {
+            saw_sidecar = true;
+            continue;
+        }
+        if should_ignore(name) {
+            continue;
+        }
+        return false;
+    }
+    saw_sidecar
+}
 
 #[derive(Debug, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -106,10 +166,13 @@ pub struct VaultTreeNode {
     pub children: Option<Vec<VaultTreeNode>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub children_pending: Option<bool>,
-    /// Paper `source/` shells only: whether TeX exists on disk (children are
-    /// lazy, so the renderer cannot infer this from the tree itself).
+    /// Paper rows and lazy source shells: whether a readable TeX manuscript
+    /// exists; the renderer cannot validate its dependencies from node names.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_tex: Option<bool>,
+    /// Paper rows: missing fetchable arXiv source, independently of Markdown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs_source: Option<bool>,
 }
 
 /// Whether a vault-root child name is excluded from the tree. Public for the
@@ -245,6 +308,7 @@ fn pending_shell(name: String, path: String) -> VaultTreeNode {
         children: Some(Vec::new()),
         children_pending: Some(true),
         has_tex: None,
+        needs_source: None,
     }
 }
 
@@ -297,6 +361,11 @@ fn list_dir(
         if rel.is_empty() && is_sync_store_artifact(&name) {
             continue;
         }
+        // The app's own sidecars inside a paper's `source/` bucket are never
+        // user content (references + PDF layout sidecars).
+        if last_rel_segment(rel) == LAZY_PAPER_DIR && is_paper_source_artifact(&name) {
+            continue;
+        }
         let file_type = match entry.file_type() {
             Ok(t) => t,
             Err(_) => continue,
@@ -307,13 +376,13 @@ fn list_dir(
         } else {
             format!("{rel}/{name}")
         };
-        if file_type.is_dir() {
+        // `file_type()` does not follow symlinks, so a directory symlink is not
+        // `is_dir()`. A same-vault paper alias is that symlink (or a Windows
+        // junction, which already reports `is_dir`) and must show up as a folder.
+        // File symlinks stay files; their targets are not walked.
+        if file_type.is_dir() || crate::fs::is_linked_dir(&child_path) {
             dirs.push((name, child_path, child_rel));
         } else if file_type.is_file()
-            // `file_type()` intentionally does not follow symlinks. A valid
-            // symlink to a regular file is still a local paper asset (for
-            // example a PDF kept in a shared Downloads folder), so include it
-            // in the tree without ever traversing symlinked directories.
             || (file_type.is_symlink()
                 && fs::metadata(&child_path)
                     .map(|metadata| metadata.is_file())
@@ -329,14 +398,30 @@ fn list_dir(
                 children: None,
                 children_pending: None,
                 has_tex: None,
+                needs_source: None,
             });
         }
     }
 
     let mut nodes: Vec<VaultTreeNode> = Vec::with_capacity(dirs.len() + files.len());
+    // A folder under `papers/` carrying a paper marker (NOTES.md / PAPER.md, or
+    // a `source` / `assets` / `marks` child) is a paper unit: its `source/`
+    // bucket keeps its current handling (lazy shell for papers, hidden by the
+    // renderer for paper rows).
+    let is_paper_unit = is_under_papers_rel(rel)
+        && (paper_marker
+            || dirs
+                .iter()
+                .any(|(name, _, _)| PAPER_MARKER_DIRS.contains(&name.as_str())));
     for (name, child_path, child_rel) in dirs {
         let path_str = child_path.to_string_lossy().into_owned();
-        let node = match mode {
+        // Outside a paper unit the `source/` bucket exists only to hold the
+        // app's rebuildable sidecars — skip it instead of surfacing an empty
+        // folder (#747).
+        if name == LAZY_PAPER_DIR && !is_paper_unit && is_app_sidecar_only_dir(&child_path) {
+            continue;
+        }
+        let mut node = match mode {
             Mode::OneLevel => pending_shell(name, path_str),
             Mode::Eager => {
                 if paper_marker && name == LAZY_PAPER_DIR {
@@ -358,6 +443,7 @@ fn list_dir(
                         )),
                         children_pending: None,
                         has_tex: None,
+                        needs_source: None,
                     }
                 } else {
                     VaultTreeNode {
@@ -374,10 +460,33 @@ fn list_dir(
                         )),
                         children_pending: Some(false),
                         has_tex: None,
+                        needs_source: None,
                     }
                 }
             }
         };
+        if node.children.as_ref().is_some_and(|children| {
+            children.iter().any(|child| {
+                child.kind == "file"
+                    && crate::features::paper::identity::is_paper_marker_file(&child.name)
+            })
+        }) {
+            let has_tex = caps.caps_for(root, &child_rel).has_tex;
+            node.has_tex = Some(has_tex);
+            if has_tex {
+                node.needs_source = Some(false);
+            } else if let Ok(Some(paper)) =
+                crate::features::paper::catalog::papers::get_by_path(root, &child_rel)
+            {
+                node.needs_source = Some(
+                    crate::features::paper::source::automatic_download_allowed(root)
+                        && crate::features::paper::source::needs_source(
+                            &child_path,
+                            crate::features::paper::source::arxiv_request(&paper).as_deref(),
+                        ),
+                );
+            }
+        }
         nodes.push(node);
     }
     nodes.extend(files);
@@ -464,7 +573,10 @@ mod tests {
     fn eager_roots_recurse_and_paper_source_stays_pending() {
         let root = &temp_root("build");
         write(&root.join("papers/p1/NOTES.md"), "# n");
-        write(&root.join("papers/p1/source/main.tex"), "x");
+        write(
+            &root.join("papers/p1/source/main.tex"),
+            "\\documentclass{article}\\begin{document}Body\\end{document}",
+        );
         write(&root.join("papers/p1/source/figs/a.png"), "x");
         write(&root.join("papers/p1/assets/img.png"), "x");
         write(&root.join("notes/idea.md"), "x");
@@ -495,7 +607,10 @@ mod tests {
         let root = &temp_root("children");
         write(&root.join("papers/p1/NOTES.md"), "# n");
         write(&root.join("papers/p1/source/sub/deep.tex"), "x");
-        write(&root.join("papers/p1/source/main.tex"), "x");
+        write(
+            &root.join("papers/p1/source/main.tex"),
+            "\\documentclass{article}\\begin{document}Body\\end{document}",
+        );
         let caps = CapsCache::new();
 
         // Expanding the paper's source/: one level, subdirs pending.
@@ -514,6 +629,26 @@ mod tests {
 
         // Outside the vault is rejected.
         assert!(list_children(root, Path::new("/"), &caps).is_err());
+    }
+
+    #[test]
+    fn directory_link_is_listed_as_a_folder() {
+        let root = &temp_root("dir-link");
+        write(&root.join("papers/inbox/demo/NOTES.md"), "# n");
+        fs::create_dir_all(root.join("papers/archive")).unwrap();
+        crate::fs::create_directory_link(
+            Path::new("../inbox/demo"),
+            &root.join("papers/inbox/demo"),
+            &root.join("papers/archive/demo"),
+        )
+        .unwrap();
+
+        let tree = build_tree(root, &CapsCache::new());
+        let papers = find(&tree, "papers").unwrap();
+        let archive = find(papers.children.as_ref().unwrap(), "archive").unwrap();
+        let demo = find(archive.children.as_ref().unwrap(), "demo").unwrap();
+        assert_eq!(demo.kind, "directory");
+        assert!(find(demo.children.as_ref().unwrap(), "NOTES.md").is_some());
     }
 
     #[test]
@@ -613,6 +748,69 @@ mod tests {
         }
     }
 
+    /// The app's own sidecars never surface, and a `source/` bucket that holds
+    /// nothing but them is skipped entirely outside paper units (#747).
+    #[test]
+    fn app_sidecars_are_hidden_and_sidecar_only_source_dirs_are_skipped() {
+        let root = &temp_root("app-sidecars");
+        // A paper folder kept outside `papers/` (moved in / copied by the
+        // user): the refs + layout sidecars are the only content.
+        write(&root.join("loose-paper/source/agentero-cite.json"), "{}");
+        write(&root.join("loose-paper/source/layout.json"), "{}");
+        write(&root.join("loose-paper/source/layout-index.json"), "{}");
+        // Same, but with real TeX next to the sidecars: the bucket stays and
+        // only the sidecars are filtered out of its listing.
+        write(
+            &root.join("with-tex/source/main.tex"),
+            "\\documentclass{article}\\begin{document}Body\\end{document}",
+        );
+        write(&root.join("with-tex/source/agentero-cite.json"), "{}");
+        write(&root.join("with-tex/source/layout.json"), "{}");
+        // A paper unit under papers/ without NOTES.md: `source/` is its only
+        // marker, so it must survive for the renderer's paper detection.
+        write(&root.join("papers/p1/p1.pdf"), "%PDF-1.4");
+        write(&root.join("papers/p1/source/agentero-cite.json"), "{}");
+
+        let tree = build_tree(root, &CapsCache::new());
+
+        let loose = find(&tree, "loose-paper").unwrap();
+        let loose_children: Vec<&str> = loose
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(
+            !loose_children.contains(&"source"),
+            "sidecar-only source/ should be skipped: {loose_children:?}"
+        );
+
+        let with_tex = find(&tree, "with-tex").unwrap();
+        let source = find(with_tex.children.as_ref().unwrap(), "source").unwrap();
+        let source_children = list_children(root, &root.join("with-tex/source"), &CapsCache::new())
+            .expect("list source");
+        let source_names: Vec<&str> = source_children.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            source_names.contains(&"main.tex"),
+            "real content stays visible: {source_names:?}"
+        );
+        for hidden in ["agentero-cite.json", "layout.json", "layout-index.json"] {
+            assert!(
+                !source_names.contains(&hidden),
+                "{hidden} should be hidden but found: {source_names:?}"
+            );
+        }
+        assert!(source.children.as_ref().is_none_or(|c| c.is_empty()));
+
+        let papers = find(&tree, "papers").unwrap();
+        let p1 = find(papers.children.as_ref().unwrap(), "p1").unwrap();
+        assert!(
+            find(p1.children.as_ref().unwrap(), "source").is_some(),
+            "a paper unit keeps its source/ marker"
+        );
+    }
+
     #[test]
     fn source_shell_without_tex_reports_has_tex_false() {
         let root = &temp_root("notex");
@@ -644,7 +842,10 @@ mod tests {
         assert_eq!(source_has_tex(&build_tree(root, &caps)), Some(false));
 
         // TeX appears; the cached probe is stale until the watcher invalidates.
-        write(&root.join("papers/p1/source/main.tex"), "x");
+        write(
+            &root.join("papers/p1/source/main.tex"),
+            "\\documentclass{article}\\begin{document}Body\\end{document}",
+        );
         assert_eq!(source_has_tex(&build_tree(root, &caps)), Some(false));
 
         // Watcher-style invalidation of the paper folder refreshes the probe.
@@ -660,7 +861,10 @@ mod tests {
         let root = &temp_root("symlink-pdf");
         let paper = root.join("papers/p1");
         write(&paper.join("NOTES.md"), "# n");
-        write(&paper.join("source/main.tex"), "x");
+        write(
+            &paper.join("source/main.tex"),
+            "\\documentclass{article}\\begin{document}Body\\end{document}",
+        );
         let target = root.join("outside.pdf");
         write(&target, "pdf");
         symlink(&target, paper.join("p1.pdf")).unwrap();
@@ -686,7 +890,11 @@ mod tests {
             for f in 0..199 {
                 fs::write(src.join(format!("figs/f{f:03}.png")), "x").unwrap();
             }
-            fs::write(src.join("main.tex"), "x").unwrap();
+            fs::write(
+                src.join("main.tex"),
+                "\\documentclass{article}\\begin{document}Body\\end{document}",
+            )
+            .unwrap();
         }
         let caps = CapsCache::new();
 

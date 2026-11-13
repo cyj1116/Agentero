@@ -4,6 +4,7 @@ import {
 	citationLabelFromHref,
 	isAgentCitationHref,
 	isCitationStatusLabel,
+	isVaultPdfHref,
 	paperDirFromCitationPath,
 	rewriteCitationHrefToPdf,
 	stripCitationStatusTags,
@@ -58,6 +59,12 @@ describe("isAgentCitationHref", () => {
 		expect(
 			isAgentCitationHref("papers/vla/2504.16054/2504.16054.pdf#figure=3"),
 		).toBe(true);
+		expect(
+			isAgentCitationHref("papers/vla/2504.16054/2504.16054.pdf#formula=3"),
+		).toBe(true);
+		expect(
+			isAgentCitationHref("papers/vla/2504.16054/2504.16054.pdf#equation=3"),
+		).toBe(false);
 	});
 
 	it("rejects plain paths and http urls", () => {
@@ -76,6 +83,34 @@ describe("isAgentCitationHref", () => {
 				"\u200bpapers/vla/2504.16054/2504.16054.pdf#page=1\u200b",
 			),
 		).toBe(true);
+	});
+
+	it("accepts percent-encoded paths with spaces", () => {
+		expect(
+			isAgentCitationHref(
+				"/papers/Quantum%20Error%20Correcting/parallel%20window/2209.08552/2209.08552.pdf#page=4",
+			),
+		).toBe(true);
+	});
+});
+
+describe("isVaultPdfHref", () => {
+	it("accepts a PDF path with or without a fragment", () => {
+		expect(
+			isVaultPdfHref(
+				"./papers/Quantum%20Error%20Correcting/parallel%20window/2209.08552/2209.08552.pdf",
+			),
+		).toBe(true);
+		expect(
+			isVaultPdfHref(
+				"papers/Quantum Error Correcting/parallel window/2209.08552/2209.08552.pdf#page=4",
+			),
+		).toBe(true);
+	});
+
+	it("rejects notes and http pdf urls", () => {
+		expect(isVaultPdfHref("papers/a/NOTES.md")).toBe(false);
+		expect(isVaultPdfHref("https://example.com/a.pdf")).toBe(false);
 	});
 });
 
@@ -118,5 +153,28 @@ describe("citationHrefFromWikiParts", () => {
 				path: ["Intro"],
 			}),
 		).toBeNull();
+	});
+});
+
+describe("PDF document anchors", () => {
+	it("routes section and paragraph shorthand only for PDF targets", () => {
+		for (const fragment of ["2", "2.1", "2#p3", "2.1#p3"]) {
+			expect(isAgentCitationHref(`papers/a/a.pdf#${fragment}`)).toBe(true);
+			expect(isAgentCitationHref(`papers/a/NOTES.md#${fragment}`)).toBe(false);
+			expect(
+				citationHrefFromWikiParts("papers/a/a.pdf", {
+					kind: "heading",
+					path: fragment.split("#"),
+				}),
+			).toBe(`papers/a/a.pdf#${fragment}`);
+			expect(
+				citationHrefFromWikiParts("papers/a/NOTES.md", {
+					kind: "heading",
+					path: fragment.split("#"),
+				}),
+			).toBeNull();
+		}
+		expect(isAgentCitationHref("https://example.com/a.pdf#2#p3")).toBe(false);
+		expect(isAgentCitationHref("papers/a/a.pdf#2%23p3")).toBe(true);
 	});
 });

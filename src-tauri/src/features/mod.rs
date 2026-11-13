@@ -14,6 +14,8 @@ pub mod cli_install;
 #[cfg(feature = "desktop")]
 pub mod compile;
 #[cfg(feature = "desktop")]
+pub mod decision;
+#[cfg(feature = "desktop")]
 pub mod host_hooks;
 #[cfg(feature = "desktop")]
 pub mod jobs;
@@ -23,11 +25,27 @@ pub mod lifecycle;
 #[path = "../app/open_request/mod.rs"]
 pub mod open_request;
 
+// jEV smart highlights extract text through the PDFium-backed `pdf::locate`,
+// which is itself target-gated out on mobile; keep the whole feature off there.
+#[cfg(all(
+    feature = "desktop",
+    not(any(target_os = "ios", target_os = "android"))
+))]
+pub mod jev;
 pub mod markdown;
 pub mod paper;
 pub mod pdf;
+#[cfg(all(
+    feature = "desktop",
+    not(any(target_os = "ios", target_os = "android"))
+))]
+pub mod rtex;
 pub mod system;
 pub mod translate;
 pub mod vault;
 #[cfg(feature = "desktop")]
 pub mod web;
+#[cfg(feature = "desktop")]
+pub mod writing;
+#[cfg(feature = "desktop")]
+pub mod zhihu;

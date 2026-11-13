@@ -19,6 +19,7 @@ import { useStore } from "zustand";
 import { PaneHeader } from "@/components/shell/pane-header";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
+import { QuietIconButton } from "@/components/ui/quiet-icon-button";
 import {
 	Tooltip,
 	TooltipContent,
@@ -219,6 +220,76 @@ function Section({
 			</button>
 			{open ? <div className="grid grid-cols-1 gap-2">{children}</div> : null}
 		</section>
+	);
+}
+
+/** Eye / EyeOff toggle for the raw layout bbox overlay on the PDF. */
+function OverlayToggleButton({
+	visible,
+	onToggle,
+}: {
+	visible: boolean;
+	onToggle: () => void;
+}) {
+	const { t } = useTranslation("viewer");
+	return (
+		<Tooltip>
+			<TooltipTrigger asChild>
+				<QuietIconButton
+					variant={visible ? "secondary" : "ghost"}
+					className={cn(visible && "text-primary")}
+					aria-label={t("figures.toggleOverlay")}
+					aria-pressed={visible}
+					onClick={onToggle}
+				>
+					{visible ? (
+						<Eye className="size-3.5" aria-hidden />
+					) : (
+						<EyeOff className="size-3.5" aria-hidden />
+					)}
+				</QuietIconButton>
+			</TooltipTrigger>
+			<TooltipContent side="bottom" className="max-w-52 text-xs">
+				{visible ? t("figures.hideOverlay") : t("figures.showOverlay")}
+			</TooltipContent>
+		</Tooltip>
+	);
+}
+
+/**
+ * Self-contained overlay toggle: reads the layout store and renders nothing
+ * until the document has detections. `className` supplies the wrapper
+ * material/position so callers can slot it into their own chrome (e.g. the
+ * compact PDF panel chip that shares the left toolbar's row).
+ */
+export function FiguresOverlayToggle({
+	documentId,
+	className,
+}: {
+	documentId: string;
+	className?: string;
+}) {
+	const result = useStore(
+		layoutAnalysisStore,
+		(s) => s.byDocument[layoutDocumentKey(documentId)] ?? null,
+	);
+	const visible = useStore(layoutAnalysisStore, (s) =>
+		Boolean(s.overlayVisible[documentId]),
+	);
+	const hasOverlaySource =
+		(result?.rawRegions?.length ?? 0) > 0 || (result?.regions?.length ?? 0) > 0;
+	const handleToggle = useCallback(() => {
+		toggleLayoutOverlayVisible(documentId);
+	}, [documentId]);
+
+	if (!hasOverlaySource) return null;
+
+	return (
+		<div className={className}>
+			<TooltipProvider delayDuration={200}>
+				<OverlayToggleButton visible={visible} onToggle={handleToggle} />
+			</TooltipProvider>
+		</div>
 	);
 }
 
@@ -460,44 +531,15 @@ export function FiguresPanel({
 							<TooltipProvider delayDuration={200}>
 								<div className="flex items-center gap-0.5">
 									{hasOverlaySource ? (
-										<Tooltip>
-											<TooltipTrigger asChild>
-												<Button
-													type="button"
-													variant={overlayVisible ? "secondary" : "ghost"}
-													size="icon-xs"
-													className={cn(
-														"size-6 text-muted-foreground hover:text-foreground",
-														overlayVisible && "text-primary",
-													)}
-													aria-label={t("figures.toggleOverlay")}
-													aria-pressed={overlayVisible}
-													onClick={handleToggleOverlay}
-												>
-													{overlayVisible ? (
-														<Eye className="size-3.5" aria-hidden />
-													) : (
-														<EyeOff className="size-3.5" aria-hidden />
-													)}
-												</Button>
-											</TooltipTrigger>
-											<TooltipContent
-												side="bottom"
-												className="max-w-52 text-xs"
-											>
-												{overlayVisible
-													? t("figures.hideOverlay")
-													: t("figures.showOverlay")}
-											</TooltipContent>
-										</Tooltip>
+										<OverlayToggleButton
+											visible={overlayVisible}
+											onToggle={handleToggleOverlay}
+										/>
 									) : null}
 									<Tooltip>
 										<TooltipTrigger asChild>
-											<Button
-												type="button"
+											<QuietIconButton
 												variant={running ? "secondary" : "ghost"}
-												size="icon-xs"
-												className="size-6 text-muted-foreground hover:text-foreground"
 												aria-label={
 													result ? t("figures.reanalyze") : t("figures.analyze")
 												}
@@ -513,7 +555,7 @@ export function FiguresPanel({
 												) : (
 													<Boxes className="size-3.5" aria-hidden />
 												)}
-											</Button>
+											</QuietIconButton>
 										</TooltipTrigger>
 										<TooltipContent side="bottom" className="max-w-64 text-xs">
 											{analyzeTooltip}

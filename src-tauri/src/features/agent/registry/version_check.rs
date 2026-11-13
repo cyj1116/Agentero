@@ -4,20 +4,14 @@
 //! known — not merely because the binary is installed. Network checks stay out
 //! of synchronous `scan_catalog` (Doctor / chat switcher also call that path).
 
+use crate::core::process::SanitizeAppImageEnv;
 use crate::features::agent::models::CatalogScanResponse;
-use crate::features::agent::registry::antigravity;
 use crate::features::agent::registry::discovery::resolve_command;
 use crate::features::agent::registry::templates::template_info;
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
-
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const NPM_VERSION_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
@@ -39,15 +33,18 @@ fn npm_version_cache() -> &'static Mutex<NpmVersionCache> {
 pub fn npm_package_for_template(template_id: &str) -> Option<&'static str> {
     match template_id {
         "opencode" => Some("@opencode/cli"),
-        "openclaw" => Some("openclaw"),
         "claude-acp" => Some("@anthropic-ai/claude-code"),
         "codex-acp" => Some("@openai/codex"),
         "pi" => Some("@earendil-works/pi-coding-agent"),
         "grok-build" => Some("@xai-official/grok"),
+        "qodercli" => Some("@qoder-ai/qodercli"),
+        "qoder-cn" => Some("@qodercn-ai/qoderclicn"),
         "dsh" => Some("@deepseek-ai/dsh"),
         "kimi-code" => Some("@moonshot-ai/kimi-code"),
         "zcode" => Some("zcode-acp-server"),
         "minimax-code" => Some("@minimax-ai/code"),
+        "mimo-code" => Some("mimocode"),
+        "codebuddy" => Some("@tencent-ai/codebuddy-code"),
         _ => None,
     }
 }
@@ -105,31 +102,11 @@ fn latest_version_for_template(
     proxy_enabled: bool,
     proxy_url: &str,
 ) -> Option<String> {
-    if template_id == "antigravity-acp" {
-        // Registry is the only source (the ACP server has no npm package); an
-        // unreachable registry yields no target, so the row keeps the version
-        // recorded by the installer and shows no Upgrade button.
-        return match antigravity::resolve_release(proxy_enabled, proxy_url) {
-            Ok(release) => Some(release.version),
-            Err(error) => {
-                log::warn!(
-                    target: "agentero::agent",
-                    "antigravity version check failed: {error}"
-                );
-                None
-            }
-        };
-    }
     npm_package_for_template(template_id)
         .and_then(|pkg| npm_view_version(pkg, proxy_enabled, proxy_url))
 }
 
 fn read_installed_version(template_id: &str) -> Option<String> {
-    // Antigravity is a managed archive download: the installer records its
-    // release in a version marker, and the ACP server has no `--version`.
-    if template_id == "antigravity-acp" {
-        return antigravity::installed_version();
-    }
     let info = template_info(template_id)?;
     let detect = info
         .detect_command
@@ -139,10 +116,8 @@ fn read_installed_version(template_id: &str) -> Option<String> {
 
     let mut cmd = Command::new(&path);
     cmd.arg("--version");
-    #[cfg(target_os = "windows")]
-    {
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    cmd.sanitize_appimage_env();
+    crate::core::process::hide_console_window(&mut cmd);
     let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
@@ -164,11 +139,9 @@ fn npm_view_version(package: &str, proxy_enabled: bool, proxy_url: &str) -> Opti
     let npm = resolve_command("npm")?;
     let mut cmd = Command::new(npm);
     cmd.args(["view", package, "version"]);
+    cmd.sanitize_appimage_env();
     apply_proxy_env(&mut cmd, proxy_enabled, proxy_url);
-    #[cfg(target_os = "windows")]
-    {
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    crate::core::process::hide_console_window(&mut cmd);
     let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
@@ -274,54 +247,29 @@ pub fn is_newer(candidate: &str, installed: &str) -> bool {
     if a == b {
         return false;
     }
-    match (parse_semver_parts(a), parse_semver_parts(b)) {
-        (Some(ca), Some(in_)) => compare_semver(&ca, &in_) == std::cmp::Ordering::Greater,
+    match (parse_version(a), parse_version(b)) {
+        (Some(candidate), Some(installed)) => candidate.cmp_precedence(&installed).is_gt(),
         _ => a != b,
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct SemverParts {
-    major: u64,
-    minor: u64,
-    patch: u64,
-    /// Empty = release; non-empty prerelease sorts below the same numeric triple.
-    prerelease: String,
-}
-
-fn parse_semver_parts(raw: &str) -> Option<SemverParts> {
-    let core = raw.split_once('+').map(|(c, _)| c).unwrap_or(raw);
-    let (numeric, prerelease) = match core.split_once('-') {
-        Some((num, pre)) => (num, pre.to_string()),
-        None => (core, String::new()),
-    };
-    let mut parts = numeric.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next().unwrap_or("0").parse().unwrap_or(0);
-    let patch = parts.next().unwrap_or("0").parse().unwrap_or(0);
-    Some(SemverParts {
-        major,
-        minor,
-        patch,
-        prerelease,
-    })
-}
-
-fn compare_semver(a: &SemverParts, b: &SemverParts) -> std::cmp::Ordering {
-    (
-        a.major,
-        a.minor,
-        a.patch,
-        a.prerelease.is_empty(),
-        &a.prerelease,
-    )
-        .cmp(&(
-            b.major,
-            b.minor,
-            b.patch,
-            b.prerelease.is_empty(),
-            &b.prerelease,
-        ))
+/// CLI banners sometimes use abbreviated releases (`1` / `1.2`). Expand only
+/// numeric release components; opaque banners keep the existing inequality
+/// fallback, while full SemVer precedence is owned by the semver crate.
+fn parse_version(raw: &str) -> Option<semver::Version> {
+    if let Ok(version) = semver::Version::parse(raw) {
+        return Some(version);
+    }
+    let parts: Vec<_> = raw.split('.').collect();
+    if !(1..=2).contains(&parts.len())
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let expanded = format!("{raw}{}", ".0".repeat(3 - parts.len()));
+    semver::Version::parse(&expanded).ok()
 }
 
 #[cfg(test)]
@@ -338,8 +286,21 @@ mod tests {
         assert_eq!(npm_package_for_template("hermes"), None);
         assert_eq!(npm_package_for_template("dsh"), Some("@deepseek-ai/dsh"));
         assert_eq!(
+            npm_package_for_template("qodercli"),
+            Some("@qoder-ai/qodercli")
+        );
+        assert_eq!(
+            npm_package_for_template("qoder-cn"),
+            Some("@qodercn-ai/qoderclicn")
+        );
+        assert_eq!(
             npm_package_for_template("minimax-code"),
             Some("@minimax-ai/code")
+        );
+        assert_eq!(npm_package_for_template("mimo-code"), Some("mimocode"));
+        assert_eq!(
+            npm_package_for_template("codebuddy"),
+            Some("@tencent-ai/codebuddy-code")
         );
     }
 
@@ -365,11 +326,10 @@ mod tests {
 
     #[test]
     fn antigravity_has_no_npm_target() {
-        // Antigravity rows are served by the registry manifest branch, so the
-        // npm lookup must stay out of their way (and never spawn npm for them).
         assert_eq!(npm_package_for_template("antigravity-acp"), None);
         assert_eq!(npm_package_for_template("hermes"), None);
         assert!(latest_version_for_template("hermes", false, "").is_none());
+        assert!(latest_version_for_template("antigravity-acp", false, "").is_none());
     }
 
     #[test]
@@ -398,6 +358,14 @@ mod tests {
         assert!(!is_newer("1.0.0-rc.1", "1.0.0"));
         assert!(is_newer("0.1.1-rc.3", "0.1.1-rc.2"));
         assert!(is_newer("v2.0.0", "2.0.0-beta"));
+        assert!(is_newer("1.0.0-beta.10", "1.0.0-beta.2"));
+        assert!(!is_newer("1.0.0-beta.2", "1.0.0-beta.10"));
+        assert!(is_newer("1.0.0-beta.a", "1.0.0-beta.10"));
+        assert!(!is_newer("1.0.0+new", "1.0.0+old"));
+        assert!(!is_newer("1.2", "1.2.0"));
+        assert!(is_newer("2", "1.9.9"));
+        assert!(parse_version("1.2.invalid").is_none());
+        assert!(parse_version("1.2.3.4").is_none());
     }
 
     #[test]

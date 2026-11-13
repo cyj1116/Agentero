@@ -1,23 +1,30 @@
 import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
 import type { LocalePreference } from "@/lib/settings";
-
+import enAccount from "./locales/en/account.json";
 import enAgent from "./locales/en/agent.json";
 import enAiElements from "./locales/en/aiElements.json";
 import enApp from "./locales/en/app.json";
 import enCommon from "./locales/en/common.json";
 import enEditor from "./locales/en/editor.json";
+import enLatexBuild from "./locales/en/latexBuild.json";
+import enLatexLanguage from "./locales/en/latexLanguage.json";
+import enLatexPdf from "./locales/en/latexPdf.json";
 import enMobile from "./locales/en/mobile.json";
 import enOnboarding from "./locales/en/onboarding.json";
 import enSettings from "./locales/en/settings.json";
 import enShortcuts from "./locales/en/shortcuts.json";
 import enSidebar from "./locales/en/sidebar.json";
 import enViewer from "./locales/en/viewer.json";
+import zhAccount from "./locales/zh-CN/account.json";
 import zhAgent from "./locales/zh-CN/agent.json";
 import zhAiElements from "./locales/zh-CN/aiElements.json";
 import zhApp from "./locales/zh-CN/app.json";
 import zhCommon from "./locales/zh-CN/common.json";
 import zhEditor from "./locales/zh-CN/editor.json";
+import zhLatexBuild from "./locales/zh-CN/latexBuild.json";
+import zhLatexLanguage from "./locales/zh-CN/latexLanguage.json";
+import zhLatexPdf from "./locales/zh-CN/latexPdf.json";
 import zhMobile from "./locales/zh-CN/mobile.json";
 import zhOnboarding from "./locales/zh-CN/onboarding.json";
 import zhSettings from "./locales/zh-CN/settings.json";
@@ -25,13 +32,14 @@ import zhShortcuts from "./locales/zh-CN/shortcuts.json";
 import zhSidebar from "./locales/zh-CN/sidebar.json";
 import zhViewer from "./locales/zh-CN/viewer.json";
 
-export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
-export type Locale = (typeof SUPPORTED_LOCALES)[number];
+const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
+type Locale = (typeof SUPPORTED_LOCALES)[number];
 
 export const DEFAULT_NS = "common";
 
 export const resources = {
 	en: {
+		account: enAccount,
 		common: enCommon,
 		app: enApp,
 		settings: enSettings,
@@ -39,12 +47,16 @@ export const resources = {
 		sidebar: enSidebar,
 		viewer: enViewer,
 		editor: enEditor,
+		latexBuild: enLatexBuild,
+		latexLanguage: enLatexLanguage,
+		latexPdf: enLatexPdf,
 		shortcuts: enShortcuts,
 		aiElements: enAiElements,
 		mobile: enMobile,
 		onboarding: enOnboarding,
 	},
 	"zh-CN": {
+		account: zhAccount,
 		common: zhCommon,
 		app: zhApp,
 		settings: zhSettings,
@@ -52,6 +64,9 @@ export const resources = {
 		sidebar: zhSidebar,
 		viewer: zhViewer,
 		editor: zhEditor,
+		latexBuild: zhLatexBuild,
+		latexLanguage: zhLatexLanguage,
+		latexPdf: zhLatexPdf,
 		shortcuts: zhShortcuts,
 		aiElements: zhAiElements,
 		mobile: zhMobile,
@@ -60,7 +75,7 @@ export const resources = {
 } as const;
 
 /** Resolve a stored preference to a concrete BCP-47 locale we ship. */
-export function resolveLocale(pref: LocalePreference): Locale {
+function resolveLocale(pref: LocalePreference): Locale {
 	if (pref === "en" || pref === "zh-CN") return pref;
 	const nav =
 		typeof navigator !== "undefined" && navigator.language

@@ -3,12 +3,18 @@ import type {
 	PdfHighlightAnnoObject,
 } from "@embedpdf/models";
 import { PdfAnnotationSubtype } from "@embedpdf/models";
+import type { TrackedAnnotation } from "@embedpdf/plugin-annotation";
 import type { AnnotationTransferItem } from "@embedpdf/plugin-annotation/react";
 import { isTauri } from "@/lib/core/tauri";
+import {
+	dedupeAnnotationItems,
+	reviveAnnotationDates,
+} from "@/lib/pdf/highlight/annotation-items";
 import {
 	type HighlightColor,
 	highlightColorFromHex,
 } from "@/lib/pdf/highlight/palette";
+import { sanitizeTranslatedRects } from "@/lib/pdf/highlight/translated-geometry";
 import type { PdfHighlight } from "@/lib/pdf/highlight/types";
 import {
 	ANNOTATIONS_JSON,
@@ -28,24 +34,6 @@ export const ANNOTATIONS_FILE = ANNOTATIONS_JSON;
 
 /** In-memory fallback when not running under Tauri (browser dev). */
 const memoryStore = new Map<string, AnnotationTransferItem[]>();
-
-function dedupeAnnotationItems(
-	items: AnnotationTransferItem[],
-): AnnotationTransferItem[] {
-	const seen = new Set<string>();
-	const out: AnnotationTransferItem[] = [];
-	for (const item of items) {
-		const id = item.annotation?.id;
-		if (!id) {
-			out.push(item);
-			continue;
-		}
-		if (seen.has(id)) continue;
-		seen.add(id);
-		out.push(item);
-	}
-	return out;
-}
 
 /** Canonical path: `papers/<id>/marks/annotations.json`. */
 function annotationsPath(paperAbsPath: string): string {
@@ -69,6 +57,14 @@ async function removeFileIfExists(path: string): Promise<void> {
 	}
 }
 
+function parseAnnotationItems(raw: string): AnnotationTransferItem[] {
+	const parsed = JSON.parse(raw) as unknown;
+	if (!Array.isArray(parsed)) return [];
+	return dedupeAnnotationItems(
+		(parsed as AnnotationTransferItem[]).map(reviveAnnotationDates),
+	);
+}
+
 export async function loadAnnotationItems(
 	paperAbsPath: string,
 ): Promise<AnnotationTransferItem[]> {
@@ -79,20 +75,17 @@ export async function loadAnnotationItems(
 
 	// Prefer marks/; fall back to paper-root and migrate once.
 	try {
-		const raw = await readVaultFile(annotationsPath(paperAbsPath));
-		const parsed = JSON.parse(raw) as unknown;
-		return Array.isArray(parsed)
-			? dedupeAnnotationItems(parsed as AnnotationTransferItem[])
-			: [];
+		return parseAnnotationItems(
+			await readVaultFile(annotationsPath(paperAbsPath)),
+		);
 	} catch {
 		// continue to legacy
 	}
 
 	try {
-		const raw = await readVaultFile(legacyAnnotationsPath(paperAbsPath));
-		const parsed = JSON.parse(raw) as unknown;
-		if (!Array.isArray(parsed)) return [];
-		const items = dedupeAnnotationItems(parsed as AnnotationTransferItem[]);
+		const items = parseAnnotationItems(
+			await readVaultFile(legacyAnnotationsPath(paperAbsPath)),
+		);
 		if (items.length) {
 			await saveAnnotationItems(paperAbsPath, items);
 		} else {
@@ -150,11 +143,28 @@ export function isHighlightObject(
 	return obj.type === PdfAnnotationSubtype.HIGHLIGHT;
 }
 
+/**
+ * EmbedPDF keeps a deleted annotation in `byUid` until an async commit purges
+ * it, and `getAnnotations()` / `getAnnotationById()` still return it as
+ * `commitState: "deleted"` in the meantime (or forever if the commit was
+ * dropped). Rendering, hit testing and editors must treat those as gone.
+ */
+export function isLiveAnnotation(
+	annotation: Pick<TrackedAnnotation, "commitState">,
+): boolean {
+	return annotation.commitState !== "deleted";
+}
+
 /** App-specific metadata round-tripped through the annotation `custom` field. */
 export type HighlightCustom = {
 	app?: string;
 	paletteKey?: HighlightColor;
 	quote?: string;
+	/**
+	 * Page-fraction boxes of the translated selection on this annotation's
+	 * page. Absent for a highlight made on the English text layer.
+	 */
+	translatedRects?: PdfHighlight["translatedRects"];
 };
 
 export function highlightColorOf(obj: PdfHighlightAnnoObject): HighlightColor {
@@ -189,5 +199,9 @@ export function highlightViewFromObject(
 		color: highlightColorOf(obj),
 	};
 	if (comment) view.comment = comment;
+	const translated = sanitizeTranslatedRects(
+		(obj.custom as HighlightCustom | undefined)?.translatedRects,
+	);
+	if (translated.length > 0) view.translatedRects = translated;
 	return view;
 }

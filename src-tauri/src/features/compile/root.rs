@@ -10,7 +10,8 @@
 //!    (root → sub → … → target) contains this file,
 //! 4. fallback: compile the file itself (standalone docs, snippets).
 //!
-//! Subfiles (`\documentclass[..]{subfiles}`) are intentionally out of scope.
+//! Subfiles resolve to their declared parent; callers may explicitly select
+//! the subfile itself through the project root override for standalone builds.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -21,6 +22,7 @@ use serde::Serialize;
 
 use agentero_core::features::vault::tree::should_ignore;
 
+use super::project::subfile_parent;
 use crate::core::blocking::run_blocking;
 use crate::core::error::{ApiResult, AppError};
 
@@ -37,6 +39,7 @@ pub enum LatexRootSource {
     VaultScan,
     /// Nothing found — the file compiles itself.
     FallbackSelf,
+    SubfileParent,
 }
 
 #[derive(Debug, Clone, Serialize, specta::Type)]
@@ -86,7 +89,7 @@ pub async fn resolve_latex_root(tex_path: String, vault_path: String) -> ApiResu
     .await
 }
 
-fn resolve_root(tex: &Path, vault: Option<&Path>) -> LatexRoot {
+pub(super) fn resolve_root(tex: &Path, vault: Option<&Path>) -> LatexRoot {
     let content = read_lossy(tex).unwrap_or_default();
     if let Some(root) = find_magic_root(tex, &content) {
         return LatexRoot {
@@ -94,7 +97,14 @@ fn resolve_root(tex: &Path, vault: Option<&Path>) -> LatexRoot {
             source: LatexRootSource::MagicComment,
         };
     }
-    if has_indicator(&strip_comments(&content)) {
+    let stripped = strip_comments(&content);
+    if let Some(parent) = subfile_parent(tex, &stripped) {
+        return LatexRoot {
+            root_path: parent.to_string_lossy().into_owned(),
+            source: LatexRootSource::SubfileParent,
+        };
+    }
+    if has_indicator(&stripped) {
         return LatexRoot {
             root_path: tex.to_string_lossy().into_owned(),
             source: LatexRootSource::SelfIndicator,
@@ -180,152 +190,17 @@ fn split_word(s: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Strip `%`-comments line by line. A `%` preceded by an odd number of
-/// backslashes (`\%`) is a literal percent sign, so the scan steps over
-/// backslash + escaped-char pairs. Verbatim environments are NOT stripped (a
-/// `\documentclass` inside verbatim would read as an indicator; the fallout —
-/// compiling that file itself — is visible and recoverable, so the
-/// simplification is accepted).
-fn strip_comments(content: &str) -> String {
-    content
-        .lines()
-        .map(truncate_at_comment)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn truncate_at_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => {
-                i += 1;
-                // Skip the escaped char: `\\` is a literal backslash, `\%` a
-                // literal percent — neither starts a comment.
-                if i < bytes.len() {
-                    i += 1;
-                }
-            }
-            b'%' => return &line[..i],
-            _ => i += 1,
-        }
-    }
-    line
-}
-
-/// Root indicator on comment-stripped content: `\documentclass` or
-/// `\begin{document}` with a word boundary after the match (so
-/// `\documentclassfoo` does not count).
-fn has_indicator(stripped: &str) -> bool {
-    contains_word(stripped, "\\documentclass") || contains_word(stripped, "\\begin{document}")
-}
-
-fn contains_word(haystack: &str, needle: &str) -> bool {
-    let mut start = 0;
-    while let Some(pos) = haystack[start..].find(needle) {
-        let abs = start + pos;
-        let after = haystack[abs + needle.len()..].chars().next();
-        if !after.is_some_and(|c| c.is_ascii_alphabetic()) {
-            return true;
-        }
-        start = abs + needle.len();
-    }
-    false
-}
-
-/// Parse `\input{…}` / `\include{…}` arguments from comment-stripped
-/// content. The command name must match exactly, which excludes
-/// `\includegraphics` / `\includeonly` / `\includepdf` / `\includesvg`. The
-/// bare form (`\input foo`) is not parsed, matching LaTeX Workshop's regex.
-fn parse_input_refs(stripped: &str) -> Vec<String> {
-    let bytes = stripped.as_bytes();
-    let mut refs = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'\\' {
-            i += 1;
-            continue;
-        }
-        let name_start = i + 1;
-        let mut j = name_start;
-        while j < bytes.len() && bytes[j].is_ascii_alphabetic() {
-            j += 1;
-        }
-        if j == name_start {
-            // Lone backslash (e.g. `\\`); step past it.
-            i += 1;
-            continue;
-        }
-        let name = &stripped[name_start..j];
-        i = j;
-        if name != "input" && name != "include" {
-            continue;
-        }
-        if i < bytes.len() && bytes[i] == b'*' {
-            i += 1;
-        }
-        i = skip_ws(bytes, i);
-        // Optional `[…]` argument (no nesting).
-        if i < bytes.len() && bytes[i] == b'[' {
-            while i < bytes.len() && bytes[i] != b']' {
-                i += 1;
-            }
-            if i < bytes.len() {
-                i += 1;
-            }
-            i = skip_ws(bytes, i);
-        }
-        if i < bytes.len() && bytes[i] == b'{' {
-            let arg_start = i + 1;
-            if let Some(end) = stripped[arg_start..].find('}') {
-                refs.push(stripped[arg_start..arg_start + end].trim().to_string());
-                i = arg_start + end + 1;
-            }
-        }
-    }
-    refs
-}
-
-fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    i
-}
-
-/// Resolve an `\input`/`\include` argument relative to the declaring file's
-/// directory: the argument as written, then with `.tex` appended (the bare
-/// extension-less form), returning the candidate that exists on disk.
-fn resolve_input(dir: &Path, arg: &str) -> Option<PathBuf> {
-    let arg = arg.trim();
-    if arg.is_empty() {
-        return None;
-    }
-    let joined = if Path::new(arg).is_absolute() {
-        PathBuf::from(arg)
-    } else {
-        dir.join(arg)
-    };
-    if joined.is_file() {
-        return Some(joined);
-    }
-    let with_ext = {
-        let mut s = joined.clone().into_os_string();
-        s.push(".tex");
-        PathBuf::from(s)
-    };
-    if with_ext.is_file() {
-        return Some(with_ext);
-    }
-    None
-}
+#[cfg(test)]
+use agentero_core::features::paper::source::tex::truncate_at_comment;
+pub(super) use agentero_core::features::paper::source::tex::{
+    has_indicator, parse_input_refs, resolve_input, strip_comments,
+};
 
 /// Lexically fold `.` / `..` without touching the filesystem, so returned
 /// paths keep the caller's prefix shape (never `canonicalize()` a return
 /// value — on Windows it grows a `\\?\` verbatim prefix that breaks the
 /// frontend's fs-scope matching).
-fn normalize_lexical(path: &Path) -> PathBuf {
+pub(super) fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
@@ -348,7 +223,7 @@ fn canonical_key(p: &Path) -> PathBuf {
     fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-fn read_lossy(path: &Path) -> Option<String> {
+pub(super) fn read_lossy(path: &Path) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let mut bytes = Vec::new();
     file.take(MAX_FILE_BYTES).read_to_end(&mut bytes).ok()?;
@@ -421,7 +296,7 @@ fn scan_for_root(scan_root: &Path, target: &Path) -> Option<PathBuf> {
     best.map(|(_, key)| display.get(key).cloned().unwrap_or_else(|| key.clone()))
 }
 
-fn collect_tex_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+pub(super) fn collect_tex_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth > SCAN_MAX_DEPTH {
         return;
     }

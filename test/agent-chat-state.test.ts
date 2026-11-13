@@ -18,15 +18,18 @@ import {
 	formatAskUserAnswers,
 	isBackgroundWorkflowHistoryTitle,
 	isPendingAskUserToolStatus,
+	mergeModelChoices,
 	parseAskUserQuestions,
 	providerSessionIdForHistoryLoad,
 	questionsFromAskUserDtos,
 	questionsFromElicitationFields,
 	resolveSelected,
+	shouldAttachLocalTranscript,
 	shouldDeferSessionEvent,
 	upsertChatSessionTurn,
 	upsertPlanPart,
 } from "@/lib/agent/chat-state";
+import { encodeMentionToken } from "@/lib/agent/composer-inline-tokens";
 import { resetAgentChatIds } from "@/lib/pdf-visual/ids";
 
 beforeEach(() => {
@@ -134,6 +137,69 @@ describe("stream / tool / plan parts", () => {
 		expect(
 			applyToolToLines(lines, { id: "unknown", status: "completed" }),
 		).toBe(lines);
+	});
+
+	it("keeps recorded ask-user answers on the tool card across later updates", () => {
+		const questions = [
+			{
+				question: "Which language?",
+				options: [{ label: "English" }, { label: "Chinese" }],
+			},
+		];
+		const lines: ChatLine[] = [
+			{
+				id: "a1",
+				kind: "agent",
+				streaming: true,
+				parts: [
+					{
+						type: "tool",
+						id: "p1",
+						tool: {
+							id: "ask-1",
+							title: "Ask 1 question",
+							kind: "other",
+							status: "in_progress",
+						},
+					},
+				],
+			},
+		];
+
+		const answered = applyToolToLines(lines, {
+			id: "ask-1",
+			status: "completed",
+			askUser: { questions, answers: ["Chinese"] },
+		});
+		expect(answered).toMatchObject([
+			{
+				parts: [
+					{
+						tool: {
+							status: "completed",
+							askUser: { questions, answers: ["Chinese"] },
+						},
+					},
+				],
+			},
+		]);
+
+		const late = applyToolToLines(answered, {
+			id: "ask-1",
+			output: "done",
+		});
+		expect(late).toMatchObject([
+			{
+				parts: [
+					{
+						tool: {
+							output: "done",
+							askUser: { questions, answers: ["Chinese"] },
+						},
+					},
+				],
+			},
+		]);
 	});
 
 	it("fails only unfinished tools when a turn ends", () => {
@@ -865,6 +931,40 @@ describe("ensureModelsInclude", () => {
 	});
 });
 
+describe("mergeModelChoices", () => {
+	it("keeps the richer catalog and appends new ids (openCode stale snapshot)", () => {
+		const richer = [
+			{ id: "opencode/gpt-5", name: "opencode/GPT-5" },
+			{ id: "deepseek/deepseek-flash", name: "deepseek/DeepSeek V4.1 Flash" },
+			{ id: "xai/grok-4.3", name: "xai/Grok 4.3" },
+		];
+		// session/new partial snapshot (custom providers only) arrives after the
+		// complete list; it must not drop the built-in provider.
+		const stale = [
+			{ id: "deepseek/deepseek-flash", name: "deepseek/DeepSeek V4.1 Flash" },
+			{ id: "xai/grok-4.3", name: "xai/Grok 4.3" },
+		];
+		const merged = mergeModelChoices(richer, stale);
+		expect(merged.map((m) => m.id)).toEqual([
+			"opencode/gpt-5",
+			"deepseek/deepseek-flash",
+			"xai/grok-4.3",
+		]);
+	});
+
+	it("adds genuinely new ids from the extra list", () => {
+		const merged = mergeModelChoices(
+			[{ id: "a", name: "A" }],
+			[
+				{ id: "a", name: "A again" },
+				{ id: "b", name: "B", group: "g" },
+			],
+		);
+		expect(merged.map((m) => m.id)).toEqual(["a", "b"]);
+		expect(merged[1]?.group).toBe("g");
+	});
+});
+
 describe("isBackgroundWorkflowHistoryTitle", () => {
 	it("hides paper-reader workflow titles", () => {
 		expect(
@@ -1018,5 +1118,48 @@ describe("buildLocalTranscriptPrompt", () => {
 
 	it("returns empty when there is no prior dialogue", () => {
 		expect(buildLocalTranscriptPrompt([])).toBe("");
+	});
+
+	it("replays a mention chip as a readable label", () => {
+		const lines: ChatLine[] = [
+			{
+				id: "u1",
+				kind: "user",
+				text: "梳理一下",
+				markup: `梳理一下 ${encodeMentionToken("notes/论文关系图.md")}`,
+			},
+		];
+		expect(buildLocalTranscriptPrompt(lines)).toContain(
+			"User: 梳理一下 @论文关系图.md",
+		);
+	});
+});
+
+describe("shouldAttachLocalTranscript", () => {
+	it("attaches when the provider session cannot be resumed", () => {
+		expect(
+			shouldAttachLocalTranscript({
+				resumeAllowed: false,
+				historyStatus: "completed",
+			}),
+		).toBe(true);
+	});
+
+	it("attaches after a failed turn so a dead connection does not drop the chat", () => {
+		expect(
+			shouldAttachLocalTranscript({
+				resumeAllowed: true,
+				historyStatus: "failed",
+			}),
+		).toBe(true);
+	});
+
+	it("omits the transcript on a healthy resume", () => {
+		expect(
+			shouldAttachLocalTranscript({
+				resumeAllowed: true,
+				historyStatus: "completed",
+			}),
+		).toBe(false);
 	});
 });

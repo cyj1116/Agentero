@@ -35,6 +35,8 @@ export type DocTab = {
 	textSeed: string;
 	markdownDirty: boolean;
 	notesDirty: boolean;
+	/** A sibling Markdown editor saved over this panel's baseline; retain its draft. */
+	markdownConflict?: boolean;
 	excalidrawDirty: boolean;
 	textDirty: boolean;
 	/** Bump to reload the center Markdown editor's content in place from `markdownSeed`. */
@@ -43,12 +45,20 @@ export type DocTab = {
 	excalidrawKey: number;
 	/** Bump to reload the plain-text editor's content in place from `textSeed`. */
 	textKey: number;
+	/** Bump to reload a local HTML preview after the file changes on disk. */
+	htmlKey: number;
 	/** Bump to reload the NOTES editor's content in place from `notesSeed`. */
 	notesKey: number;
 	/** One-shot, monotonic intent consumed by the mounted Markdown editor. */
 	navigationIntent?: { id: number; fragment: LinkFragment };
 	/** Transient: compiled-PDF pane is waiting on a running LaTeX compile. */
 	texCompiling?: boolean;
+	/** Render the rtex live canvas instead of the compiled PDF (PDF tab only). */
+	texLive?: boolean;
+	/** Project root .tex for compiled PDFs and live previews, including custom outputs. */
+	texRoot?: string;
+	/** Owning writing project for source files and project assets. */
+	writingRoot?: string;
 	loaded: boolean;
 };
 
@@ -69,6 +79,16 @@ export type OpenPlacement = {
 	referencePanelId: string | null;
 } | null;
 
+/**
+ * Anchors of the standard two-column reading layout. While dockview shows
+ * exactly two side-by-side columns, new paper bodies join the left column and
+ * their NOTES companions join the right one, regardless of focus.
+ */
+export type ReadingColumns = {
+	leftAnchorId: string;
+	rightAnchorId: string;
+};
+
 /** Fields loadTabResources fills in on top of a placeholder tab. */
 export type TabResources = {
 	kind: DocTabKind;
@@ -87,7 +107,7 @@ export type TabResources = {
 	loaded: true;
 	/** Non-fatal message to surface (e.g. unpreviewable file). */
 	error?: string;
-	/** True when this load triggered `paper_download_assets` (tree may need refresh). */
+	/** True when this load triggered a `DownloadAssets` job (tree may need refresh). */
 	didDownloadAssets?: boolean;
 };
 
@@ -97,6 +117,9 @@ export type PersistedTab = {
 	mode: CenterViewMode;
 	/** Last resolved display title (paper metadata title); shown before hydration. */
 	title?: string;
+	/** rtex live pane; persists across window reloads instead of reverting to PDF. */
+	texLive?: boolean;
+	texRoot?: string;
 };
 
 /**
@@ -117,6 +140,9 @@ export type PanelPersistParams = {
 	mode: CenterViewMode;
 	/** Display title at save time; restore shows it before resources hydrate. */
 	title: string;
+	/** Live TeX pane state; only set while live. The source association persists in either mode. */
+	texLive?: boolean;
+	texRoot?: string;
 };
 
 export const NOTES_PLACEHOLDER =

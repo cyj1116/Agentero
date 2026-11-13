@@ -6,23 +6,34 @@ import { useCallback, useMemo } from "react";
 import {
 	isPaperDirectory,
 	isPapersRoot,
-	isUnderPaperAttachments,
 	type PaperMetadata,
 	type PaperTreeLabelMode,
 	type PaperTreeSortMode,
 	paperAttachmentsNode,
+	paperSurfacesChildPath,
 	sortFileTreeNodes,
 } from "@/lib/paper";
 import { LIBRARY_VIRTUAL_PATH } from "@/lib/paper/api";
 import { PLAZA_VIRTUAL_PATH, visiblePlazaSources } from "@/lib/plaza";
 import type { FileNode } from "@/lib/vault";
+import {
+	agentTreeHighlightPath,
+	finishAgentTreeDisplay,
+	projectAgentTree,
+	type SkillTreeLabel,
+} from "@/lib/vault/agent-tree";
 import { toVaultRelative } from "@/lib/wiki";
+import { isWritingProjectMetadataPath } from "@/lib/writing/project-manifest";
 import {
 	isVirtualTreePath,
 	pathKey,
+	vaultRootFace,
 	visibleTreeChildren,
 } from "../tree-helpers";
 import type { FlatRow, TreeCreateDraft } from "../types";
+import type { ZoteroCollectionReference } from "../zotero-collection-references";
+
+const EMPTY_SKILL_LABELS: ReadonlyMap<string, SkillTreeLabel> = new Map();
 
 export type TreeIndex = {
 	byPath: ReadonlyMap<string, FileNode>;
@@ -34,7 +45,8 @@ export type TreeIndex = {
 	/**
 	 * Row to highlight / scroll to:
 	 * - virtual Library / Trash as-is;
-	 * - a surfaced attachment under `{paper}/attachments/` → that file/folder;
+	 * - a surfaced paper child (root Markdown/HTML note, or a file/folder under
+	 *   `{paper}/attachments/`) → that row;
 	 * - any other path under a paper folder → that paper;
 	 * - otherwise the path itself if present, else nearest existing ancestor.
 	 */
@@ -48,6 +60,7 @@ export function useTreeIndex({
 	paperMetaByRelPath,
 	paperTreeLabelMode,
 	paperTreeSortMode,
+	skillLabels,
 }: {
 	nodes: FileNode[];
 	vaultPath: string | null;
@@ -55,6 +68,7 @@ export function useTreeIndex({
 	paperMetaByRelPath?: ReadonlyMap<string, PaperMetadata>;
 	paperTreeLabelMode: PaperTreeLabelMode;
 	paperTreeSortMode: PaperTreeSortMode;
+	skillLabels?: ReadonlyMap<string, SkillTreeLabel>;
 }): TreeIndex {
 	const byPath = useMemo(() => {
 		const map = new Map<string, FileNode>();
@@ -85,28 +99,43 @@ export function useTreeIndex({
 		[vaultPath],
 	);
 
-	const displayNodes = useMemo(
-		() =>
-			sortFileTreeNodes(
-				nodes,
-				paperTreeSortMode,
-				paperMetaByRelPath,
-				relPathForNode,
-				paperTreeLabelMode,
-			),
-		[
-			nodes,
+	const displayNodes = useMemo(() => {
+		const sorted = sortFileTreeNodes(
+			projectAgentTree(nodes, vaultPath),
 			paperTreeSortMode,
 			paperMetaByRelPath,
 			relPathForNode,
 			paperTreeLabelMode,
-		],
-	);
+		);
+		const writing = sorted.filter(
+			(node) => vaultRootFace(vaultPath, node.path) === "thesis",
+		);
+		const ordered = sorted.filter(
+			(node) => vaultRootFace(vaultPath, node.path) !== "thesis",
+		);
+		const libraryIndex = ordered.findIndex((node) => isPapersRoot(node.path));
+		ordered.splice(libraryIndex < 0 ? 0 : libraryIndex + 1, 0, ...writing);
+		return finishAgentTreeDisplay(
+			ordered,
+			vaultPath,
+			skillLabels ?? EMPTY_SKILL_LABELS,
+		);
+	}, [
+		nodes,
+		vaultPath,
+		paperTreeSortMode,
+		paperMetaByRelPath,
+		relPathForNode,
+		paperTreeLabelMode,
+		skillLabels,
+	]);
 
 	const treeSelectedPath = useMemo(() => {
 		if (!selectedPath) return undefined;
-		return resolveTreeHighlightPath(selectedPath, byPathKey);
-	}, [selectedPath, byPathKey]);
+		const visible =
+			agentTreeHighlightPath(vaultPath, selectedPath) ?? selectedPath;
+		return resolveTreeHighlightPath(visible, byPathKey);
+	}, [selectedPath, byPathKey, vaultPath]);
 
 	return {
 		byPath,
@@ -143,7 +172,7 @@ export function resolveTreeHighlightPath(
 			node.kind === "directory" &&
 			isPaperDirectory(node.path, node.children)
 		) {
-			if (isUnderPaperAttachments(selectedPath, node.path)) {
+			if (paperSurfacesChildPath(selectedPath, node)) {
 				const exact = byPathKey.get(pathKey(selectedPath));
 				if (exact) return exact.path;
 				let up = selectedPath.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -151,7 +180,7 @@ export function resolveTreeHighlightPath(
 					const idx = up.lastIndexOf("/");
 					if (idx <= 0) break;
 					up = up.slice(0, idx);
-					if (!isUnderPaperAttachments(up, node.path)) break;
+					if (!paperSurfacesChildPath(up, node)) break;
 					const found = byPathKey.get(pathKey(up));
 					if (found) return found.path;
 				}
@@ -191,6 +220,7 @@ export function useTreeRows({
 	vaultPath,
 	plazaEnabled,
 	plazaHiddenSources,
+	zoteroCollectionReferences,
 }: {
 	displayNodes: FileNode[];
 	expanded: ReadonlySet<string>;
@@ -198,6 +228,7 @@ export function useTreeRows({
 	vaultPath: string | null;
 	plazaEnabled: boolean;
 	plazaHiddenSources: readonly string[];
+	zoteroCollectionReferences: ReadonlyMap<string, ZoteroCollectionReference[]>;
 }): TreeRows {
 	const selectableOrder = useMemo(() => {
 		const out: string[] = [];
@@ -207,12 +238,16 @@ export function useTreeRows({
 				if (n.kind === "directory" && expanded.has(n.path)) {
 					const kids = visibleTreeChildren(n);
 					if (kids.length) walk(kids);
+					for (const reference of zoteroCollectionReferences.get(n.path) ??
+						[]) {
+						out.push(reference.path);
+					}
 				}
 			}
 		};
 		walk(displayNodes);
 		return out;
-	}, [displayNodes, expanded]);
+	}, [displayNodes, expanded, zoteroCollectionReferences]);
 
 	const flatRows = useMemo<FlatRow[]>(() => {
 		// Virtual rows sit at the top: Recycle Bin, then 广场 + its sources.
@@ -239,6 +274,8 @@ export function useTreeRows({
 		}
 		const walk = (list: FileNode[], depth: number) => {
 			for (const n of list) {
+				if (vaultPath && isWritingProjectMetadataPath(vaultPath, n.path))
+					continue;
 				const paper =
 					n.kind === "directory" && isPaperDirectory(n.path, n.children);
 				out.push({
@@ -263,6 +300,16 @@ export function useTreeRows({
 				if (n.kind === "directory" && expanded.has(n.path)) {
 					const kids = visibleTreeChildren(n);
 					if (kids.length) walk(kids, depth + 1);
+					for (const reference of zoteroCollectionReferences.get(n.path) ??
+						[]) {
+						out.push({
+							key: `zotero-reference-${reference.path}`,
+							kind: "zoteroCollectionReference",
+							depth: depth + 1,
+							path: reference.path,
+							paper: reference.paper,
+						});
+					}
 				}
 			}
 		};
@@ -275,6 +322,7 @@ export function useTreeRows({
 		vaultPath,
 		plazaEnabled,
 		plazaHiddenSources,
+		zoteroCollectionReferences,
 	]);
 
 	return { selectableOrder, flatRows };

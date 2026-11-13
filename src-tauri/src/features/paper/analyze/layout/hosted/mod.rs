@@ -5,6 +5,8 @@
 //! Engines return raw layout detection boxes; coordinate conversion stays in
 //! the frontend.
 
+use crate::core::error::AppError;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
@@ -28,6 +30,12 @@ pub struct LayoutRemoteBox {
     pub score: f64,
     /// `[x1, y1, x2, y2]` in rendered-image pixels (top-left origin).
     pub coordinate: [f64; 4],
+    /// OCR/content text for this box, when provided by the engine.
+    #[specta(optional)]
+    pub text: Option<String>,
+    /// Caption text attached to a host without independent caption geometry.
+    #[specta(optional)]
+    pub caption: Option<String>,
 }
 
 /// Map raw `layout_det_res.boxes` entries into the API shape.
@@ -53,6 +61,8 @@ pub fn parse_det_boxes(boxes: &[Value]) -> Vec<LayoutRemoteBox> {
                 .to_string(),
             score: b.get("score").and_then(Value::as_f64).unwrap_or(0.0),
             coordinate: [nums[0], nums[1], nums[2], nums[3]],
+            text: None,
+            caption: None,
         });
     }
     out
@@ -146,14 +156,38 @@ pub struct LayoutRemoteProbeResult {
     pub job_id: String,
 }
 
+/// Per-request payload cap for whole-PDF uploads, measured in base64 chars.
+const MAX_PDF_BASE64_CHARS: usize = 96 * 1024 * 1024;
+
+fn prepare_pdf_upload(
+    pdf_base64: &str,
+    file_name: Option<&str>,
+) -> Result<(Vec<u8>, String), AppError> {
+    if pdf_base64.trim().is_empty() {
+        return Err(AppError::message("layout_remote: PDF is empty"));
+    }
+    if pdf_base64.len() > MAX_PDF_BASE64_CHARS {
+        return Err(AppError::message("layout_remote: PDF too large"));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(pdf_base64.trim())
+        .map_err(|e| AppError::message(format!("layout_remote: invalid PDF base64: {e}")))?;
+    let file_name = file_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("paper.pdf")
+        .to_string();
+    Ok((bytes, file_name))
+}
+
 /// Anti-drift: bind the owned `LayoutRemoteProgressEvent` mirror (in
 /// `app::events_contract`, feeding the `layout-remote:progress` payload type
 /// in bindings.ts) to the private `CloudProgressPayload` actually emitted
 /// here: serde shapes (both `requestId` variants, covering
 /// `skip_serializing_if`) and field types must stay identical.
 #[cfg(test)]
-mod events_contract_shape_tests {
-    use super::CloudProgressPayload;
+mod tests {
+    use super::{prepare_pdf_upload, CloudProgressPayload};
     use crate::app::events_contract::LayoutRemoteProgressEvent as MirrorLayoutRemoteProgress;
 
     fn samples(request_id: Option<String>) -> (CloudProgressPayload, MirrorLayoutRemoteProgress) {
@@ -193,5 +227,24 @@ mod events_contract_shape_tests {
         eq_type(&real.extracted_pages, &mirror.extracted_pages);
         eq_type(&real.total_pages, &mirror.total_pages);
         eq_type(&real.request_id, &mirror.request_id);
+    }
+    #[test]
+    fn pdf_upload_preserves_validation_and_filename_defaults() {
+        assert_eq!(
+            prepare_pdf_upload("  ", None).unwrap_err().to_string(),
+            "layout_remote: PDF is empty"
+        );
+        assert!(prepare_pdf_upload("%not-base64%", None)
+            .unwrap_err()
+            .to_string()
+            .starts_with("layout_remote: invalid PDF base64:"));
+        assert_eq!(
+            prepare_pdf_upload(" YWJj ", Some(" ")).unwrap(),
+            (b"abc".to_vec(), "paper.pdf".into())
+        );
+        assert_eq!(
+            prepare_pdf_upload("YWJj", Some(" draft.pdf ")).unwrap().1,
+            "draft.pdf"
+        );
     }
 }

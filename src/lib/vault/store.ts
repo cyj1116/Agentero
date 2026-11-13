@@ -8,13 +8,16 @@
 import { createStore } from "zustand/vanilla";
 import { errorText } from "@/lib/core/error";
 import { notifyError } from "@/lib/core/notify";
+import { toVaultRelative } from "@/lib/core/path";
+import { perfActive, perfWait } from "@/lib/core/perf";
 import { isTauri } from "@/lib/core/tauri";
-import { collectPaperFoldersFromTree } from "@/lib/paper";
+import { collectPaperFoldersFromTree } from "@/lib/paper/detect";
 import {
 	collectDirectoryRelPaths,
 	collectMarkdownRelPaths,
 	collectTreeRefreshTargets,
 	collectWikiTargetRelPaths,
+	directoryIsLoaded,
 	type FileNode,
 	getRecentVaults,
 	getSavedVaultPath,
@@ -23,11 +26,11 @@ import {
 	loadVaultTree,
 	removeTreeNode,
 	replaceTreeNodeChildren,
+	upsertTreeChild,
 } from "@/lib/vault";
 import { watchRefreshDelayMs } from "@/lib/vault/shell-activity";
-import { toVaultRelative } from "@/lib/wiki";
 
-export type TreeCreateKind = "file" | "folder";
+export type TreeCreateKind = "file" | "folder" | "table" | "experiment";
 
 export type TreeCreateDraft = {
 	kind: TreeCreateKind;
@@ -85,6 +88,41 @@ function deriveFromTree(
 	};
 }
 
+/**
+ * Content equality for tree-derived lists: watcher refreshes usually rebuild
+ * identical lists, and always-new references would re-render every
+ * derived-list subscriber (wiki nav, agent chips) for nothing.
+ */
+function sameStringArrays(a: string[], b: string[]): boolean {
+	if (a === b) return true;
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		if (a[i] !== b[i]) return false;
+	}
+	return true;
+}
+
+/**
+ * `deriveFromTree` with reference stability: lists with identical content
+ * keep their previous reference so array-identity subscribers bail out.
+ */
+function deriveGuarded(
+	tree: FileNode[],
+	vaultPath: string | null,
+	prev: VaultStore,
+): VaultTreeDerived {
+	const next = deriveFromTree(tree, vaultPath);
+	const keep = (key: keyof VaultTreeDerived): string[] =>
+		sameStringArrays(next[key], prev[key]) ? prev[key] : next[key];
+	return {
+		vaultMdFiles: keep("vaultMdFiles"),
+		vaultWikiTargetFiles: keep("vaultWikiTargetFiles"),
+		vaultDirPaths: keep("vaultDirPaths"),
+		paperFolders: keep("paperFolders"),
+		vaultPaperPaths: keep("vaultPaperPaths"),
+	};
+}
+
 export const vaultStore = createStore<VaultStore>(() => ({
 	vaultPath: null,
 	tree: [],
@@ -105,7 +143,7 @@ export function initVaultStore(): void {
 	if (initialized) return;
 	initialized = true;
 	const vaultPath = isTauri()
-		? getSavedVaultPath({ allowRestore: true })
+		? getSavedVaultPath({ allowRestore: !perfActive() })
 		: null;
 	vaultStore.setState({
 		vaultPath,
@@ -120,17 +158,26 @@ export function getVaultPath(): string | null {
 }
 
 export function setVaultPath(path: string | null): void {
-	const { tree } = vaultStore.getState();
-	vaultStore.setState({
-		vaultPath: path,
-		cutPaths: [],
-		...deriveFromTree(tree, path),
-	});
+	const prev = vaultStore.getState();
+	const derived = deriveGuarded(prev.tree, path, prev);
+	// Same vault, nothing staged, identical lists: skip the notification.
+	if (
+		path === prev.vaultPath &&
+		prev.cutPaths.length === 0 &&
+		derived.vaultMdFiles === prev.vaultMdFiles &&
+		derived.vaultWikiTargetFiles === prev.vaultWikiTargetFiles &&
+		derived.vaultDirPaths === prev.vaultDirPaths &&
+		derived.paperFolders === prev.paperFolders &&
+		derived.vaultPaperPaths === prev.vaultPaperPaths
+	) {
+		return;
+	}
+	vaultStore.setState({ vaultPath: path, cutPaths: [], ...derived });
 }
 
 export function setTree(tree: FileNode[]): void {
-	const { vaultPath } = vaultStore.getState();
-	vaultStore.setState({ tree, ...deriveFromTree(tree, vaultPath) });
+	const prev = vaultStore.getState();
+	vaultStore.setState({ tree, ...deriveGuarded(tree, prev.vaultPath, prev) });
 }
 
 export function setTreeLoading(loading: boolean): void {
@@ -254,13 +301,66 @@ export async function loadDirChildren(dirPath: string): Promise<void> {
  * changed paths map onto loaded tree nodes; falls back to a full rebuild
  * otherwise (change at the vault root, too many targets, remote vault).
  */
+function parentPath(path: string): string {
+	return path.replace(/[/\\][^/\\]+$/, "");
+}
+
+/**
+ * List only these directories and splice each into its loaded parent.
+ * A missing parent is left for {@link scheduleTreeRefresh}; a path that is
+ * not a directory is skipped. This does not re-list `papers/`.
+ */
+export async function refreshKnownDirectories(
+	absPaths: string[],
+): Promise<void> {
+	const vault = getVaultPath();
+	if (!vault || !isTauri() || absPaths.length === 0) return;
+	let tree = vaultStore.getState().tree;
+	const fallback: string[] = [];
+	for (const abs of absPaths) {
+		const parent = parentPath(abs);
+		if (!parent || parent === abs || !directoryIsLoaded(tree, parent)) {
+			fallback.push(abs);
+			continue;
+		}
+		try {
+			const children = await listVaultDirChildren(vault, abs);
+			const name = abs.split(/[/\\]/).pop() || abs;
+			tree = upsertTreeChild(tree, parent, {
+				id: abs,
+				name,
+				path: abs,
+				kind: "directory",
+				children,
+				childrenPending: false,
+			});
+		} catch {
+			// A file create/delete, or a directory that is already gone. The
+			// targeted tree refresh lists the loaded parent and applies it.
+			fallback.push(abs);
+		}
+	}
+	setTree(tree);
+	if (fallback.length > 0) scheduleTreeRefresh(fallback);
+}
+
+export function removeTreePaths(absPaths: string[]): void {
+	if (absPaths.length === 0) return;
+	let tree = vaultStore.getState().tree;
+	for (const path of absPaths) tree = removeTreeNode(tree, path);
+	setTree(tree);
+}
+
 export function scheduleTreeRefresh(changedAbsPaths?: string[]): void {
 	// Callers without path info (rescan, manual) force a full rebuild.
 	if (!changedAbsPaths?.length) treeRefreshPaths.add("");
 	else for (const p of changedAbsPaths) treeRefreshPaths.add(p);
 	if (treeRefreshTimer) clearTimeout(treeRefreshTimer);
+	const scheduledAt = performance.now();
+	const delay = watchRefreshDelayMs("tree");
 	treeRefreshTimer = setTimeout(() => {
 		treeRefreshTimer = null;
+		perfWait("watch_wait.tree", performance.now() - scheduledAt);
 		const vault = getVaultPath();
 		const changed = [...treeRefreshPaths];
 		treeRefreshPaths.clear();
@@ -305,5 +405,5 @@ export function scheduleTreeRefresh(changedAbsPaths?: string[]): void {
 					// best-effort background refresh
 				});
 		});
-	}, watchRefreshDelayMs("tree"));
+	}, delay);
 }

@@ -7,13 +7,14 @@
  */
 
 import { FolderOpen } from "lucide-react";
-import { Fragment, useEffect } from "react";
+import { Fragment, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { OnboardingRoot } from "@/components/onboarding/onboarding-root";
 import { AppDialogs } from "@/components/shell/app-dialogs";
 import { BackgroundTasksPanel } from "@/components/shell/background-tasks-panel";
 import { ErrorBoundary } from "@/components/shell/error-boundary";
 import { fileTreeHandle } from "@/components/shell/file-tree-registry";
+import { HintModeProvider } from "@/components/shell/hint-mode-provider";
 import { RightSidebar } from "@/components/shell/right-sidebar";
 import { TitleBar } from "@/components/shell/title-bar";
 import { VaultSidebar } from "@/components/shell/vault-sidebar";
@@ -26,17 +27,21 @@ import {
 } from "@/components/ui/resizable";
 import { resolveActivePdfHandle } from "@/components/viewer";
 import { WorkspaceHost } from "@/components/workspace/workspace-host";
+import { WritingDialogs } from "@/components/writing/writing-dialogs";
 import { useAgentCatalogPrefetch } from "@/hooks/use-agent-catalog-prefetch";
 import { useAppBootstrap } from "@/hooks/use-app-bootstrap";
 import { useAppShortcuts } from "@/hooks/use-app-shortcuts";
 import { useUiStore, useVaultStore } from "@/hooks/use-app-stores";
+import { useConfigReminders } from "@/hooks/use-config-reminders";
 import { useConnectorSync } from "@/hooks/use-connector-sync";
 import { useExternalFileDrop } from "@/hooks/use-external-file-drop";
 import { useFeatureTour } from "@/hooks/use-feature-tour";
+import { useFlushMarkdownOnClose } from "@/hooks/use-flush-markdown-on-close";
 import { useLayoutModelPrefetch } from "@/hooks/use-layout-model-prefetch";
 import { useMcpSync } from "@/hooks/use-mcp-sync";
 import { useNativeMenuEvents } from "@/hooks/use-native-menu-events";
 import { useAnyModalOverlayOpen } from "@/hooks/use-overlay-registration";
+import { usePaperBackfillPrompt } from "@/hooks/use-paper-backfill-prompt";
 import {
 	RAIL_COLLAPSED_MAX_PX,
 	RIGHT_SIDEBAR_MAX_RATIO,
@@ -56,13 +61,20 @@ import {
 	listenOpenAgentWithPrompt,
 	setPendingAgentComposerPrompt,
 } from "@/lib/agent/composer-seed";
-import { runSelectionQuickChat } from "@/lib/agent/selection-quick-chat";
+import {
+	runSelectionAddToChat,
+	runSelectionQuickChat,
+} from "@/lib/agent/selection-quick-chat";
 import { pinActiveSelection } from "@/lib/agent/selection-store";
 import { closeTopOverlay } from "@/lib/core/overlay-stack";
 import { isMacOS, isTauri } from "@/lib/core/tauri";
 import { doctorSetDirtyPaths } from "@/lib/doctor/api";
+import {
+	isCommittedRefreshPath,
+	noteExternalLibraryPaths,
+	noteTreePaths,
+} from "@/lib/lifecycle/refresh-wave";
 import { openMagicWand } from "@/lib/paper/import-actions";
-import { scheduleLibraryRefresh } from "@/lib/paper/library-store";
 import { UI_SCALE_PRESETS } from "@/lib/settings";
 import { getSettings, patchSettings } from "@/lib/settings/react-store";
 import {
@@ -74,6 +86,7 @@ import {
 	toggleSettingsWindow,
 } from "@/lib/shell/settings-window";
 import {
+	type LayoutMode,
 	layout,
 	openPalette,
 	setLayoutMode,
@@ -98,7 +111,7 @@ import {
 	revealSelectedInFinder,
 } from "@/lib/vault/actions";
 import { isRemoteVaultHandle } from "@/lib/vault/remote/remote-vault";
-import { scheduleTreeRefresh, vaultStore } from "@/lib/vault/store";
+import { vaultStore } from "@/lib/vault/store";
 import { renameMayAffectWikiTargets } from "@/lib/wiki";
 import { handleExternalRename } from "@/lib/wiki/actions";
 import {
@@ -108,11 +121,13 @@ import {
 import {
 	applyDiskChange,
 	closeTabOrWindow,
+	cycleActiveGroupTab,
 	cycleActiveTab,
 	dirtyVaultPaths,
 	reopenClosedTab,
 	splitActivePane,
 } from "@/lib/workspace/actions";
+import { toggleActiveMarkdownSource } from "@/lib/workspace/markdown-source-toggle";
 import { workspaceStore } from "@/lib/workspace/store";
 
 // macOS keeps native traffic lights (Overlay title bar) and a native menu bar.
@@ -149,6 +164,11 @@ function AppTitleBar() {
 	const sidebarCollapsed = useUiStore((s) => s.sidebarCollapsed);
 	const rightSidebarOpen = useUiStore((s) => s.rightSidebarOpen);
 	const layoutMode = useUiStore((s) => s.layoutMode);
+	// PERF: stable identity — an inline arrow would break TitleBar's memo.
+	const applyLayoutMode = useCallback(
+		(mode: Exclude<LayoutMode, "custom">) => layout()?.applyLayoutMode(mode),
+		[],
+	);
 
 	return (
 		<TitleBar
@@ -159,7 +179,7 @@ function AppTitleBar() {
 			layoutMode={layoutMode}
 			onToggleSidebar={toggleSidebar}
 			onToggleAgent={toggleChat}
-			onApplyLayoutMode={(mode) => layout()?.applyLayoutMode(mode)}
+			onApplyLayoutMode={applyLayoutMode}
 			onOpenSettings={openSettingsWindow}
 		/>
 	);
@@ -213,6 +233,10 @@ export default function App() {
 	useExternalFileDrop();
 	// First-vault highlight tour (driver.js) + Settings replay listener.
 	useFeatureTour();
+	// Low-frequency config reminders (#658): startup layout-model hint.
+	useConfigReminders();
+	// Vault backfill prompt: lib decides when, this window renders the toast.
+	usePaperBackfillPrompt();
 	const vaultPath = useVaultStore((s) => s.vaultPath);
 	const {
 		sidebarPanelRef,
@@ -224,12 +248,11 @@ export default function App() {
 		rightWidthPxRef,
 		initialLeftPx,
 		initialRightPx,
-		animatingRailRef,
-		cancelRailAnimation,
 	} = useShellLayout(vaultPath);
 
 	const sidebarCollapsed = useUiStore((s) => s.sidebarCollapsed);
 	const rightSidebarOpen = useUiStore((s) => s.rightSidebarOpen);
+	const isResizingRightRef = useRef(false);
 
 	// Seed the chrome agent icon with the registry default before the Agent panel
 	// is ever opened. If the panel mounts first, it wins via agentChromeStore.
@@ -306,8 +329,10 @@ export default function App() {
 	useVaultFileEvents({
 		vaultPath,
 		onDiskChange: (absPath) => void applyDiskChange(absPath),
-		onStructuralChange: scheduleTreeRefresh,
-		onLibraryChange: scheduleLibraryRefresh,
+		onStructuralChange: (paths) => {
+			noteTreePaths(paths.filter((path) => !isCommittedRefreshPath(path)));
+		},
+		onLibraryChange: noteExternalLibraryPaths,
 		onWikiChange: scheduleWikiRebuild,
 		shouldIgnoreEvent: shouldIgnoreInternalRenameEvent,
 		onExternalRename: (rename, payload) => {
@@ -329,6 +354,7 @@ export default function App() {
 	});
 
 	const anyModalOverlayOpen = useAnyModalOverlayOpen();
+	useFlushMarkdownOnClose();
 	useAppShortcuts(anyModalOverlayOpen, {
 		settings: toggleSettingsWindow,
 		// Esc → dismiss top overlay (settings, palette, dialogs…)
@@ -339,29 +365,40 @@ export default function App() {
 		openVault: () => void openVault(),
 		createVault: () => void createNewVault(),
 		refreshTree: refreshAll,
-		revealInFinder: revealSelectedInFinder,
-		openInTerminal: openSelectedInTerminal,
-		deleteTreeItem: deleteSelectedPath,
-		collapseTreeCurrent: () => fileTreeHandle()?.collapseSelected(),
-		collapseTreeDefault: () => fileTreeHandle()?.collapseToDefault(),
-		cutTreeItem: () => fileTreeHandle()?.cutSelected(),
-		pasteTreeItem: () => fileTreeHandle()?.pasteIntoSelected(),
+		revealInFinder: () => {
+			revealSelectedInFinder();
+		},
+		openInTerminal: () => {
+			openSelectedInTerminal();
+		},
+		deleteTreeItem: () => {
+			deleteSelectedPath();
+		},
+		collapseTreeCurrent: () => {
+			fileTreeHandle()?.collapseSelected();
+		},
+		collapseTreeDefault: () => {
+			fileTreeHandle()?.collapseToDefault();
+		},
+		cutTreeItem: () => {
+			fileTreeHandle()?.cutSelected();
+		},
+		pasteTreeItem: () => {
+			fileTreeHandle()?.pasteIntoSelected();
+		},
 		magicWand: openMagicWand,
 		quickOpen: () => openPalette("go"),
 		commandPalette: () => openPalette("commands"),
+		toggleMarkdownSource: () => toggleActiveMarkdownSource(),
 		toggleSidebar,
-		// ⌘L: Add to chat when a selection is staged; otherwise toggle the rail.
-		toggleChat: () => {
-			if (pinActiveSelection()) {
-				openRightTab("agent");
-			} else toggleChat();
-		},
+		toggleChat,
 		// ⌘K: in-page Quick chat (Ask) from the armed PDF / Plaza selection.
 		quickChat: () => {
 			runSelectionQuickChat();
 		},
-		// ⇧⌘A: pin the selection, open Agent, and focus the composer.
+		// Pin a staged selection, open Agent, and focus the composer.
 		addSelectionToChat: () => {
+			if (runSelectionAddToChat()) return;
 			pinActiveSelection();
 			openRightTab("agent");
 			focusAgentComposer();
@@ -369,11 +406,15 @@ export default function App() {
 		focusSidebar: () => layout()?.focusSidebar(),
 		focusEditor: () => layout()?.focusEditorPane(),
 		focusNotes: () => layout()?.focusNotesEditor(),
-		closeTab: closeTabOrWindow,
+		closeTab: () => {
+			closeTabOrWindow();
+		},
 		reopenTab: reopenClosedTab,
 		splitPane: splitActivePane,
 		nextTab: () => cycleActiveTab(1),
 		prevTab: () => cycleActiveTab(-1),
+		nextGroupTab: () => cycleActiveGroupTab(1),
+		prevGroupTab: () => cycleActiveGroupTab(-1),
 		zoomIn,
 		zoomOut,
 		zoomReset,
@@ -425,6 +466,9 @@ export default function App() {
 	// imperative resize (isUserInteraction stays false), so persist the
 	// known reset target directly instead of racing a DOM read-back.
 	const commitRailReset = (side: "left" | "right") => {
+		if (side === "right" && uiStore.getState().layoutMode !== "reading") {
+			setLayoutMode("custom");
+		}
 		commitUserRailPx(
 			side === "left" ? initialLeftPx : undefined,
 			side === "right" ? initialRightPx : undefined,
@@ -432,157 +476,163 @@ export default function App() {
 	};
 
 	return (
-		<WikiNavProvider>
-			<div className="flex h-dvh max-h-dvh flex-col overflow-hidden bg-background text-foreground">
-				{/*
+		<HintModeProvider>
+			<WikiNavProvider>
+				<div className="flex h-dvh max-h-dvh flex-col overflow-hidden bg-background text-foreground">
+					{/*
 				  macOS title bar (traffic lights row): Tauri Overlay + hiddenTitle.
 				  Height must match trafficLightPosition math in tao (≈32px → h-8).
 				*/}
-				<AppTitleBar />
+					<AppTitleBar />
 
-				<ErrorBoundary label="workspace">
-					<ResizableGroup
-						orientation="horizontal"
-						className="h-full min-h-0 flex-1 overflow-hidden"
-						onLayoutChanged={(_nextLayout, meta) => {
-							// Only genuine user resizes (drag release / keyboard) update
-							// the remembered widths; mount echoes, window resizes and
-							// programmatic preset applies are filtered out here.
-							if (!meta.isUserInteraction) return;
-							// Entering custom snapshots the rail flags; widths commit
-							// from measured px so save and restore share one base.
-							setLayoutMode("custom");
-							commitUserRailPx(
-								vaultPath
-									? sidebarPanelRef.current?.getSize().inPixels
-									: undefined,
-								rightSidebarPanelRef.current?.getSize().inPixels,
-							);
-						}}
-					>
-						{vaultPath ? (
-							<Fragment>
-								<ResizablePanel
-									id="sidebar"
-									panelRef={sidebarPanelRef}
-									defaultSize={sidebarCollapsed ? 0 : initialLeftPx}
-									minSize={SIDEBAR_MIN_PX}
-									maxSize={`${Math.round(SIDEBAR_MAX_RATIO * 100)}%`}
-									collapsible
-									collapsedSize={0}
-									// Keep pixel width when the right rail or Notes column toggles.
-									groupResizeBehavior="preserve-pixel-size"
-									className="min-h-0 overflow-hidden"
-									onResize={(size) => {
-										// Programmatic collapse/expand transition in flight.
-										if (
-											animatingRailRef.current === "left" ||
-											animatingRailRef.current === "both"
-										) {
-											return;
-										}
-										// Only mark collapsed after a real collapse, never mid-drag.
-										if (size.inPixels <= RAIL_COLLAPSED_MAX_PX) {
-											setSidebarCollapsedState(true);
-										} else if (size.inPixels >= RAIL_RECORD_MIN_PX) {
-											setSidebarCollapsedState(false);
-											leftWidthPxRef.current = size.inPixels;
-										}
-									}}
-								>
-									{/*
+					<ErrorBoundary label="workspace">
+						<ResizableGroup
+							orientation="horizontal"
+							className="h-full min-h-0 flex-1 overflow-hidden"
+							onLayoutChanged={(_nextLayout, meta) => {
+								// Only genuine user resizes (drag release / keyboard) update
+								// the remembered widths; mount echoes, window resizes and
+								// programmatic preset applies are filtered out here.
+								if (!meta.isUserInteraction) return;
+								// Only user resize of the right (Agent) rail transitions the
+								// layout into custom. The left Vault sidebar is independent of
+								// Agent / Notes presets.
+								if (
+									isResizingRightRef.current &&
+									uiStore.getState().layoutMode !== "reading"
+								) {
+									setLayoutMode("custom");
+								}
+								isResizingRightRef.current = false;
+								commitUserRailPx(
+									vaultPath
+										? sidebarPanelRef.current?.getSize().inPixels
+										: undefined,
+									rightSidebarPanelRef.current?.getSize().inPixels,
+								);
+							}}
+						>
+							{vaultPath ? (
+								<Fragment>
+									<ResizablePanel
+										id="sidebar"
+										panelRef={sidebarPanelRef}
+										defaultSize={sidebarCollapsed ? 0 : initialLeftPx}
+										minSize={SIDEBAR_MIN_PX}
+										maxSize={`${Math.round(SIDEBAR_MAX_RATIO * 100)}%`}
+										collapsible
+										collapsedSize={0}
+										// Keep pixel width when the right rail or Notes column toggles.
+										groupResizeBehavior="preserve-pixel-size"
+										className="min-h-0 overflow-hidden"
+										onResize={(size) => {
+											// Only mark collapsed after a real collapse, never mid-drag.
+											if (size.inPixels <= RAIL_COLLAPSED_MAX_PX) {
+												setSidebarCollapsedState(true);
+											} else if (size.inPixels >= RAIL_RECORD_MIN_PX) {
+												setSidebarCollapsedState(false);
+												leftWidthPxRef.current = size.inPixels;
+											}
+										}}
+									>
+										{/*
 									  `isolate` (stacking context) separates the rail from the PDF
 									  pane, but a whole-rail `transform-gpu` GPU layer goes
 									  unpainted in WKWebView after paper open / tab switch /
 									  import and only recovers on scroll. Rows use `top`, not
 									  `translateY`, so no compositing layer is needed here.
 									*/}
-									<aside
-										ref={sidebarAsideRef}
-										data-vault-sidebar
-										className="flex h-full min-h-0 flex-col overflow-hidden bg-sidebar isolate"
-									>
-										<VaultSidebar />
-									</aside>
-								</ResizablePanel>
+										<aside
+											ref={sidebarAsideRef}
+											data-vault-sidebar
+											className="flex h-full min-h-0 flex-col overflow-hidden bg-sidebar isolate"
+										>
+											<VaultSidebar />
+										</aside>
+									</ResizablePanel>
 
-								{sidebarCollapsed ? null : (
-									<ResizableHandle
-										onPointerDown={cancelRailAnimation}
-										onDoubleClick={() => commitRailReset("left")}
-									/>
-								)}
-							</Fragment>
-						) : null}
+									{sidebarCollapsed ? null : (
+										<ResizableHandle
+											onDoubleClick={() => commitRailReset("left")}
+											onPointerDown={() => {
+												isResizingRightRef.current = false;
+											}}
+											onKeyDown={() => {
+												isResizingRightRef.current = false;
+											}}
+										/>
+									)}
+								</Fragment>
+							) : null}
 
-						<ResizablePanel
-							id="source"
-							panelRef={sourcePanelRef}
-							minSize={200}
-							collapsible
-							collapsedSize={0}
-							className="min-h-0 min-w-0 overflow-hidden"
-						>
-							<div
-								ref={editorPaneRef}
-								className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden"
+							<ResizablePanel
+								id="source"
+								panelRef={sourcePanelRef}
+								minSize={200}
+								collapsible
+								collapsedSize={0}
+								className="min-h-0 min-w-0 overflow-hidden"
 							>
-								{/* Document panels + library toolbar live inside dockview. */}
-								{!vaultPath ? (
-									<WelcomeCenter />
-								) : (
-									<div className="relative min-h-0 flex-1 overflow-hidden">
-										<WorkspaceHost />
-									</div>
-								)}
-							</div>
-						</ResizablePanel>
+								<div
+									ref={editorPaneRef}
+									className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden"
+								>
+									{/* Document panels + library toolbar live inside dockview. */}
+									{!vaultPath ? (
+										<WelcomeCenter />
+									) : (
+										<div className="relative h-full min-h-0 flex-1 overflow-hidden">
+											<WorkspaceHost />
+											<WritingDialogs />
+										</div>
+									)}
+								</div>
+							</ResizablePanel>
 
-						{/* Right sidebar: always mounted + collapsible (same as left). */}
-						{rightSidebarOpen ? (
-							<ResizableHandle
-								onPointerDown={cancelRailAnimation}
-								onDoubleClick={() => commitRailReset("right")}
-							/>
-						) : null}
-						<ResizablePanel
-							id="right-sidebar"
-							panelRef={rightSidebarPanelRef}
-							defaultSize={rightSidebarOpen ? initialRightPx : 0}
-							minSize={RIGHT_SIDEBAR_MIN_PX}
-							maxSize={`${Math.round(RIGHT_SIDEBAR_MAX_RATIO * 100)}%`}
-							collapsible
-							collapsedSize={0}
-							groupResizeBehavior="preserve-pixel-size"
-							className="min-h-0 overflow-hidden"
-							onResize={(size) => {
-								// Programmatic collapse/expand transition in flight.
-								if (
-									animatingRailRef.current === "right" ||
-									animatingRailRef.current === "both"
-								) {
-									return;
-								}
-								if (size.inPixels <= RAIL_COLLAPSED_MAX_PX) {
-									setRightSidebarOpenState(false);
-								} else if (size.inPixels >= RAIL_RECORD_MIN_PX) {
-									setRightSidebarOpenState(true);
-									rightWidthPxRef.current = size.inPixels;
-								}
-							}}
-						>
-							<RightSidebar />
-						</ResizablePanel>
-					</ResizableGroup>
-				</ErrorBoundary>
+							{/* Right sidebar: always mounted + collapsible (same as left). */}
+							{rightSidebarOpen ? (
+								<ResizableHandle
+									onDoubleClick={() => commitRailReset("right")}
+									onPointerDown={() => {
+										isResizingRightRef.current = true;
+									}}
+									onKeyDown={() => {
+										isResizingRightRef.current = true;
+									}}
+								/>
+							) : null}
+							<ResizablePanel
+								id="right-sidebar"
+								panelRef={rightSidebarPanelRef}
+								defaultSize={rightSidebarOpen ? initialRightPx : 0}
+								minSize={RIGHT_SIDEBAR_MIN_PX}
+								maxSize={`${Math.round(RIGHT_SIDEBAR_MAX_RATIO * 100)}%`}
+								collapsible
+								collapsedSize={0}
+								groupResizeBehavior="preserve-pixel-size"
+								className="min-h-0 overflow-hidden"
+								onResize={(size) => {
+									if (size.inPixels <= RAIL_COLLAPSED_MAX_PX) {
+										setRightSidebarOpenState(false);
+									} else if (size.inPixels >= RAIL_RECORD_MIN_PX) {
+										setRightSidebarOpenState(true);
+										rightWidthPxRef.current = size.inPixels;
+									}
+								}}
+							>
+								<RightSidebar />
+							</ResizablePanel>
+						</ResizableGroup>
+					</ErrorBoundary>
 
-				<AppDialogs />
+					<AppDialogs />
 
-				<BackgroundTasksPanel />
+					<BackgroundTasksPanel />
 
-				{/* First-run setup wizard (Raycast-style full-window overlay). */}
-				<OnboardingRoot />
-			</div>
-		</WikiNavProvider>
+					{/* First-run setup wizard (Raycast-style full-window overlay). */}
+					<OnboardingRoot />
+				</div>
+			</WikiNavProvider>
+		</HintModeProvider>
 	);
 }

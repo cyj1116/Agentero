@@ -8,7 +8,8 @@ use crate::features::agent::runtime::events::AgentEventEmitter;
 use agent_client_protocol::schema::v1::{
     AvailableCommandInput, PlanEntryPriority, PlanEntryStatus, SessionConfigKind,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelectOptions, SessionNotification, SessionUpdate, ToolCallStatus, ToolKind,
+    SessionConfigSelectOptions, SessionNotification, SessionUpdate, ToolCallContent,
+    ToolCallStatus, ToolKind,
 };
 use agent_client_protocol::schema::MaybeUndefined;
 use std::collections::HashSet;
@@ -225,6 +226,22 @@ pub(crate) fn richer_models_event(
     }
 }
 
+/// Store `event` only when it is at least as large as the current catalog.
+///
+/// opencode 2.x reports a partial model catalog on `session/new` and pushes the
+/// complete one moments later via `config_option_update`. A warm result (or
+/// pooled-slot snapshot) captured before that push still carries the partial
+/// list, so replacing unconditionally would shrink the picker and hide custom
+/// providers (#638). Richer wins; equal counts refresh to the newer event.
+pub(crate) fn store_richer_models(slot: &mut Option<AgentModelsEvent>, event: AgentModelsEvent) {
+    let replace = slot
+        .as_ref()
+        .is_none_or(|prev| event.models.len() >= prev.models.len());
+    if replace {
+        *slot = Some(event);
+    }
+}
+
 /// Fallback model selector extraction for agents that still expose the
 /// pre-stabilization top-level `models` field on `session/new` (e.g. hermes-agent
 /// before it migrated to `configOptions`, see NousResearch/hermes-agent#81067).
@@ -243,7 +260,41 @@ pub(crate) fn models_from_session_models_value(
     value: &serde_json::Value,
 ) -> Option<AgentModelsEvent> {
     let models_obj = session_models_object(value)?;
+    let event = models_from_models_object(session_id, agent_id, models_obj)?;
+    log::debug!(
+        target: "agentero::agent",
+        "agent={} using legacy top-level session models field: count={} current={}",
+        agent_id,
+        event.models.len(),
+        event.current_id
+    );
+    Some(event)
+}
 
+/// Grok Build's `_x.ai/models/update` params carry the same catalog shape as
+/// the legacy top-level `models` object (`currentModelId` / `availableModels`).
+pub(crate) fn models_from_grok_update(
+    session_id: &str,
+    agent_id: &str,
+    params: &crate::features::agent::acp::grok_models::GrokModelsUpdateParams,
+) -> Option<AgentModelsEvent> {
+    let models_obj = serde_json::to_value(params).ok()?;
+    let event = models_from_models_object(session_id, agent_id, &models_obj)?;
+    log::debug!(
+        target: "agentero::agent",
+        "agent={} grok models update: count={} current={}",
+        agent_id,
+        event.models.len(),
+        event.current_id
+    );
+    Some(event)
+}
+
+fn models_from_models_object(
+    session_id: &str,
+    agent_id: &str,
+    models_obj: &serde_json::Value,
+) -> Option<AgentModelsEvent> {
     let available = models_obj
         .get("availableModels")
         .or_else(|| models_obj.get("available_models"))?
@@ -294,17 +345,10 @@ pub(crate) fn models_from_session_models_value(
         current_id
     };
 
-    log::debug!(
-        target: "agentero::agent",
-        "agent={} using legacy top-level session models field: count={} current={}",
-        agent_id,
-        models.len(),
-        current_id
-    );
     Some(AgentModelsEvent {
         session_id: session_id.to_string(),
         agent_id: agent_id.to_string(),
-        // The legacy field carries no config option id; the picker only needs a
+        // The vendor field carries no config option id; the picker only needs a
         // stable key for persistence, and "model" matches the standard option id.
         config_id: "model".to_string(),
         current_id,
@@ -561,6 +605,33 @@ pub(crate) fn emit_session_config_options(
 /// transcript only renders a preview, so ship a bounded head + marker instead.
 pub(crate) const TOOL_PAYLOAD_MAX_BYTES: usize = 32 * 1024;
 
+// ACP updates can carry output only in native content blocks. Retain those
+// alongside raw provider metadata; updates need not repeat the initial kind.
+fn tool_output_payload(
+    raw_output: Option<serde_json::Value>,
+    content: &[ToolCallContent],
+) -> Option<serde_json::Value> {
+    let text: Vec<_> = content
+        .iter()
+        .filter_map(|item| match item {
+            ToolCallContent::Content(item) => text_from_content_block(&item.content),
+            _ => None,
+        })
+        .collect();
+    if text.is_empty() {
+        return cap_tool_payload(raw_output);
+    }
+    let mut output = match raw_output {
+        Some(serde_json::Value::Object(output)) => output,
+        Some(raw) => serde_json::Map::from_iter([("rawOutput".into(), raw)]),
+        None => serde_json::Map::new(),
+    };
+    output
+        .entry("stdout")
+        .or_insert_with(|| serde_json::Value::String(text.join("\n")));
+    cap_tool_payload(Some(serde_json::Value::Object(output)))
+}
+
 pub(crate) fn cap_tool_payload(value: Option<serde_json::Value>) -> Option<serde_json::Value> {
     let value = value?;
     let serialized = serde_json::to_string(&value).unwrap_or_default();
@@ -632,7 +703,7 @@ pub(crate) fn emit_rich_session_update(
                     kind: Some(tool_kind_str(tc.kind).to_string()),
                     status: Some(tool_status_str(tc.status).to_string()),
                     input: cap_tool_payload(tc.raw_input.clone()),
-                    output: cap_tool_payload(tc.raw_output.clone()),
+                    output: tool_output_payload(tc.raw_output.clone(), &tc.content),
                     full: true,
                 },
             );
@@ -648,7 +719,10 @@ pub(crate) fn emit_rich_session_update(
                     kind: f.kind.map(tool_kind_str).map(str::to_string),
                     status: f.status.map(tool_status_str).map(str::to_string),
                     input: cap_tool_payload(f.raw_input.clone()),
-                    output: cap_tool_payload(f.raw_output.clone()),
+                    output: tool_output_payload(
+                        f.raw_output.clone(),
+                        f.content.as_deref().unwrap_or_default(),
+                    ),
                     full: false,
                 },
             );
@@ -1011,8 +1085,29 @@ mod config_option_tests {
 
 #[cfg(test)]
 mod session_models_fallback_tests {
+    #[test]
+    fn native_opencode_terminal_content_keeps_stdout_and_metadata() {
+        let content: Vec<agent_client_protocol::schema::v1::ToolCallContent> = serde_json::from_value(serde_json::json!([
+			{ "type": "content", "content": { "type": "text", "text": "component_migration_probe" } }
+		])).unwrap();
+        let metadata = serde_json::json!({ "metadata": { "status": "completed", "truncated": false, "exit": 0 }});
+        let output = super::tool_output_payload(Some(metadata.clone()), &content).unwrap();
+        assert_eq!(output["stdout"], "component_migration_probe");
+        assert_eq!(output["metadata"], metadata["metadata"]);
+        let existing = serde_json::json!({ "stdout": "provider output", "extra": "preserve" });
+        assert_eq!(
+            super::tool_output_payload(Some(existing.clone()), &content),
+            Some(existing)
+        );
+        assert_eq!(
+            super::tool_output_payload(Some(serde_json::json!("raw")), &content).unwrap()
+                ["rawOutput"],
+            "raw"
+        );
+    }
     use super::{
-        models_from_config_options, models_from_session_models_value, richer_models_event,
+        models_from_config_options, models_from_grok_update, models_from_session_models_value,
+        richer_models_event, store_richer_models,
     };
     use agent_client_protocol::schema::v1::{
         SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
@@ -1072,6 +1167,30 @@ mod session_models_fallback_tests {
             .find(|m| m.id == "custom-gateway/my-model")
             .expect("custom provider model");
         assert_eq!(custom.group.as_deref(), Some("custom-gateway"));
+    }
+
+    #[test]
+    fn grok_models_push_replaces_a_stale_session_snapshot() {
+        let params = crate::features::agent::acp::grok_models::GrokModelsUpdateParams {
+            current_model_id: Some("grok-4.7-build-fast".into()),
+            available_models: serde_json::json!([
+                { "modelId": "grok-4.7", "name": "Grok 4.7" },
+                { "modelId": "grok-4.7-build-fast", "name": "Grok 4.7 Fast" },
+                { "modelId": "grok-4.6", "name": "Grok 4.6" },
+                { "modelId": "grok-4.5", "name": "Grok 4.5" },
+                { "modelId": "grok-4.6", "name": "Grok 4.6 (dup id)" }
+            ])
+            .as_array()
+            .unwrap()
+            .clone(),
+        };
+
+        let ev = models_from_grok_update("sess-1", "catalog-grok-build", &params)
+            .expect("grok models push should parse");
+        assert_eq!(ev.config_id, "model");
+        assert_eq!(ev.current_id, "grok-4.7-build-fast");
+        assert_eq!(ev.models.len(), 4);
+        assert_eq!(ev.models[0].id, "grok-4.7");
     }
 
     #[test]
@@ -1157,5 +1276,40 @@ mod session_models_fallback_tests {
 
         let ev = models_from_session_models_value("sess-1", "hermes", &value).expect("models");
         assert_eq!(ev.current_id, "moa:default");
+    }
+
+    #[test]
+    fn store_richer_models_ignores_stale_partial_snapshot() {
+        use crate::features::agent::models::{AgentModelChoice, AgentModelsEvent};
+
+        let event = |ids: &[&str]| AgentModelsEvent {
+            session_id: "sess-1".into(),
+            agent_id: "opencode".into(),
+            config_id: "model".into(),
+            current_id: ids[0].to_string(),
+            models: ids
+                .iter()
+                .map(|id| AgentModelChoice {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    group: None,
+                })
+                .collect(),
+        };
+
+        let mut slot: Option<AgentModelsEvent> = None;
+        store_richer_models(&mut slot, event(&["deepseek/deepseek-flash"]));
+        assert_eq!(slot.as_ref().expect("stored").models.len(), 1);
+
+        // opencode 2.0.22 pushes the complete catalog after session/new.
+        store_richer_models(
+            &mut slot,
+            event(&["opencode/gpt-5", "deepseek/deepseek-flash"]),
+        );
+        assert_eq!(slot.as_ref().expect("stored").models.len(), 2);
+
+        // A stale partial snapshot must not shrink it again.
+        store_richer_models(&mut slot, event(&["deepseek/deepseek-flash"]));
+        assert_eq!(slot.as_ref().expect("stored").models.len(), 2);
     }
 }

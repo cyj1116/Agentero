@@ -48,6 +48,9 @@ src-tauri/target/
 # Brainstorming visual-companion scratch
 .superpowers/
 
+# Local spec workflow scratch
+.spec-workflow/
+
 .pnpm-store/
 src-tauri/binaries/*
 !src-tauri/binaries/.gitkeep
@@ -56,3 +59,6 @@ src-tauri/pdfium/
 
 # Staged by scripts/prepare-adapters.mjs on every dev/release build
 src-tauri/adapters/
+
+# Local stargazer affiliation viz (not part of the app)
+/stargazers-viz/

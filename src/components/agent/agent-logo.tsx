@@ -1,22 +1,35 @@
 import { Terminal } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
-import { SiClaude, SiDeepseek, SiHermes, SiOpencode } from "react-icons/si";
+import {
+	SiClaude,
+	SiCursor,
+	SiDeepseek,
+	SiHermes,
+	SiOpencode,
+	SiXiaomi,
+	SiZhihu,
+} from "react-icons/si";
 import type { AgentTemplate } from "@/lib/agent";
 import { cn } from "@/lib/core/utils";
 
 export type AgentLogoKey =
 	| "opencode"
-	| "openclaw"
 	| "claude-acp"
 	| "codex-acp"
+	| "cursor-agent"
 	| "hermes"
 	| "qodercli"
+	| "antigravity-acp"
 	| "grok-build"
 	| "pi"
 	| "dsh"
 	| "kimi-code"
 	| "zcode"
 	| "minimax-code"
+	| "mimo-code"
+	| "codebuddy"
+	| "qoder-cn"
+	| "zhihu"
 	| "custom";
 
 export function agentLogoKeyForTemplate(
@@ -24,17 +37,22 @@ export function agentLogoKeyForTemplate(
 ): AgentLogoKey {
 	switch (template) {
 		case "opencode":
-		case "openclaw":
 		case "claude-acp":
 		case "codex-acp":
+		case "cursor-agent":
 		case "hermes":
 		case "qodercli":
+		case "antigravity-acp":
 		case "grok-build":
 		case "pi":
 		case "dsh":
 		case "kimi-code":
 		case "zcode":
 		case "minimax-code":
+		case "mimo-code":
+		case "codebuddy":
+		case "qoder-cn":
+		case "zhihu":
 			return template;
 		default:
 			return "custom";
@@ -67,18 +85,14 @@ export function AgentLogo({
 		case "opencode":
 			icon = <SiOpencode className={neutralIconClass} />;
 			break;
-		case "openclaw":
-			icon = (
-				<OpenClawMark
-					className={cn(iconClass, "!text-red-600 dark:!text-red-400")}
-				/>
-			);
-			break;
 		case "claude-acp":
 			icon = <SiClaude className={cn(iconClass, "!text-[#D97757]")} />;
 			break;
 		case "codex-acp":
 			icon = <OpenAiMark className={neutralIconClass} />;
+			break;
+		case "cursor-agent":
+			icon = <SiCursor className={neutralIconClass} />;
 			break;
 		case "hermes":
 			icon = (
@@ -109,8 +123,21 @@ export function AgentLogo({
 		case "minimax-code":
 			icon = <MiniMaxMark className={iconClass} />;
 			break;
+		case "mimo-code":
+			icon = <SiXiaomi className={cn(iconClass, "!text-[#FF6900]")} />;
+			break;
+		case "codebuddy":
+			icon = <CodeBuddyMark className={iconClass} />;
+			break;
+		case "zhihu":
+			icon = <SiZhihu className={cn(iconClass, "!text-[#0084FF]")} />;
+			break;
 		case "qodercli":
+		case "qoder-cn":
 			icon = <QoderMark className={neutralIconClass} />;
+			break;
+		case "antigravity-acp":
+			icon = <AntigravityMark className={neutralIconClass} />;
 			break;
 		case "custom":
 			icon = <Terminal className={cn(iconClass, "!text-muted-foreground")} />;
@@ -164,30 +191,6 @@ function QoderMark(props: ComponentProps<"svg">) {
 	);
 }
 
-function OpenClawMark(props: ComponentProps<"svg">) {
-	return (
-		<svg viewBox="0 0 120 120" fill="none" aria-hidden {...props}>
-			<title>OpenClaw</title>
-			<path
-				d="M60 10C30 10 15 35 15 55c0 20 15 40 30 45v10h10v-10c0 0 5 2 10 0v10h10v-10c15-5 30-25 30-45 0-20-15-45-45-45Z"
-				fill="currentColor"
-			/>
-			<path
-				d="M20 45C5 40 0 50 5 60c5 10 15 5 20-5 3-7 0-10-5-10ZM100 45c15-5 20 5 15 15s-15 5-20-5c-3-7 0-10 5-10Z"
-				fill="currentColor"
-			/>
-			<path
-				d="M45 15Q35 5 30 8M75 15Q85 5 90 8"
-				stroke="currentColor"
-				strokeWidth="3"
-				strokeLinecap="round"
-			/>
-			<circle cx="45" cy="35" r="4.5" fill="var(--background)" />
-			<circle cx="75" cy="35" r="4.5" fill="var(--background)" />
-		</svg>
-	);
-}
-
 function OpenAiMark(props: ComponentProps<"svg">) {
 	return (
 		<svg
@@ -199,6 +202,22 @@ function OpenAiMark(props: ComponentProps<"svg">) {
 		>
 			<title>OpenAI</title>
 			<path d="M21.55 10.004a5.416 5.416 0 00-.478-4.501c-1.217-2.09-3.662-3.166-6.05-2.66A5.59 5.59 0 0010.831 1C8.39.995 6.224 2.546 5.473 4.838A5.553 5.553 0 001.76 7.496a5.487 5.487 0 00.691 6.5 5.416 5.416 0 00.477 4.502c1.217 2.09 3.662 3.165 6.05 2.66A5.586 5.586 0 0013.168 23c2.443.006 4.61-1.546 5.361-3.84a5.553 5.553 0 003.715-2.66 5.488 5.488 0 00-.693-6.497v.001zm-8.381 11.558a4.199 4.199 0 01-2.675-.954c.034-.018.093-.05.132-.074l4.44-2.53a.71.71 0 00.364-.623v-6.176l1.877 1.069c.02.01.033.029.036.05v5.115c-.003 2.274-1.87 4.118-4.174 4.123zM4.192 17.78a4.059 4.059 0 01-.498-2.763c.032.02.09.055.131.078l4.44 2.53c.225.13.504.13.73 0l5.42-3.088v2.138a.068.068 0 01-.027.057L9.9 19.288c-1.999 1.136-4.552.46-5.707-1.51h-.001zM3.023 8.216A4.15 4.15 0 015.198 6.41l-.002.151v5.06a.711.711 0 00.364.624l5.42 3.087-1.876 1.07a.067.067 0 01-.063.005l-4.489-2.559c-1.995-1.14-2.679-3.658-1.53-5.63h.001zm15.417 3.54l-5.42-3.088L14.896 7.6a.067.067 0 01.063-.006l4.489 2.557c1.998 1.14 2.683 3.662 1.529 5.633a4.163 4.163 0 01-2.174 1.807V12.38a.71.71 0 00-.363-.623zm1.867-2.773a6.04 6.04 0 00-.132-.078l-4.44-2.53a.731.731 0 00-.729 0l-5.42 3.088V7.325a.068.068 0 01.027-.057L14.1 4.713c2-1.137 4.555-.46 5.707 1.513.487.833.664 1.809.499 2.757h.001zm-11.741 3.81l-1.877-1.068a.065.065 0 01-.036-.051V6.559c.001-2.277 1.873-4.122 4.181-4.12.976 0 1.92.338 2.671.954-.034.018-.092.05-.131.073l-4.44 2.53a.71.71 0 00-.365.623l-.003 6.173v.002zm1.02-2.168L12 9.25l2.414 1.375v2.75L12 14.75l-2.415-1.375v-2.75z" />
+		</svg>
+	);
+}
+
+/** Google Antigravity brand mark. */
+function AntigravityMark(props: ComponentProps<"svg">) {
+	return (
+		<svg
+			viewBox="0 0 24 24"
+			fill="currentColor"
+			fillRule="evenodd"
+			aria-hidden
+			{...props}
+		>
+			<title>Antigravity</title>
+			<path d="M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z" />
 		</svg>
 	);
 }
@@ -264,6 +283,63 @@ function ZcodeMark(props: ComponentProps<"svg">) {
 				<rect x="6" y="15.7" width="12" height="2.7" />
 			</g>
 			<path d="M11.07 12.69L13.03 11.31" stroke="#0A0A0A" strokeWidth="1.2" />
+		</svg>
+	);
+}
+
+/** CodeBuddy brand mark: purple gradient tile, white bird and mint glow. */
+function CodeBuddyMark(props: ComponentProps<"svg">) {
+	return (
+		<svg viewBox="0 0 40 40" fill="none" aria-hidden {...props}>
+			<title>CodeBuddy</title>
+			<defs>
+				<linearGradient
+					id="codebuddy-tile"
+					x1="20"
+					y1="0"
+					x2="20"
+					y2="40"
+					gradientUnits="userSpaceOnUse"
+				>
+					<stop stopColor="#6C4DFF" />
+					<stop offset="1" stopColor="#583ED3" />
+				</linearGradient>
+				<linearGradient
+					id="codebuddy-bird"
+					x1="14.639"
+					y1="10.7917"
+					x2="32.1712"
+					y2="41.1585"
+					gradientUnits="userSpaceOnUse"
+				>
+					<stop stopColor="#FFFFFF" stopOpacity="0.8" />
+					<stop offset="0.4377" stopColor="#FFFFFF" />
+				</linearGradient>
+			</defs>
+			<rect width="40" height="40" rx="20" fill="url(#codebuddy-tile)" />
+			<circle cx="12.6" cy="35" r="10.5" fill="#32E6B9" fillOpacity="0.35" />
+			<path
+				d="M27.6897 3.3426C28.057 3.01322 28.0795 2.99983 28.3485 2.98366C28.7851 2.95177 29.1858 3.16107 29.8664 3.78072C31.4566 5.22574 33.6703 8.19724 35.047 10.7343L35.5796 11.7191L36.3309 12.0927C37.0562 12.4593 38.2459 13.2111 38.7428 13.614C38.9673 13.7997 38.9992 13.8032 39.2326 13.7124C40.2872 13.3017 41.7982 13.846 43.1307 15.1244C44.3302 16.274 45.479 18.2384 45.9191 19.8778C45.9833 20.1417 46.0683 20.709 46.0994 21.1314C46.1997 22.6144 45.7243 23.7986 44.8085 24.3349C44.6213 24.443 44.6085 24.4725 44.6137 24.939C44.6559 27.1604 44.0571 29.3777 42.8543 31.54C41.4965 33.9678 39.0794 36.4798 35.8073 38.846C34.0502 40.1247 29.8918 42.5469 28.0122 43.3973C23.5096 45.4244 19.8999 46.2022 16.7645 45.8181C14.8943 45.5915 12.7771 44.8611 11.5246 44.0137C11.1951 43.786 11.1428 43.7719 10.8909 43.8439C9.55017 44.2289 7.79442 43.4374 6.30272 41.7817C5.70771 41.1197 4.74709 39.4939 4.43575 38.6241C3.71569 36.5887 3.85859 34.752 4.81783 33.6551C5.0657 33.3725 5.07387 33.3607 5.01972 32.8856C4.93033 32.1079 4.88982 30.9566 4.93066 30.2138L4.96343 29.5205L3.92091 27.6777C2.3078 24.8074 1.28326 22.3968 0.887982 20.5554C0.679402 19.546 0.692781 19.0981 0.949061 18.7667C1.10529 18.5666 1.61622 18.3594 2.23252 18.2455C3.78518 17.9729 7.17203 18.2198 10.9394 18.885L11.3303 18.9525L12.1903 18.1921C13.6179 16.9275 14.5665 16.2176 16.315 15.1274C18.1373 13.9872 20.1943 13.0498 22.5103 12.3071L23.2533 12.0687L23.6615 10.9964C25.1239 7.13587 26.6218 4.28969 27.6897 3.3426ZM15.4393 23.1261C13.7864 24.0804 12.9602 24.5582 12.3529 25.093C9.89364 27.2585 8.9738 30.6888 10.0208 33.7938C10.2794 34.5606 10.7568 35.387 11.7111 37.0398C12.6653 38.6926 13.1424 39.5194 13.6771 40.1267C15.8426 42.5859 19.2732 43.5045 22.3783 42.4574C23.145 42.1989 23.972 41.7223 25.6248 40.768L35.1333 35.2783C36.7862 34.324 37.6124 33.8462 38.2196 33.3114C40.6789 31.1459 41.5988 27.7156 40.5518 24.6105C40.2932 23.8438 39.8157 23.0174 38.8615 21.3646C37.9072 19.7117 37.4302 18.885 36.8955 18.2777C34.7299 15.8185 31.2993 14.8999 28.1943 15.947C27.4275 16.2055 26.6006 16.6821 24.9478 17.6364L15.4393 23.1261Z"
+				fill="url(#codebuddy-bird)"
+			/>
+			<rect
+				x="15.8816"
+				y="30.0273"
+				width="4.00904"
+				height="8.32646"
+				rx="2.00452"
+				transform="rotate(-30 15.8816 30.0273)"
+				fill="#FFFFFF"
+			/>
+			<rect
+				x="26.6978"
+				y="23.7812"
+				width="4.00904"
+				height="8.32646"
+				rx="2.00452"
+				transform="rotate(-30 26.6978 23.7812)"
+				fill="#FFFFFF"
+			/>
 		</svg>
 	);
 }

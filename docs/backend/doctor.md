@@ -44,6 +44,7 @@ Doctor 聚合本地 Vault 的只读完整性检查，并为论文别名、双链
 - 拒绝复杂、异常或无法精确定位的 YAML；
 - 先规划全部文件，再**原地写入**（不改 path / 文件名，只改 frontmatter）；
 - 任一写入失败时按规划内容回滚本批已写文件。
+- alias 与 wikilink 修复共用 core `features/vault/doctor/note_writes.rs` 的提交阶段：全部源文件重检后再原地写入，失败逆序回滚；修复规划和各自错误文案仍由业务入口负责。
 
 不使用 tmp+rename 式原子替换：那样会被 Vault 文件监听器当成「不完整改名」，误报外部改名未修复链接。
 
@@ -60,6 +61,7 @@ Doctor 聚合本地 Vault 的只读完整性检查，并为论文别名、双链
 
 1. **探测** `doctor_plan_wikilinks`  
    - 对 unresolved 边做唯一高置信匹配（path / stem / alias 近邻、heading/block 近邻）→ `layer=deterministic`（默认勾选）  
+   - 目标替换保持媒体类型：图片只匹配图片（png/jpg/jpeg/gif/webp/bmp/svg/avif/ico），PDF 只匹配 PDF，Markdown 只匹配 Markdown；同 stem 的图片优先保留原扩展名，只有 PDF 时不会把图片链接改成 PDF，而是留在 `manual` 候选项  
    - 无法唯一匹配时仍输出可编辑候选项 → `layer=manual`（默认不勾选，绿色区可手改）  
    - 每条 suggestion 含 `rangeStart/End`、`expected`、`expectedHash`、`linePrefix` / `lineSuffix`（整行上下文）  
 2. **UI 列表**：git 风格整行展示，核心变更居中高亮，按容器宽度窗口化前后文  
@@ -92,6 +94,14 @@ Doctor 聚合本地 Vault 的只读完整性检查，并为论文别名、双链
 
 Codex 登录状态不再放在主机运行环境；改由 Agent 卡片第三行展示（见下）。
 
+`node` 或 `npm` 任一不可用时，该分区显示「一键安装 Node.js」按钮（`doctor_install_node`）：Windows 走 `winget install OpenJS.NodeJS.LTS --silent`，macOS 走 `brew install node`（npm 随 Node 一起装，没有独立的 npm 安装包）；进程 PATH 中找不到 winget / Homebrew 时（Linux 无单一包管理器且需要 sudo，通常也落在这里）返回 `no-package-manager`，Toast 提示手动安装并附带「从 nodejs.org 下载」动作。该分区和引导页 Node.js 步骤在 node/npm 缺失时也常驻同一个下载按钮（`NODE_DOWNLOAD_URL`，见 `src/lib/doctor/node-guidance.ts`），不依赖包管理器。
+
+- **后台任务**：安装走与 Agent lifecycle 同一套进度/取消通道——调用方传入 `taskId` 后，Host 通过 `agent-lifecycle:progress` 事件报告进度，取消复用 `agent_lifecycle_cancel`（协作式取消，丢掉安装子进程；Windows 上同时关闭 Job，结束 `cmd` / `npm` 拉起的后代）。前端 `src/lib/doctor/install-node.ts` 把它包成后台任务行（`kind: nodeInstall`），多分钟的下载不再阻塞调用方 UI。
+- **安装后 PATH**：Windows 安装后合并注册表中的机器 + 用户 PATH 重新探测；`core::process::discover` 的 `WIN_ABS_BIN_DIRS` 额外列出 `C:\Program Files\nodejs`，使已运行的应用无需重启即可解析到新装的 npm。
+- **错误恢复**：Agent 安装/更新因 npm 不在 PATH 失败时（Windows `'npm' is not recognized...` / Unix `command not found` / Host 的 `npm is not available on PATH`），Toast 附带同一「安装 Node.js」动作按钮。
+- **Agent 页提醒**：Settings → Agent 打开时复用同一检测（`src/hooks/use-host-node-status.ts`，仅本地 Vault；SSH 远端不检查本机环境）。node/npm 不可用时页首显示紧凑提示，带「一键安装 Node.js」（同一后台任务）与跳转「问题诊断」的入口；安装成功后广播 `agentero:host-node-installed`，已挂载的 Agent 页重新探测并重扫目录，不做轮询。
+- **生命周期守卫**：`src/lib/doctor/node-guidance.ts` 判定动作是否真的经 npm/Node——`adapterDistinct`（Claude / Codex / Pi / ZCode 的独立 ACP 适配器由 npm 安装、由 Node 执行）、`acpBundled`（随包分发的 JS 适配器），以及 npm-only 的生命周期：`dsh` / `minimax-code` / `mimo-code`（所有平台都走 `npm i -g`）与 Windows 上的 `opencode`（无原生安装器）。node/npm 缺失时这些安装/升级不再启动注定失败的静默任务，改弹 Toast 引导先装 Node.js；卸载始终不拦（恢复路径），带平台原生安装器的 Agent（Hermes / Qoder / Qoder CN / Kimi / Grok / Antigravity 等）保持原行为——它们的 npm 兜底失败仍走上面的 npm-missing 恢复。首次 `doctor_check_host` 尚未返回时，生命周期入口会先等待这次探测再判定，避免抢在结果前启动 npm 任务。Unix 安装子进程与 doctor / ACP spawn 使用同一套 PATH 合并顺序（login shell + 进程 + nvm / fnm / Homebrew / 用户 bin），Doctor 能解析到的 npm 在静默安装里同样可见。注意 Codex 自身虽有官方二进制安装器，Agentero 的 Codex 接入依赖 npm 的 `codex-acp` 适配器，因此 Node.js 仍是必需项。
+
 ### Agent ACP 连通性（`doctor_check_agents`）
 
 `agent/doctor_agents.rs` `diagnose_agents`：对 registry 中**每个已注册 Agent**（含 custom）重新执行 ACP initialize 探测（不发 prompt），并分类失败原因。每个诊断额外收集卡片三行字段：
@@ -99,8 +109,8 @@ Codex 登录状态不再放在主机运行环境；改由 Agent 卡片第三行�
 | 行 | 字段 | 来源 |
 |---|---|---|
 | Agent 位置 · 版本 | `agentPath` / `agentVersion` | 模板 `detect_command` 的路径 + `--version` |
-| ACP 位置 · 版本 | `resolvedPath` / `acpVersion` | ACP `command` 的路径 + `--version`（不是协议版本） |
-| 登录状态 | `authStatus` | Codex 走 `codex(-acp) login status`；其它由探测结果推导（成功→已登录，`not-logged-in`→未登录，命令缺失→不适用，其余→未知） |
+| ACP 位置 · 版本 | `resolvedPath` / `acpVersion` | ACP `command` 的路径 + `--version`（不是协议版本）；Claude / Codex 的内置适配器不探测，该行不展示（`resolvedPath` / `acpVersion` 为 null），只剩 Agent 行与登录状态 |
+| 登录状态 | `authStatus` | Codex 先查 `codex-acp cli login status`；未报告已登录时再通过同一适配器的 Codex app-server `account/read` 查询 `requiresOpenaiAuth` 与 `account`：自定义 provider 无须 OpenAI 登录时为不适用，需要登录且无账号时为未登录。app-server 查询失败时，CLI 的“未登录”仅作未知状态；其它 Agent 由 ACP 探测结果推导（成功→已登录，`not-logged-in`→未登录，命令缺失→不适用，其余→未知） |
 
 - 编排：先 `scan_catalog()`（把 PATH 上已装但未落盘的目录 Agent 自动注册，避免必须先打开设置 → Agent）；再 `snapshot()` 一次（内部已刷新命令可用性）；`buffered(3)` 限流并行探测；`!available` 的 Agent 不 spawn，直接按 `last_error` 合成「命令缺失」结果（镜像 `agent_probe` 快路径）；
 - 写回：每个结果 `apply_probe_result` 持久化到 registry，结束后 `emit_registry_changed`，Agent 目录页同步刷新；成功时清除该 Agent 的 warm-gate 熔断，失败**不**记录新熔断（Doctor 是用户主动重试，应无视 120s 冷却）；

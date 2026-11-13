@@ -3,20 +3,20 @@
  * (Settings → Layout pane and the onboarding layout step).
  */
 
+import { errorMessage } from "@/lib/core/notify";
+import { isSecretMask, maskSecret } from "@/lib/core/secret-mask";
 import { isTauri } from "@/lib/core/tauri";
 import {
 	invokeLayoutRemoteProbe,
 	tinyProbeJpegBase64,
 } from "@/lib/pdf/layout/paddle";
 import {
-	isLayoutApiKeyMask,
 	isLayoutBackend,
 	isParserBackend,
 	type LayoutBackend,
 	type LayoutProviderConfig,
 	type LayoutProviderId,
 	type LayoutSettings,
-	maskLayoutApiKey,
 	type ParserBackend,
 } from "@/lib/pdf/layout/settings";
 import type { AppSettings } from "@/lib/settings";
@@ -48,19 +48,24 @@ export function layoutBackendsAfterClearingProvider(
  *
  * An empty `config.apiKey` clears the stored secret (Host merge only preserves
  * when the UI sends a `*` mask) and falls `backend` / `parserBackend` back to
- * `local` when they pointed at this provider, unless the caller overrides them.
+ * `local` when they pointed at this provider, unless the caller overrides them
+ * or `ready` says the card is still usable without a key (a self-hosted
+ * endpoint, see `isProviderReady`).
  */
 export async function persistLayoutProviderConfig(opts: {
 	settings: AppSettings;
 	provider: LayoutProviderId;
 	config: LayoutProviderConfig;
+	/** Card is usable without an apiKey (self-hosted endpoint). */
+	ready?: boolean;
 	/** Also switch the active layout backend (onboarding / explicit override). */
 	backend?: LayoutBackend;
 	/** Also switch the body-parse engine (explicit override). */
 	parserBackend?: ParserBackend;
 }): Promise<{ displayLayout: LayoutSettings }> {
 	const layout = opts.settings.layout;
-	const clearing = opts.config.apiKey.trim().length === 0;
+	const ready = opts.ready ?? opts.config.apiKey.trim().length > 0;
+	const clearing = !ready;
 	const clearedBackends = clearing
 		? layoutBackendsAfterClearingProvider(layout, opts.provider)
 		: null;
@@ -81,9 +86,9 @@ export async function persistLayoutProviderConfig(opts: {
 	} catch {
 		// Still mask the UI below.
 	}
-	const masked = isLayoutApiKeyMask(opts.config.apiKey)
+	const masked = isSecretMask(opts.config.apiKey)
 		? opts.config.apiKey
-		: maskLayoutApiKey(opts.config.apiKey);
+		: maskSecret(opts.config.apiKey);
 	return {
 		displayLayout: {
 			...savedLayout,
@@ -95,25 +100,29 @@ export async function persistLayoutProviderConfig(opts: {
 	};
 }
 
+/** Outcome of one connectivity probe. `error` is the Host's message, if any. */
+export type LayoutProbeOutcome = { ok: boolean; error?: string };
+
 /**
  * One-shot connectivity probe through the Host. A masked key is resolved
- * from stored settings; the base URL always comes from stored settings.
+ * from stored settings; the base URL and the self-hosted flag always come
+ * from stored settings, so persist before probing.
  */
 export async function probeLayoutProvider(
 	provider: LayoutProviderId,
 	apiKey: string,
-): Promise<boolean> {
-	if (!isTauri()) return false;
+): Promise<LayoutProbeOutcome> {
+	if (!isTauri()) return { ok: false };
 	const base64 = tinyProbeJpegBase64();
-	if (!base64) return false;
+	if (!base64) return { ok: false, error: "probe image unavailable" };
 	try {
 		await invokeLayoutRemoteProbe({
 			provider,
 			imageBase64: base64,
 			apiKey: apiKey.trim() || undefined,
 		});
-		return true;
-	} catch {
-		return false;
+		return { ok: true };
+	} catch (err) {
+		return { ok: false, error: errorMessage(err) };
 	}
 }

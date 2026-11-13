@@ -11,6 +11,7 @@ import {
 	Download,
 	FileCode2,
 	FileUp,
+	Languages,
 	LayoutGrid,
 	ListOrdered,
 	Loader2,
@@ -18,6 +19,7 @@ import {
 	Plug,
 	ScanSearch,
 	Search,
+	Settings,
 	X,
 } from "lucide-react";
 import {
@@ -45,11 +47,14 @@ import {
 	cancelBackgroundTask,
 	clearFinishedBackgroundTasks,
 	getActiveBackgroundTasks,
+	getBackgroundTasksSnapshot,
 	isFinishedBackgroundTask,
 	setBackgroundTasksExpanded,
 } from "@/lib/core/background-tasks";
 import { MOTION_MS, prefersReducedMotion } from "@/lib/core/motion";
+import { notifyError } from "@/lib/core/notify";
 import { cn } from "@/lib/core/utils";
+import { openSettingsWindow } from "@/lib/shell/settings-window";
 
 /** Dwell before expanding detail from the ring (avoids flicker on pass-over). */
 const HOVER_EXPAND_MS = 400;
@@ -67,16 +72,41 @@ const KIND_ICONS: Partial<Record<BackgroundTaskKind, BackgroundTaskIcon>> = {
 	parseRefs: "layout",
 	layoutAnalyze: "layout",
 	layoutRun: "layout",
+	layoutTranslate: "translate",
 	connectorSync: "plug",
 	recognizeMetadata: "scan",
 	latexCompile: "fileCode",
 	paperRead: "read",
+	nodeInstall: "download",
 };
 
 function taskIcon(task: BackgroundTask | undefined): BackgroundTaskIcon {
 	if (!task) return "list";
 	return task.icon ?? KIND_ICONS[task.kind] ?? "list";
 }
+
+/**
+ * Failed layout / reference-parse rows can be caused by a missing or invalid
+ * provider key, so they offer a jump to the analysis settings (#656).
+ */
+const LAYOUT_SETTINGS_KINDS: ReadonlySet<BackgroundTaskKind> = new Set([
+	"layoutAnalyze",
+	"layoutRun",
+	"parseRefs",
+	"parseBody",
+]);
+
+/**
+ * JobCenter-driven failures need their own top-right toast: unlike the
+ * in-viewer run (`layoutRun`, which notifies from the viewer hook), headless
+ * `layoutAnalyze` / `parseBody` / `parseRefs` jobs only project a panel row.
+ * Excludes `layoutRun` to avoid a duplicate toast.
+ */
+const JOB_LAYOUT_TOAST_KINDS: ReadonlySet<BackgroundTaskKind> = new Set([
+	"layoutAnalyze",
+	"parseRefs",
+	"parseBody",
+]);
 
 /** Center icon for the primary active task. */
 function iconGlyph(icon: BackgroundTaskIcon) {
@@ -92,6 +122,8 @@ function iconGlyph(icon: BackgroundTaskIcon) {
 			return <Package className={cls} aria-hidden />;
 		case "layout":
 			return <LayoutGrid className={cls} aria-hidden />;
+		case "translate":
+			return <Languages className={cls} aria-hidden />;
 		case "read":
 			return <BookOpen className={cls} aria-hidden />;
 		case "plug":
@@ -144,7 +176,7 @@ function TaskRow({ task }: { task: BackgroundTask }) {
 	}, [task.detail]);
 
 	return (
-		<div className="flex flex-col gap-1 border-b border-border/60 px-2.5 py-2 last:border-b-0">
+		<div className="flex flex-col gap-1 border-b border-border/60 px-3 py-2.5 last:border-b-0">
 			<div className="flex min-w-0 items-start gap-2">
 				<span className="mt-0.5">{statusIcon(task)}</span>
 				<div className="min-w-0 flex-1">
@@ -194,6 +226,44 @@ function TaskRow({ task }: { task: BackgroundTask }) {
 							</Button>
 						</TooltipTrigger>
 						<TooltipContent side="left">{t("tasks.cancel")}</TooltipContent>
+					</Tooltip>
+				) : null}
+				{task.status === "failed" && LAYOUT_SETTINGS_KINDS.has(task.kind) ? (
+					<Tooltip>
+						<TooltipTrigger asChild>
+							<Button
+								type="button"
+								variant="ghost"
+								size="icon-xs"
+								className="size-6 shrink-0"
+								aria-label={t("tasks.openLayoutSettings")}
+								onClick={() => openSettingsWindow("layout")}
+							>
+								<Settings className="size-3.5" />
+							</Button>
+						</TooltipTrigger>
+						<TooltipContent side="left">
+							{t("tasks.openLayoutSettings")}
+						</TooltipContent>
+					</Tooltip>
+				) : null}
+				{task.status === "failed" && task.kind === "layoutTranslate" ? (
+					<Tooltip>
+						<TooltipTrigger asChild>
+							<Button
+								type="button"
+								variant="ghost"
+								size="icon-xs"
+								className="size-6 shrink-0"
+								aria-label={t("tasks.openTranslateSettings")}
+								onClick={() => openSettingsWindow("translate")}
+							>
+								<Settings className="size-3.5" />
+							</Button>
+						</TooltipTrigger>
+						<TooltipContent side="left">
+							{t("tasks.openTranslateSettings")}
+						</TooltipContent>
 					</Tooltip>
 				) : null}
 			</div>
@@ -326,7 +396,7 @@ function ProgressRing({
 		<button
 			type="button"
 			className={cn(
-				"relative flex size-9 items-center justify-center rounded-full bg-background text-foreground shadow-sm ring-1 ring-border transition-[opacity,transform] duration-100 hover:opacity-90 active:scale-[0.96] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1",
+				"relative flex size-9 items-center justify-center rounded-full bg-background text-foreground shadow-raised ring-1 ring-border transition-[opacity,transform] duration-100 hover:opacity-90 active:scale-[0.96] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1",
 				celebrate && "task-ring-success-pulse",
 			)}
 			aria-label={label}
@@ -543,6 +613,37 @@ export function BackgroundTasksPanel({ className }: { className?: string }) {
 		for (const id of ids) seenFailedIdsRef.current.add(id);
 		if (fresh.length === 0) return;
 
+		// Headless layout / parse jobs have no viewer toast of their own — surface
+		// a top-right error with a jump to the analysis settings.
+		const failedTasks = getBackgroundTasksSnapshot().tasks;
+		for (const id of fresh) {
+			const task = failedTasks.find((item) => item.id === id);
+			if (!task) continue;
+			if (JOB_LAYOUT_TOAST_KINDS.has(task.kind)) {
+				notifyError(task.title, {
+					description: task.error?.trim() || undefined,
+					id: `layout-failed-${id}`,
+					action: {
+						label: t("tasks.openLayoutSettings"),
+						onClick: () => openSettingsWindow("layout"),
+					},
+				});
+				continue;
+			}
+			// Background import translation fails without a viewer: surface the
+			// provider / settings error here instead of only the panel row.
+			if (task.kind === "layoutTranslate") {
+				notifyError(task.title, {
+					description: task.error?.trim() || undefined,
+					id: `translate-failed-${id}`,
+					action: {
+						label: t("tasks.openTranslateSettings"),
+						onClick: () => openSettingsWindow("translate"),
+					},
+				});
+			}
+		}
+
 		openDetail();
 		if (errorCollapseTimerRef.current) {
 			clearTimeout(errorCollapseTimerRef.current);
@@ -551,7 +652,7 @@ export function BackgroundTasksPanel({ className }: { className?: string }) {
 			errorCollapseTimerRef.current = null;
 			if (!pointerInsideRef.current) closeDetail();
 		}, ERROR_DETAIL_MS);
-	}, [failedIdsKey, openDetail, closeDetail]);
+	}, [failedIdsKey, openDetail, closeDetail, t]);
 
 	useEffect(() => {
 		return () => {
@@ -617,7 +718,7 @@ export function BackgroundTasksPanel({ className }: { className?: string }) {
 				{detailMounted ? (
 					<div
 						className={cn(
-							"w-full origin-bottom-left overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-lg",
+							"w-full origin-bottom-left overflow-hidden rounded-lg border border-border/70 bg-popover text-popover-foreground shadow-overlay",
 							"transition-[opacity,transform] ease-out",
 							reduceMotion ? "duration-150" : "duration-200",
 							detailVisible
@@ -627,7 +728,7 @@ export function BackgroundTasksPanel({ className }: { className?: string }) {
 									: "scale-95 opacity-0",
 						)}
 					>
-						<div className="flex h-8 items-center gap-1 border-b bg-muted/40 px-2">
+						<div className="flex h-9 items-center gap-1 border-b border-border/60 bg-muted/30 px-2.5">
 							<span className="min-w-0 flex-1 truncate px-1 font-medium text-sm">
 								{t("tasks.title")}
 								{active.length > 0 ? (

@@ -15,19 +15,17 @@ export {
 	tabIdForPath,
 } from "@/lib/workspace/tabs/model";
 export {
+	applyMarkdownConflictChoice,
 	createNotesSplitPane,
+	findNotesPaneForReplacement,
 	isPaperContentTab,
 	paperReadingPlacements,
 	readingPairCloseIds,
-	refreshExcalidrawTab,
 	refreshPdfTab,
-	refreshTextTab,
-	reseedExcalidrawTab,
-	reseedMarkdownTab,
-	reseedNotesTab,
-	reseedTextTab,
+	seedTabs,
 	syncTabSeedsForPath,
 	tabHasNotesSplit,
+	tabIsPaperNoteDocument,
 	tabIsPaperNotes,
 	tabNotesEligible,
 } from "@/lib/workspace/tabs/notes-split";
@@ -48,6 +46,7 @@ export {
 export type {
 	DocTab,
 	OpenPlacement,
+	ReadingColumns,
 	SplitDirection,
 	TabResources,
 } from "@/lib/workspace/tabs/types";

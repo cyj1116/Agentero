@@ -3,7 +3,11 @@
  * Used by Settings → Translate when the default-service Select opens or on Confirm.
  */
 
-import { BUILTIN_PROVIDER_ID } from "@/lib/core/builtin";
+import {
+	BUILTIN_PROVIDER_ID,
+	loadBuiltinProviderStatus,
+} from "@/lib/core/builtin";
+import { hasSecret, isSecretMask } from "@/lib/core/secret-mask";
 import { isTauri } from "@/lib/core/tauri";
 import { invokeTranslateText } from "@/lib/translate/api";
 import type {
@@ -51,31 +55,11 @@ export type ProbeCommercialMtOptions = {
 	signal?: AbortSignal;
 };
 
-/**
- * Host redacts a commercial API key to the same number of `*` characters.
- * Must match `mask_translate_api_key` / `is_translate_api_key_mask` in
- * `src-tauri/.../settings/mod.rs`.
- */
-export function maskTranslateApiKey(apiKey: string): string {
-	const n = [...apiKey.trim()].length;
-	return n === 0 ? "" : "*".repeat(n);
-}
-
-export function isTranslateApiKeyMask(apiKey: string | undefined): boolean {
-	const t = apiKey?.trim() ?? "";
-	return t.length > 0 && /^\*+$/.test(t);
-}
-
-/** True when a non-empty key is stored (plaintext or host `*`-mask). */
-export function hasTranslateApiKey(apiKey: string | undefined): boolean {
-	return Boolean(apiKey?.trim());
-}
-
 export function isCommercialProviderConfigured(
 	id: CommercialTranslateProviderId,
 	config: TranslateProviderConfig | undefined,
 ): boolean {
-	if (!hasTranslateApiKey(config?.apiKey)) return false;
+	if (!hasSecret(config?.apiKey)) return false;
 	if (id === "azure" && !config?.region.trim()) return false;
 	if (id === "openaiCompatible" && !config?.model.trim()) return false;
 	return true;
@@ -102,23 +86,27 @@ async function probeOne(
 }
 
 /**
- * Probe all free MT engines in parallel (not Agent).
+ * Probe all free MT engines in parallel, the built-in included (its probe
+ * fires one real "Hi" translation through the Host-injected credential).
  * Results stream via `onResult`; returned map is the final snapshot.
  *
- * The built-in provider is excluded: probing it would fire a real translation
- * request, and its availability comes from `builtinProviderStatus` instead.
+ * The built-in resolves to `false` without a request when
+ * `builtinProviderStatus` says it is unavailable — probing then would only
+ * re-report the deterministic no-key failure.
  */
 export async function probeFreeMtProviders(
 	opts: ProbeFreeMtOptions = {},
 ): Promise<Record<FreeTranslateProviderId, boolean>> {
+	const builtinReady = (await loadBuiltinProviderStatus())?.available ?? false;
 	const results = await Promise.all(
-		FREE_MT_PROVIDER_IDS.filter((id) => id !== BUILTIN_PROVIDER_ID).map(
-			async (id) => {
-				const ok = await probeOne(id, opts);
-				opts.onResult?.(id, ok);
-				return [id, ok] as const;
-			},
-		),
+		FREE_MT_PROVIDER_IDS.map(async (id) => {
+			const ok =
+				id === BUILTIN_PROVIDER_ID && !builtinReady
+					? false
+					: await probeOne(id, opts);
+			opts.onResult?.(id, ok);
+			return [id, ok] as const;
+		}),
 	);
 	const map = {} as Record<FreeTranslateProviderId, boolean>;
 	for (const [id, ok] of results) {
@@ -142,10 +130,11 @@ export async function probeCommercialMtProvider(
 			targetLang: PROBE_TARGET,
 			provider: id,
 			// Mask → Host resolves from durable settings; real draft key is sent once.
-			apiKey: rawKey && !isTranslateApiKeyMask(rawKey) ? rawKey : undefined,
+			apiKey: rawKey && !isSecretMask(rawKey) ? rawKey : undefined,
 			baseUrl: opts.config.baseUrl,
 			region: opts.config.region,
 			model: opts.config.model,
+			extraRequestBody: opts.config.extraRequestBody,
 			timeoutMs: opts.timeoutMs ?? TRANSLATE_PROBE_TIMEOUT_MS,
 		});
 		return text.trim().length > 0;

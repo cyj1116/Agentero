@@ -53,6 +53,7 @@ pub async fn agent_list_sessions(
     registry: State<'_, AgentRegistry>,
     remote_registry: State<'_, Arc<dyn RemoteAgentHosts>>,
     warm_gate: State<'_, AgentWarmGate>,
+    pool: State<'_, Arc<AgentWarmPool>>,
     agent_id: Option<String>,
     vault_path: Option<String>,
     cursor: Option<String>,
@@ -61,9 +62,39 @@ pub async fn agent_list_sessions(
         registry.inner(),
         remote_registry.inner().as_ref(),
         warm_gate.inner(),
+        pool.inner(),
         agent_id,
         vault_path,
         cursor,
+    )
+    .await
+    {
+        Ok(result) => Ok(ApiResult::ok(result)),
+        Err(e) => Ok(map_err(e)),
+    }
+}
+
+/// Remove one session from history.
+///
+/// Always hides the id from later `session/list` results. Sends ACP
+/// `session/delete` only when the agent advertises that capability.
+#[tauri::command]
+#[specta::specta]
+pub async fn agent_delete_session(
+    registry: State<'_, AgentRegistry>,
+    remote_registry: State<'_, Arc<dyn RemoteAgentHosts>>,
+    pool: State<'_, Arc<AgentWarmPool>>,
+    agent_id: Option<String>,
+    session_id: String,
+    vault_path: Option<String>,
+) -> Result<ApiResult<crate::features::agent::models::AcpDeleteSessionResult>, String> {
+    match service::delete_session(
+        registry.inner(),
+        remote_registry.inner().as_ref(),
+        pool.inner(),
+        agent_id,
+        session_id,
+        vault_path,
     )
     .await
     {
@@ -134,6 +165,29 @@ pub async fn agent_warm(
         }
     };
 
+    // Built-in agents have nothing to spawn; publish their model catalog and
+    // slash commands so the config bar / composer render without a run.
+    if crate::features::agent::models::is_builtin_template(&desc.template) {
+        let events = AgentEventEmitter::new(window.app_handle().clone(), window.label());
+        crate::features::zhihu::emit_warm_events(&events, &desc.id, request.model_id.as_deref());
+        let current = request
+            .model_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or(crate::features::zhihu::ZHIHU_MODEL_ID);
+        return Ok(ApiResult::ok(WarmResult {
+            agent_id: desc.id.clone(),
+            ok: true,
+            models: Some(crate::features::zhihu::models_event(
+                &desc.id, "warm", current,
+            )),
+            usage_used: None,
+            usage_size: None,
+            error: None,
+        }));
+    }
+
     if let Some(error) = warm_gate.blocked(&desc.id) {
         return Ok(ApiResult::ok(WarmResult {
             agent_id: desc.id,
@@ -176,7 +230,9 @@ pub async fn agent_warm(
     .await;
     if result.ok {
         warm_gate.clear(&agent_id);
-    } else {
+    } else if result.error.as_deref()
+        != Some(crate::features::agent::session::warm::WARM_CANCELLED_ERROR)
+    {
         warm_gate.record_failure(
             &agent_id,
             result.error.as_deref().unwrap_or("agent warm failed"),

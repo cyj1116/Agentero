@@ -1,6 +1,6 @@
 ---
 name: paper-reader
-version: 8
+version: 11
 description: >-
   用中文清晰阅读和讲解科研论文。用于提炼核心贡献、深入解释方法、分析实验与局限，并在 NOTES.md 中写入中文讲义式笔记。
 ---
@@ -32,7 +32,27 @@ description: >-
   `[Section 2.3](papers/<id>/<id>.pdf#section=2.3)`,
   `[Figure 1](papers/<id>/<id>.pdf#figure=1)`,
   `[p.11](papers/<id>/<id>.pdf#page=11)`,
-  or notes `[[papers/<id>/NOTES]]` / `[[papers/<id>/NOTES|short title]]`.For web pages use `[domain](https://...)`.
+  or notes `[[papers/<id>/NOTES]]` / `[[papers/<id>/NOTES|short title]]`.
+  If a path segment contains a space, percent-encode it as `%20` (preferred) or wrap the destination in angle brackets. Do not leave a raw space outside `<>`.
+  `[p.4](papers/Quantum%20Error%20Correcting/<id>/<id>.pdf#page=4)`
+  `[p.4](<papers/Quantum Error Correcting/<id>/<id>.pdf#page=4>)`
+  For web pages use `[domain](https://...)`.
+  For a specific claim, query `agentero layout list <paper> --kind paragraph --json`
+  (Windows: `agentero-cli`) and copy a returned `anchor` verbatim, for example
+  `[Section 2.1, paragraph 3](papers/<id>/<id>.pdf#2.1#p3)` or
+  `[[papers/<id>/<id>.pdf#2.1#p3|supporting paragraph]]`.
+  Read `text`, `sectionAnchor`, page and bbox to verify the supporting passage.
+  Paragraphs count directly owned body blocks within each section; subsections
+  have separate counters. Never guess an ordinal from candidate/display order.
+  If analysis or a unique anchor is unavailable, report the limit and use a
+  verified page/section reference instead; do not invent a paragraph anchor.
+  Numbered `#figure=` / `#table=` / `#formula=` / `#algorithm=` anchors follow
+  the same rule: verify they exist in the layout
+  (`agentero layout list <paper> --kind ... --json`), never guess a number, and
+  fall back to a verified page/section when the anchor is absent.
+  Shorthand `#2` / `#2.1` / `#2.1#p3` is only for PDF targets; Markdown
+  `#heading`, legacy `#section=` / `#page=`, figures and annotations keep their semantics.
+
 
 ## Workflow (CoT)：按照以下流程进行信息提取
 

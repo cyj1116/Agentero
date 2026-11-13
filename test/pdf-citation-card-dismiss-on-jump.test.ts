@@ -121,7 +121,7 @@ function createHarness(navigateOutcome: { outcome: string; uri?: string }) {
 		react,
 		"@/components/viewer/pdf/coords": {
 			pageElByIndex: () => ({}),
-			rectRightScreen: () => ({ x: 120, y: 240 }),
+			rectBottomCenterScreen: () => ({ x: 120, y: 240 }),
 		},
 		"@/components/viewer/pdf/floating-hover": {
 			EPHEMERAL_PREVIEW_HIDE_MS: 400,

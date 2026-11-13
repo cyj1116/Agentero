@@ -29,15 +29,28 @@ use tauri::http::{header, Response, StatusCode};
 /// credential-bearing headers: the proxy carries no login state).
 use crate::features::paper::discovery::proxy::looks_like_document;
 
-/// Marker every bridge → app message carries.
-pub const BRIDGE_SOURCE: &str = "agentero-web";
-
 /// Selection / shortcut / navigation bridge injected into proxied documents.
 ///
-/// Vanilla ES5 in an IIFE with no namespace leakage (the 广场 NAV_BRIDGE
-/// pattern). Talks to the app window via `postMessage`; the app validates
-/// `event.origin` against the proxy origin.
-const WEB_BRIDGE: &str = r##"<script>
+/// Shared selection IIFE with no namespace leakage. The app validates both
+/// `event.origin` and the sending iframe before consuming its messages.
+pub(crate) const SELECTION_BRIDGE: &str = concat!(
+    "<script>",
+    include_str!("../../../../src/lib/web-view/selection-bridge.js"),
+    "</script>"
+);
+
+pub(crate) fn inject_selection_bridge(html: &str) -> String {
+    match html.to_ascii_lowercase().find("</head>") {
+        Some(index) => format!("{}{}{}", &html[..index], SELECTION_BRIDGE, &html[index..]),
+        None => format!("{SELECTION_BRIDGE}{html}"),
+    }
+}
+
+const WEB_BRIDGE: &str = concat!(
+    "<script>",
+    include_str!("../../../../src/lib/web-view/selection-bridge.js"),
+    "</script>",
+    r##"<script>
 (function () {
   try {
     // Only the top-level proxied document talks to the app. A nested frame on
@@ -56,74 +69,6 @@ const WEB_BRIDGE: &str = r##"<script>
     try {
       host = decodeURIComponent((location.pathname.match(/^\/([^/]+)/) || [])[1] || "") || "";
     } catch (e) {}
-
-    // ---- selection → app toolbar -----------------------------------------
-    var MAX_SELECTION_CHARS = 4000;
-    var sendSelection = function () {
-      var text = "";
-      var rect = null;
-      var sel = window.getSelection();
-      if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
-        text = (sel.toString() || "")
-          .replace(/\s+/g, " ")
-          .trim()
-          .slice(0, MAX_SELECTION_CHARS);
-        if (text) {
-          var r = sel.getRangeAt(0).getBoundingClientRect();
-          if (r.width !== 0 || r.height !== 0) {
-            rect = { x: r.left, y: r.top, width: r.width, height: r.height };
-          }
-        }
-      }
-      if (text && rect) {
-        // Raw copy inside the frame: the app's clipboard write can be refused
-        // while focus sits in this cross-origin frame.
-        try { document.execCommand("copy"); } catch (e) {}
-      }
-      post({ type: "selection", text: text, rect: rect, url: location.href });
-    };
-    var scheduleSelection = function () {
-      // Let the browser finish updating the selection first.
-      requestAnimationFrame(function () { setTimeout(sendSelection, 0); });
-    };
-    document.addEventListener("mouseup", scheduleSelection);
-    document.addEventListener("keyup", function (event) {
-      var key = event.key || "";
-      if (key === "Shift" || key.indexOf("Arrow") === 0) scheduleSelection();
-    });
-
-    // The app hides its toolbar while the page scrolls (plaza parity).
-    var scrollPending = false;
-    window.addEventListener("scroll", function () {
-      if (scrollPending) return;
-      scrollPending = true;
-      setTimeout(function () {
-        scrollPending = false;
-        post({ type: "scroll" });
-      }, 150);
-    }, true);
-
-    // ---- shortcuts → app handlers -----------------------------------------
-    // Keyboard events land in this frame, never in the app window; ⌘K / ⌘L
-    // must be carried over explicitly.
-    var isEditable = function (el) {
-      if (!el || !el.nodeName) return false;
-      var name = el.nodeName.toLowerCase();
-      return (
-        name === "input" ||
-        name === "textarea" ||
-        name === "select" ||
-        el.isContentEditable === true
-      );
-    };
-    document.addEventListener("keydown", function (event) {
-      if (event.altKey || !(event.metaKey || event.ctrlKey)) return;
-      if (isEditable(event.target)) return;
-      var key = (event.key || "").toLowerCase();
-      if (key !== "k" && key !== "l") return;
-      event.preventDefault();
-      post({ type: "shortcut", id: key === "k" ? "quickChat" : "addToChat" });
-    }, true);
 
     // ---- navigation policy --------------------------------------------------
     // Same-site navigations stay inside the proxy so the bridge survives;
@@ -176,20 +121,10 @@ const WEB_BRIDGE: &str = r##"<script>
       });
     }
 
-    // ---- app → frame --------------------------------------------------------
-    window.addEventListener("message", function (event) {
-      var data = event.data;
-      if (!data || data.source !== "agentero-web-host") return;
-      if (data.type === "clearSelection") {
-        var sel = window.getSelection();
-        if (sel) sel.removeAllRanges();
-      } else if (data.type === "copySelection") {
-        try { document.execCommand("copy"); } catch (e) {}
-      }
-    });
   } catch (e) {}
 })();
-</script>"##;
+</script>"##
+);
 
 /// Where a proxy request goes upstream.
 struct Target {
@@ -607,14 +542,24 @@ mod tests {
         assert!(WEB_BRIDGE.contains("MAX_SELECTION_CHARS = 4000"));
     }
 
-    /// Focus sits in the frame, so ⌘K / ⌘L must be forwarded to the app.
+    /// Frame bindings come from the app; forwarded keys are resolved there.
     #[test]
     fn bridge_forwards_shortcuts() {
         assert!(WEB_BRIDGE.contains("\"quickChat\""));
-        assert!(WEB_BRIDGE.contains("\"addToChat\""));
+        assert!(WEB_BRIDGE.contains("\"addSelectionToChat\""));
+        assert!(WEB_BRIDGE.contains("\"toggleChat\""));
+        assert!(WEB_BRIDGE.contains("data.type === \"shortcuts\""));
         // Editable targets keep their keystrokes (site search boxes, comment
         // forms).
         assert!(WEB_BRIDGE.contains("isEditable"));
+    }
+
+    /// Escape cannot cross the frame boundary; every proxied site must relay it
+    /// so the app can close its selection chrome.
+    #[test]
+    fn bridge_relays_escape() {
+        assert!(WEB_BRIDGE.contains("type: \"escape\""));
+        assert!(WEB_BRIDGE.contains("event.key === \"Escape\""));
     }
 
     /// Same-site navigations stay proxied; foreign ones are handed to the app.
@@ -631,6 +576,5 @@ mod tests {
     fn bridge_honors_host_messages() {
         assert!(WEB_BRIDGE.contains("agentero-web-host"));
         assert!(WEB_BRIDGE.contains("clearSelection"));
-        assert!(WEB_BRIDGE.contains("copySelection"));
     }
 }

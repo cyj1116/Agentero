@@ -170,11 +170,23 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+enum McpCmd {
+    /// Listen on loopback until Ctrl-C or SIGTERM. Requires --vault or AGENTERO_VAULT.
+    Serve(commands::mcp::ServeArgs),
+}
+
+#[derive(Debug, Subcommand)]
 enum Commands {
     /// Vault lifecycle: create, resolve, inspect.
     Vault {
         #[command(subcommand)]
         cmd: commands::vault::VaultCmd,
+    },
+    /// Cloud sync (S3/R2, WebDAV): configure, run, inspect — same engine as
+    /// the desktop app, no GUI required.
+    Sync {
+        #[command(subcommand)]
+        cmd: commands::sync::SyncCmd,
     },
     /// Introspect curated machine ops (agent schema). Omit id for the full index.
     Describe {
@@ -190,6 +202,17 @@ enum Commands {
     Import {
         #[command(subcommand)]
         cmd: commands::import::ImportCmd,
+    },
+    /// Discover/rank new papers (query-first, vault-free).
+    Discover {
+        #[command(subcommand)]
+        cmd: commands::discover::DiscoverCmd,
+    },
+    /// Plaza feed subscriptions (RSS / Atom / JSON Feed): subscribe, refresh,
+    /// read items — same store as the desktop app, vault-free.
+    Feed {
+        #[command(subcommand)]
+        cmd: commands::feed::FeedCmd,
     },
     /// Export catalog data.
     Export {
@@ -210,6 +233,21 @@ enum Commands {
     Mark {
         #[command(subcommand)]
         cmd: commands::mark::MarkCmd,
+    },
+    /// Streamable HTTP MCP server for external agents (loopback, no GUI).
+    Mcp {
+        #[command(subcommand)]
+        cmd: McpCmd,
+    },
+    /// Workspace / window management in the desktop App (open/focus/close).
+    Ui {
+        #[command(subcommand)]
+        cmd: commands::ui::UiCmd,
+    },
+    /// Research table rows (`*.table.json`).
+    Table {
+        #[command(subcommand)]
+        cmd: commands::table::TableCmd,
     },
     /// Translate text with free machine translation (no API key).
     Translate {
@@ -250,6 +288,12 @@ fn main() -> StdExitCode {
         return StdExitCode::from(status as u8);
     }
     init_logging();
+
+    // Headless downloads honor the EZProxy/WebVPN gateway + session cookie the
+    // user configured in the desktop app's shared `settings.json` (the CLI has
+    // no settings store of its own).
+    agentero_core::features::paper::import::institution_proxy::load_institution_proxy_from_settings(
+    );
 
     // `agentero <dir>` → `agentero open <dir>` before clap (subcommand names win).
     let argv = args_rewrite::rewrite_path_shorthand(std::env::args_os().collect());
@@ -358,13 +402,19 @@ fn command_label(cmd: &Commands) -> &'static str {
             commands::vault::VaultCmd::Create { .. } => "cli.vault.create",
             commands::vault::VaultCmd::List => "cli.vault.list",
         },
+        Commands::Sync { .. } => "cli.sync",
         Commands::Describe { .. } => "cli.describe",
         Commands::Paper { .. } => "cli.paper",
         Commands::Import { .. } => "cli.import",
+        Commands::Discover { .. } => "cli.discover",
+        Commands::Feed { .. } => "cli.feed",
         Commands::Export { .. } => "cli.export",
         Commands::Doctor { .. } => "cli.doctor",
         Commands::Layout { .. } => "cli.layout",
         Commands::Mark { .. } => "cli.mark",
+        Commands::Mcp { .. } => "cli.mcp",
+        Commands::Ui { .. } => "cli.ui",
+        Commands::Table { .. } => "cli.table",
         Commands::Translate { .. } => "cli.translate",
         Commands::Open { .. } => "cli.open",
     }
@@ -390,13 +440,21 @@ fn resolve_format(cli: &Cli) -> OutputFormat {
 async fn run(command: Commands, globals: &GlobalOpts) -> Result<serde_json::Value, CliError> {
     match command {
         Commands::Vault { cmd } => commands::vault::run(cmd, globals).await,
+        Commands::Sync { cmd } => commands::sync::run(cmd, globals).await,
         Commands::Describe { op } => commands::describe::run(op.as_deref(), globals),
         Commands::Paper { cmd } => commands::paper::run(cmd, globals).await,
         Commands::Import { cmd } => commands::import::run(cmd, globals).await,
+        Commands::Discover { cmd } => commands::discover::run(cmd, globals).await,
+        Commands::Feed { cmd } => commands::feed::run(cmd, globals).await,
         Commands::Export { cmd } => commands::export::run(cmd, globals).await,
         Commands::Doctor { cmd } => commands::doctor::run(cmd, globals),
         Commands::Layout { cmd } => commands::layout::run(cmd, globals),
         Commands::Mark { cmd } => commands::mark::run(cmd, globals).await,
+        Commands::Mcp { cmd } => match cmd {
+            McpCmd::Serve(args) => commands::mcp::serve(args, globals).await,
+        },
+        Commands::Ui { cmd } => commands::ui::run(cmd, globals),
+        Commands::Table { cmd } => commands::table::run(cmd, globals),
         Commands::Translate {
             text,
             to,
@@ -404,5 +462,75 @@ async fn run(command: Commands, globals: &GlobalOpts) -> Result<serde_json::Valu
             provider,
         } => commands::translate::run(&text, &to, &from, provider.as_deref(), globals).await,
         Commands::Open { path } => commands::open::run(&path, globals),
+    }
+}
+
+#[cfg(test)]
+mod ops_contract {
+    use super::Cli;
+    use agentero_core::ops::{self, OpStability, OpSurface};
+    use clap::CommandFactory;
+
+    /// Walks the clap tree from `Cli` in this file (`Commands`) and the
+    /// subcommand enums in `cli/src/commands/`.
+    fn clap_has_path(cmd: &clap::Command, segments: &[&str]) -> bool {
+        let Some((head, rest)) = segments.split_first() else {
+            return true;
+        };
+        match cmd.get_subcommands().find(|sub| sub.get_name() == *head) {
+            Some(sub) => clap_has_path(sub, rest),
+            None => false,
+        }
+    }
+
+    #[test]
+    fn stable_ops_cli_paths_match_registered_commands() {
+        let root = Cli::command();
+        assert_eq!(root.get_name(), "agentero");
+        for op in ops::all() {
+            if op.stability != OpStability::Stable {
+                continue;
+            }
+            let Some(cli) = op.cli.as_deref() else {
+                assert!(
+                    !op.surfaces.contains(&OpSurface::Cli),
+                    "{} is marked CLI but has no command string",
+                    op.id
+                );
+                continue;
+            };
+            let segments: Vec<&str> = cli.split_whitespace().collect();
+            assert_eq!(
+                segments.first().copied(),
+                Some("agentero"),
+                "{} cli {cli}",
+                op.id
+            );
+            assert!(
+                clap_has_path(&root, &segments[1..]),
+                "{} cli path `{cli}` is not registered in cli/src/main.rs Commands",
+                op.id
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_serve_is_registered() {
+        let root = Cli::command();
+        assert!(
+            clap_has_path(&root, &["mcp", "serve"]),
+            "agentero mcp serve is not registered"
+        );
+    }
+
+    #[test]
+    fn feed_commands_are_registered() {
+        let root = Cli::command();
+        for sub in ["list", "add", "remove", "refresh", "items", "read"] {
+            assert!(
+                clap_has_path(&root, &["feed", sub]),
+                "agentero feed {sub} is not registered"
+            );
+        }
     }
 }

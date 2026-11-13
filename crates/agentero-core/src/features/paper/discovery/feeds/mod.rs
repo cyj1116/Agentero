@@ -2,7 +2,7 @@
 //!
 //! Stored in `$XDG_DATA_HOME/agentero/feeds.sqlite`. Does not write catalog or Vault.
 //!
-//! @see docs/development/plaza-feeds.md
+//! @see docs/backend/api.md §3.10.4
 
 mod body;
 pub mod parse;
@@ -58,6 +58,7 @@ pub struct FeedItem {
     pub content_html: Option<String>,
     pub paper_url: Option<String>,
     pub imported_at: Option<String>,
+    pub read_at: Option<String>,
     pub body_markdown: Option<String>,
 }
 
@@ -459,7 +460,9 @@ fn load_refresh_targets(
         stmt.query_map([], map_sub_row)?
             .collect::<Result<Vec<_>, _>>()?
     };
-    if stale_only && id.is_none() {
+    // An explicit stale refresh wins even with a single id: `--id X --stale`
+    // must keep the 15-minute guard instead of force-fetching X.
+    if stale_only {
         Ok(mapped
             .into_iter()
             .filter(|s| is_stale(&s.last_fetched_at))
@@ -490,7 +493,7 @@ fn query_items(
 ) -> Result<Vec<FeedItem>, AppError> {
     let mut sql = String::from(
         "SELECT i.id, i.subscription_id, s.title, i.title, i.url, i.published_at,
-                i.summary_text, i.content_html, i.paper_url, i.imported_at, i.body_markdown
+                i.summary_text, i.content_html, i.paper_url, i.imported_at, i.body_markdown, i.read_at
          FROM items i
          JOIN subscriptions s ON s.id = i.subscription_id
          WHERE 1=1",
@@ -501,6 +504,7 @@ fn query_items(
         binds.push(sid.to_string().into());
     }
     match filter {
+        "unread" => sql.push_str(" AND i.read_at IS NULL"),
         "paper" => sql.push_str(" AND i.paper_url IS NOT NULL AND i.paper_url != ''"),
         "other" => sql.push_str(" AND (i.paper_url IS NULL OR i.paper_url = '')"),
         _ => {}
@@ -570,6 +574,22 @@ pub fn mark_imported(id: &str) -> Result<FeedItem, AppError> {
     get_item(&conn, id)
 }
 
+pub fn set_read(id: &str, read: bool) -> Result<FeedItem, AppError> {
+    let conn = ensure_feeds()?;
+    set_read_at(&conn, id, read)
+}
+
+fn set_read_at(conn: &Connection, id: &str, read: bool) -> Result<FeedItem, AppError> {
+    let n = conn.execute(
+        "UPDATE items SET read_at = CASE WHEN ?1 THEN COALESCE(read_at, ?2) ELSE NULL END WHERE id = ?3",
+        params![read, now_rfc3339(), id],
+    )?;
+    if n == 0 {
+        return Err(AppError::message("feeds.not_found"));
+    }
+    get_item(conn, id)
+}
+
 fn map_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedItem> {
     Ok(FeedItem {
         id: row.get(0)?,
@@ -583,13 +603,14 @@ fn map_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedItem> {
         paper_url: row.get(8)?,
         imported_at: row.get(9)?,
         body_markdown: row.get(10)?,
+        read_at: row.get(11)?,
     })
 }
 
 fn get_item(conn: &Connection, id: &str) -> Result<FeedItem, AppError> {
     conn.query_row(
         "SELECT i.id, i.subscription_id, s.title, i.title, i.url, i.published_at,
-                i.summary_text, i.content_html, i.paper_url, i.imported_at, i.body_markdown
+                i.summary_text, i.content_html, i.paper_url, i.imported_at, i.body_markdown, i.read_at
          FROM items i JOIN subscriptions s ON s.id = i.subscription_id
          WHERE i.id = ?1",
         [id],
@@ -912,6 +933,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_state_survives_refresh_and_filters_before_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = schema::ensure_feeds_at(&dir.path().join("feeds.sqlite")).unwrap();
+        let sub = insert_subscription(&conn, "https://example.com/feed", "Example").unwrap();
+        let entries = [
+            test_item("a", "https://example.com/a", None),
+            test_item("b", "https://example.com/b", None),
+        ];
+        upsert_items(&conn, &sub, &entries).unwrap();
+        let rows = query_items(&conn, None, "all", 100, None, None).unwrap();
+        assert!(rows.iter().all(|row| row.read_at.is_none()));
+        let read = set_read_at(&conn, &rows[0].id, true).unwrap();
+        assert!(read.read_at.is_some());
+        assert_eq!(
+            set_read_at(&conn, &rows[0].id, true).unwrap().read_at,
+            read.read_at
+        );
+        upsert_items(&conn, &sub, &entries).unwrap();
+        assert_eq!(get_item(&conn, &rows[0].id).unwrap().read_at, read.read_at);
+        let unread = query_items(&conn, Some(&sub), "unread", 1, None, None).unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].id, rows[1].id);
+        set_read_at(&conn, &rows[0].id, false).unwrap();
+        assert_eq!(
+            query_items(&conn, None, "unread", 100, None, None)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(set_read_at(&conn, "missing", true).is_err());
+    }
+
     /// A feed refresh must not wipe a paper_url that was backfilled from the
     /// article page when the feed itself still provides none.
     #[test]
@@ -1021,6 +1075,31 @@ mod tests {
             Some("https://arxiv.org/abs/1706.03762")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_filter_applies_to_single_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = schema::ensure_feeds_at(&dir.path().join("feeds.sqlite")).unwrap();
+        let fresh = insert_subscription(&conn, "https://example.com/fresh.xml", "Fresh").unwrap();
+        let old = insert_subscription(&conn, "https://example.com/old.xml", "Old").unwrap();
+        conn.execute(
+            "UPDATE subscriptions SET last_fetched_at = ?1 WHERE id = ?2",
+            params![now_rfc3339(), fresh],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE subscriptions SET last_fetched_at = ?1 WHERE id = ?2",
+            params!["2020-01-01T00:00:00.000Z", old],
+        )
+        .unwrap();
+
+        assert!(load_refresh_targets(&conn, Some(&fresh), true)
+            .unwrap()
+            .is_empty());
+        let targets = load_refresh_targets(&conn, Some(&old), true).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, old);
     }
 
     #[test]

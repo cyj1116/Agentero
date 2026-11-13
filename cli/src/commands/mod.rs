@@ -1,10 +1,16 @@
 pub mod describe;
+pub mod discover;
 pub mod doctor;
 pub mod export;
+pub mod feed;
 pub mod import;
 pub mod layout;
 pub mod mark;
+pub mod mcp;
 pub mod open;
 pub mod paper;
+pub mod sync;
+pub mod table;
 pub mod translate;
+pub mod ui;
 pub mod vault;

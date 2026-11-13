@@ -66,14 +66,33 @@ impl SyncService {
     /// vault so a slow network can hold up quit for at most a few seconds.
     /// Shares the same lease as manual/automatic passes. Skip a busy vault
     /// rather than race its local base/state files during shutdown.
-    pub fn flush_on_exit(&self) {
-        for (key, cfg) in config::list_all() {
+    pub fn flush_on_exit(&self, app: &AppHandle) {
+        let token = tauri::async_runtime::block_on(super::commands::session_bearer(app));
+        for (key, mut cfg) in config::list_all() {
             if !cfg.auto_sync {
+                continue;
+            }
+            // Git commits/pushes can exceed the 5s exit budget; interrupting
+            // one may leave index.lock behind. The next launch or interval
+            // picks the work up instead.
+            if cfg.backend == config::SyncBackendKind::Git {
+                log::info!(
+                    target: "agentero::sync",
+                    "exit flush {key}: git backend skipped (next pass will push)"
+                );
                 continue;
             }
             let dir = PathBuf::from(&key);
             if !dir.is_dir() {
                 continue;
+            }
+            if cfg.backend == config::SyncBackendKind::Agentero {
+                if cfg.agentero_api.trim().is_empty() {
+                    cfg.agentero_api = super::commands::account_api_origin();
+                }
+                if let Some(token) = token.clone() {
+                    cfg.agentero_token = token;
+                }
             }
             let Some(_lease) = self.try_begin(&key) else {
                 log::info!(target: "agentero::sync", "exit flush {key}: sync already running; skipped");
@@ -82,7 +101,7 @@ impl SyncService {
             let result = tauri::async_runtime::block_on(async {
                 tokio::time::timeout(
                     Duration::from_secs(EXIT_FLUSH_TIMEOUT_SECS),
-                    super::engine::sync_vault(&dir, &cfg, &|_, _, _| {}),
+                    super::engine::sync_vault_locked(&dir, &cfg, &|_, _, _| {}),
                 )
                 .await
             });

@@ -8,6 +8,7 @@ use crate::app::command_util::try_vault;
 use crate::core::blocking::run_blocking;
 use crate::core::error::{map_err, ApiResult, AppError};
 use crate::core::fs::{ensure_vault_dir, resolve_paper_dir};
+use crate::core::log_util::OpTimer;
 use crate::features::paper::catalog::papers::{self, PaperRecord};
 use crate::features::paper::catalog::{probe_paper_caps, CapsCache};
 use crate::features::pdf::marks::activity as reading_activity;
@@ -15,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::State;
+
+use super::service;
 
 #[derive(Debug, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -34,26 +37,7 @@ pub struct PaperGetArgs {
 pub async fn paper_get(args: PaperGetArgs) -> ApiResult<PaperRecord> {
     run_blocking(move || {
         let vault = try_vault!(&args.vault_path);
-
-        let result = if let Some(path) = args
-            .path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let path = path.trim_matches('/').replace('\\', "/");
-            papers::get_by_path(&vault, &path)
-        } else if let Some(id) = args.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            papers::get_by_id(&vault, id)
-        } else {
-            return map_err(AppError::message("path or id is required"));
-        };
-
-        match result {
-            Ok(Some(row)) => ApiResult::ok(row),
-            Ok(None) => map_err(AppError::message("paper not found in catalog")),
-            Err(e) => map_err(e),
-        }
+        service::get_paper(&vault, args.path.as_deref(), args.id.as_deref())
     })
     .await
 }
@@ -104,6 +88,9 @@ fn paper_open_bundle_inner(
 ) -> Result<PaperOpenBundle, AppError> {
     ensure_vault_dir(vault)?;
     let (paper_dir, path_rel) = resolve_paper_dir(vault, path_raw)?;
+    // Existing papers are not scanned at import time. Fill once on open so
+    // Paper Info can show the repository from this bundle.
+    agentero_core::features::paper::import::code_repo::fill_code_repo_on_open(vault, &path_rel);
     let paper = papers::get_by_path(vault, &path_rel)?
         .ok_or_else(|| AppError::message("paper not found in catalog"))?;
     let caps = cache
@@ -153,18 +140,29 @@ pub async fn paper_list(
 ) -> Result<ApiResult<Vec<PaperListRow>>, String> {
     let cache = cache.inner().clone();
     Ok(run_blocking(move || {
-        let vault = try_vault!(&args.vault_path);
+        let op = OpTimer::start("paper_list");
+        let vault = try_vault!(&args.vault_path, op);
+        // Projection intentionally differs from `remote_paper_list` (raw
+        // `PaperRecord`, no has_pdf probe, no id dedupe) — known drift kept
+        // for wire stability; see `docs/backend/remote.md`.
         match papers::list_all_unique_by_id(&vault) {
-            Ok(rows) => ApiResult::ok(
-                rows.into_iter()
+            Ok(rows) => {
+                let out: Vec<_> = rows
+                    .into_iter()
                     .map(|paper| {
                         let has_pdf =
                             !paper.path.is_empty() && cache.caps_for(&vault, &paper.path).has_pdf();
                         PaperListRow { paper, has_pdf }
                     })
-                    .collect(),
-            ),
-            Err(e) => map_err(e),
+                    .collect();
+                let count = out.len();
+                op.finish_ok_extra(format!("count={count}"));
+                ApiResult::ok(out)
+            }
+            Err(e) => {
+                op.finish_err(&e);
+                map_err(e)
+            }
         }
     })
     .await)
@@ -185,14 +183,7 @@ pub struct PaperSetIsReadArgs {
 pub async fn paper_set_is_read(args: PaperSetIsReadArgs) -> ApiResult<PaperRecord> {
     run_blocking(move || {
         let vault = try_vault!(&args.vault_path);
-        let path = args.path.trim().trim_matches('/').replace('\\', "/");
-        if path.is_empty() {
-            return map_err(AppError::message("path is required"));
-        }
-        match papers::set_is_read(&vault, &path, args.is_read) {
-            Ok(row) => ApiResult::ok(row),
-            Err(e) => map_err(e),
-        }
+        service::set_is_read(&vault, &args.path, args.is_read)
     })
     .await
 }
@@ -213,11 +204,9 @@ pub struct PaperUpdateMetaArgs {
 pub async fn paper_update_meta(args: PaperUpdateMetaArgs) -> ApiResult<PaperRecord> {
     run_blocking(move || {
         let vault = try_vault!(&args.vault_path);
-        let path = args.path.trim().trim_matches('/').replace('\\', "/");
-        if path.is_empty() {
-            return map_err(AppError::message("path is required"));
-        }
-        match papers::update_meta(&vault, &path, &args.patch) {
+        match service::normalize_paper_path(&args.path)
+            .and_then(|path| papers::update_meta(&vault, &path, &args.patch))
+        {
             Ok(row) => ApiResult::ok(row),
             Err(e) => map_err(e),
         }
@@ -265,6 +254,8 @@ mod open_bundle_tests {
             pdf_url: None,
             html_url: None,
             source_url: None,
+            code_repo: None,
+            openreview_url: None,
             body_source: None,
             body_quality: None,
             bibtex_key: None,
@@ -277,6 +268,7 @@ mod open_bundle_tests {
             is_read: false,
             zotero_item_id: None,
             zotero_last_synced: None,
+            custom_props: Default::default(),
             added_at: "t".into(),
             updated_at: "t".into(),
         }
@@ -345,16 +337,38 @@ pub struct PaperSetTagsArgs {
 pub async fn paper_set_tags(args: PaperSetTagsArgs) -> ApiResult<PaperRecord> {
     run_blocking(move || {
         let vault = try_vault!(&args.vault_path);
-        let path = args.path.trim().trim_matches('/').replace('\\', "/");
-        if path.is_empty() {
-            return map_err(AppError::message("path is required"));
-        }
-        match papers::set_tags(&vault, &path, &args.tags) {
-            Ok(row) => ApiResult::ok(row),
-            Err(e) => map_err(e),
-        }
+        service::set_tags(&vault, &args.path, &args.tags)
     })
     .await
+}
+
+#[derive(Debug, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperSyncPublicationArgs {
+    pub vault_path: String,
+    /// Vault-relative paper folder paths to process.
+    pub paths: Vec<String>,
+}
+
+/// Single Host-side publication sync: refresh the `#submitted:` projection,
+/// remove retired `#venue:` tags, and refresh EasyScholar metrics when a key is
+/// configured. The renderer never writes these system tags itself.
+#[tauri::command]
+#[specta::specta]
+pub async fn paper_sync_publication(
+    app: tauri::AppHandle,
+    args: PaperSyncPublicationArgs,
+) -> ApiResult<crate::features::paper::venue::VenueSyncReport> {
+    use tauri::Manager;
+    let vault = try_vault!(&args.vault_path);
+    let key = app
+        .state::<crate::features::system::settings::AppSettingsStore>()
+        .easy_scholar_key();
+    match crate::features::paper::venue::sync_publication(&vault, &args.paths, key.as_deref()).await
+    {
+        Ok(report) => ApiResult::ok(report),
+        Err(e) => map_err(e),
+    }
 }
 
 #[derive(Debug, Deserialize, specta::Type)]
@@ -388,6 +402,66 @@ pub async fn paper_rescan(args: PaperRescanArgs) -> ApiResult<PaperRescanResult>
             Err(e) => {
                 op.finish_err(&e);
                 map_err(e)
+            }
+        }
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperEnsureRowsArgs {
+    pub vault_path: String,
+    /// Absolute or vault-relative paths under `papers/`.
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperEnsureRowsResult {
+    /// Rows inserted. Existing rows are left as they are.
+    pub count: usize,
+    /// True when a path could not be pinned to one paper folder and the
+    /// command rebuilt the catalog from `papers/`.
+    pub rescanned: bool,
+}
+
+/// Ensure catalog rows for watcher paths. Falls back to a full rescan only
+/// when a path under `papers/` is not one paper folder.
+#[tauri::command]
+#[specta::specta]
+pub async fn paper_ensure_rows(args: PaperEnsureRowsArgs) -> ApiResult<PaperEnsureRowsResult> {
+    use crate::features::paper::catalog::papers::PaperRowsTouch;
+
+    run_blocking(move || {
+        use crate::core::log_util::OpTimer;
+
+        let started = std::time::Instant::now();
+        let op = OpTimer::start("paper_ensure");
+        let vault = try_vault!(&args.vault_path, op);
+        match papers::ensure_rows_for_paths(&vault, &args.paths) {
+            Ok(PaperRowsTouch::Ensured { count }) => {
+                op.finish_ok_extra(format!("count={count}"));
+                ApiResult::ok(PaperEnsureRowsResult {
+                    count,
+                    rescanned: false,
+                })
+            }
+            Ok(PaperRowsTouch::Rescanned { count }) => {
+                let ms = started.elapsed().as_millis();
+                op.finish_ok_extra(format!("fallback=rescan count={count}"));
+                log::info!(
+                    target: "agentero::op",
+                    "op end paper_rescan ok=true duration_ms={ms} fallback=ensure count={count}"
+                );
+                ApiResult::ok(PaperEnsureRowsResult {
+                    count,
+                    rescanned: true,
+                })
+            }
+            Err(error) => {
+                op.finish_err(&error);
+                map_err(error)
             }
         }
     })
@@ -477,6 +551,36 @@ pub async fn paper_set_page_counts(args: PaperSetPageCountsArgs) -> ApiResult<()
 }
 
 pub use super::service::{PaperMoveArgs, PaperMoveResult};
+pub use agentero_core::features::paper::catalog::copy_paper::PaperCopyResult;
+
+#[derive(Debug, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperCopyArgs {
+    pub vault_path: String,
+    /// Vault-relative item to duplicate (paper or org folder under `papers/`).
+    pub from_rel: String,
+    /// Vault-relative destination parent (`papers` or under `papers/`).
+    pub dest_parent_rel: String,
+}
+
+/// Duplicate a folder into another `papers/` folder (the library's batch
+/// "copy to folder"). Never overwrites; the source keeps its links and row.
+#[tauri::command]
+#[specta::specta]
+pub async fn paper_copy(args: PaperCopyArgs) -> ApiResult<PaperCopyResult> {
+    run_blocking(move || {
+        let vault = try_vault!(&args.vault_path);
+        match agentero_core::features::paper::catalog::copy_paper::copy_paper_under(
+            &vault,
+            &args.from_rel,
+            &args.dest_parent_rel,
+        ) {
+            Ok(result) => ApiResult::ok(result),
+            Err(error) => map_err(error),
+        }
+    })
+    .await
+}
 
 /// Move an item into another `papers/` folder on disk and rewrite matching
 /// catalog path prefixes. Never overwrites an existing target.
@@ -527,6 +631,204 @@ pub async fn paper_repath(args: PaperRepathArgs) -> ApiResult<PaperRepathResult>
             &args.to_rel,
         ) {
             Ok(count) => ApiResult::ok(PaperRepathResult { count }),
+            Err(e) => map_err(e),
+        }
+    })
+    .await
+}
+
+// Custom Properties Commands
+
+#[derive(Debug, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogListPropertiesArgs {
+    pub vault_path: String,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn catalog_list_properties(
+    args: CatalogListPropertiesArgs,
+) -> ApiResult<Vec<crate::features::paper::catalog::properties::CustomProperty>> {
+    run_blocking(move || {
+        let vault = try_vault!(&args.vault_path);
+        match crate::features::paper::catalog::properties::list_properties(&vault) {
+            Ok(v) => ApiResult::ok(v),
+            Err(e) => map_err(e),
+        }
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogCreatePropertyArgs {
+    pub vault_path: String,
+    pub name: String,
+    /// `select` (default) or `text`.
+    #[serde(default)]
+    pub property_type: Option<String>,
+    #[serde(default)]
+    pub options: Vec<crate::features::paper::catalog::properties::PropertyOption>,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn catalog_create_property(
+    args: CatalogCreatePropertyArgs,
+) -> ApiResult<crate::features::paper::catalog::properties::CustomProperty> {
+    run_blocking(move || {
+        let vault = try_vault!(&args.vault_path);
+        match crate::features::paper::catalog::properties::create_property(
+            &vault,
+            &args.name,
+            args.property_type.as_deref().unwrap_or("select"),
+            args.options,
+        ) {
+            Ok(v) => ApiResult::ok(v),
+            Err(e) => map_err(e),
+        }
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogUpdatePropertyArgs {
+    pub vault_path: String,
+    pub property: crate::features::paper::catalog::properties::CustomProperty,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn catalog_update_property(
+    args: CatalogUpdatePropertyArgs,
+) -> ApiResult<crate::features::paper::catalog::properties::CustomProperty> {
+    run_blocking(move || {
+        let vault = try_vault!(&args.vault_path);
+        match crate::features::paper::catalog::properties::update_property(&vault, &args.property) {
+            Ok(v) => ApiResult::ok(v),
+            Err(e) => map_err(e),
+        }
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogDeletePropertyArgs {
+    pub vault_path: String,
+    pub property_id: String,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn catalog_delete_property(args: CatalogDeletePropertyArgs) -> ApiResult<()> {
+    run_blocking(move || {
+        let vault = try_vault!(&args.vault_path);
+        match crate::features::paper::catalog::properties::delete_property(
+            &vault,
+            &args.property_id,
+        ) {
+            Ok(()) => ApiResult::ok(()),
+            Err(e) => map_err(e),
+        }
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSetPaperPropertyArgs {
+    pub vault_path: String,
+    pub paper_path: String,
+    pub property_id: String,
+    /// `select`: option id. `text`: raw text. `None` clears the value.
+    pub option_id: Option<String>,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn catalog_set_paper_property(
+    args: CatalogSetPaperPropertyArgs,
+) -> ApiResult<PaperRecord> {
+    run_blocking(move || {
+        let vault = try_vault!(&args.vault_path);
+        match crate::features::paper::catalog::properties::set_paper_property(
+            &vault,
+            &args.paper_path,
+            &args.property_id,
+            args.option_id.as_deref(),
+        ) {
+            Ok(v) => ApiResult::ok(v),
+            Err(e) => map_err(e),
+        }
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogCreateOptionAndSetArgs {
+    pub vault_path: String,
+    pub paper_path: String,
+    pub property_id: String,
+    pub option_name: String,
+    pub option_color: Option<String>,
+}
+
+#[derive(Debug, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogCreateOptionAndSetResult {
+    pub property: crate::features::paper::catalog::properties::CustomProperty,
+    pub paper: PaperRecord,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn catalog_create_option_and_set(
+    args: CatalogCreateOptionAndSetArgs,
+) -> ApiResult<CatalogCreateOptionAndSetResult> {
+    run_blocking(move || {
+        let vault = try_vault!(&args.vault_path);
+        match crate::features::paper::catalog::properties::create_option_and_set(
+            &vault,
+            &args.paper_path,
+            &args.property_id,
+            &args.option_name,
+            args.option_color.as_deref(),
+        ) {
+            Ok((prop, paper)) => ApiResult::ok(CatalogCreateOptionAndSetResult {
+                property: prop,
+                paper,
+            }),
+            Err(e) => map_err(e),
+        }
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogDeletePropertyOptionArgs {
+    pub vault_path: String,
+    pub property_id: String,
+    pub option_id: String,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn catalog_delete_property_option(
+    args: CatalogDeletePropertyOptionArgs,
+) -> ApiResult<crate::features::paper::catalog::properties::CustomProperty> {
+    run_blocking(move || {
+        let vault = try_vault!(&args.vault_path);
+        match crate::features::paper::catalog::properties::delete_property_option(
+            &vault,
+            &args.property_id,
+            &args.option_id,
+        ) {
+            Ok(v) => ApiResult::ok(v),
             Err(e) => map_err(e),
         }
     })

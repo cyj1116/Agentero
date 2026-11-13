@@ -122,7 +122,7 @@ export function isLayoutParagraphContinuation(
 	const head = prev.source.trim();
 	const tail = next.source.trim();
 	if (!head || !tail) return false;
-	// Source truncated at LAYOUT_TRANSLATE_MAX_CHARS: the join would be wrong.
+	// An explicit source ellipsis cannot establish a continuation.
 	if (head.endsWith("…")) return false;
 	if (/[-\u2010\u2011]$/.test(head)) return true;
 	if (SENTENCE_END.test(head)) return false;
@@ -150,7 +150,7 @@ export function buildLayoutTranslateChains(
 	const chains: LayoutTranslateChain[] = [];
 	let open: LayoutTranslateChain | null = null;
 	for (const item of items) {
-		if (!isLayoutContinuationKind(item.kind)) {
+		if (item.reflow || !isLayoutContinuationKind(item.kind)) {
 			chains.push({ members: [item], source: item.source });
 			// figure/table captions interrupt the layout, not the paragraph.
 			if (item.kind !== "figure_title") open = null;

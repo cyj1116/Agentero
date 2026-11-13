@@ -6,8 +6,8 @@ use crate::core::fs::WriteOpts;
 use crate::features::paper::catalog::papers;
 use crate::features::paper::catalog::papers::is_internal_tag_name;
 use crate::features::paper::import::{
-    ensure_paper_assets_with_cookies, map_zotero_item_to_record, normalize_parent_dir,
-    write_paper_shell_opts, NoteShellMode,
+    ensure_paper_assets_with_cookies, has_local_pdf, map_zotero_item_to_record,
+    normalize_parent_dir, write_paper_shell_opts, NoteShellMode,
 };
 use crate::features::paper::zotero::ZOTERO_INTERNAL_TAG_PREFIX;
 use crate::features::translate::{free_mt_to_zh, looks_mostly_cjk};
@@ -28,6 +28,10 @@ pub struct ConnectorImportResult {
     pub deduped: bool,
     pub connector_item_id: Value,
     pub item_type: String,
+    /// The Host spawned `RecognizeMetadata` for this paper: it owns the layout
+    /// follow-up against the post-rename path, so the Connector finalizer must
+    /// not queue one for the placeholder folder.
+    pub recognition_pending: bool,
 }
 
 /// Resolve the configured NOTES shell mode from the controller's AppHandle
@@ -93,6 +97,7 @@ pub async fn import_connector_item_with_cookies(
             deduped: true,
             connector_item_id,
             item_type,
+            recognition_pending: false,
         });
     }
 
@@ -126,6 +131,7 @@ pub async fn import_connector_item_with_cookies(
         deduped: false,
         connector_item_id,
         item_type,
+        recognition_pending: false,
     })
 }
 
@@ -163,6 +169,7 @@ pub async fn import_connector_item_remote_with_cookies(
             deduped: true,
             connector_item_id,
             item_type,
+            recognition_pending: false,
         });
     }
 
@@ -196,6 +203,7 @@ pub async fn import_connector_item_remote_with_cookies(
         deduped: false,
         connector_item_id,
         item_type,
+        recognition_pending: false,
     })
 }
 
@@ -498,17 +506,6 @@ fn decode_connector_title(raw: &str) -> String {
 /// the HTTP 201 body. Parsing is triggered only after `connector:item-saved`.
 /// Official Zotero returns `{ canRecognize }`; we return `canRecognize: false`
 /// because `/connector/getRecognizedItem` is not implemented yet.
-fn translator_url_from_ctrl(ctrl: &ConnectorController) -> String {
-    use tauri::Manager;
-    ctrl.app_handle()
-        .and_then(|app| {
-            app.try_state::<crate::features::system::settings::AppSettingsStore>()
-                .and_then(|s| s.get().ok())
-                .map(|r| r.settings.translator_base_url)
-        })
-        .unwrap_or_else(|| crate::features::paper::import::DEFAULT_TRANSLATOR_BASE_URL.to_string())
-}
-
 /// Fallback metadata for a standalone PDF when online resolution is unavailable.
 fn fallback_standalone_meta(title: Option<&str>, clean_url: Option<&str>) -> papers::PaperRecord {
     let title_raw = title.map(str::trim).filter(|s| !s.is_empty());
@@ -544,17 +541,14 @@ fn fallback_standalone_meta(title: Option<&str>, clean_url: Option<&str>) -> pap
 /// under ~15s, so the synchronous lookup is bounded far below the translator's
 /// own 60s timeout; on timeout or failure the fallback metadata is used and the
 /// background recognition pass completes the record later.
-async fn resolve_standalone_meta(
-    ctrl: &ConnectorController,
-    title: Option<&str>,
-    url: Option<&str>,
-) -> papers::PaperRecord {
+async fn resolve_standalone_meta(title: Option<&str>, url: Option<&str>) -> papers::PaperRecord {
     const RESOLVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
     let clean_url = url.map(str::trim).filter(|s| !s.is_empty());
     if let Some(u) = clean_url {
-        let base = translator_url_from_ctrl(ctrl);
-        let lookup = crate::features::paper::import::resolve_metadata(u, &base, None);
-        if let Ok(Ok((mut resolved_meta, _))) = tokio::time::timeout(RESOLVE_BUDGET, lookup).await {
+        let base = crate::features::paper::import::DEFAULT_TRANSLATOR_BASE_URL;
+        let lookup = crate::features::paper::import::resolve_metadata(u, base, None);
+        if let Ok(Ok(resolved)) = tokio::time::timeout(RESOLVE_BUDGET, lookup).await {
+            let mut resolved_meta = resolved.record;
             resolved_meta.meta_source = Some("zotero-connector".into());
             resolved_meta.source_url = Some(u.to_string());
             resolved_meta.pdf_url = Some(u.to_string());
@@ -639,6 +633,9 @@ async fn complete_standalone_session(
         ctrl.record_session_item_paper(session_id, u, &result.path);
     }
     ctrl.record_session_item_paper(session_id, &result.id, &result.path);
+    if result.recognition_pending {
+        ctrl.record_pending_recognition(session_id, &result.path);
+    }
     ctrl.mark_session_done(session_id);
     if result.deduped {
         ctrl.emit_item_saved(saved);
@@ -665,7 +662,7 @@ pub async fn import_standalone_attachment(
         session_parent
     };
 
-    let meta = resolve_standalone_meta(&ctrl, title, url).await;
+    let meta = resolve_standalone_meta(title, url).await;
     let progress_id = url
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -714,13 +711,29 @@ async fn import_standalone_local(
     if !pdf_path.is_file() {
         fs::write(&pdf_path, bytes)?;
         if let Some(app) = app {
-            crate::features::lifecycle::emit_paper_assets_ready(Some(app), vault, &commit.id);
+            crate::features::lifecycle::emit_paper_assets_ready(
+                Some(app),
+                vault,
+                &commit.id,
+                &commit.path,
+            );
         }
+    }
+    if pdf_path.is_file() {
+        crate::features::paper::import::code_repo::fill_code_repo_from_pdf(vault, &commit.path)
+            .await;
     }
 
     if commit.status == CommitStatus::Created && needs_recognize {
         if let Some(app) = app {
             app.spawn_recognize_metadata(vault, &commit.path);
+        }
+    }
+    // Resolved metadata skips recognition, so nobody else queues the layout
+    // follow-up (+ optional import translation) for this attachment.
+    if commit.status == CommitStatus::Created && !needs_recognize {
+        if let Some(app) = app {
+            app.spawn_layout_analysis(vault, &commit.path);
         }
     }
 
@@ -732,6 +745,7 @@ async fn import_standalone_local(
             deduped: true,
             connector_item_id: Value::Null,
             item_type: "attachment".into(),
+            recognition_pending: false,
         });
     }
 
@@ -742,6 +756,7 @@ async fn import_standalone_local(
         deduped: false,
         connector_item_id: Value::Null,
         item_type: "attachment".into(),
+        recognition_pending: commit.status == CommitStatus::Created && needs_recognize,
     })
 }
 
@@ -784,6 +799,7 @@ async fn import_standalone_remote(
             deduped: true,
             connector_item_id: Value::Null,
             item_type: "attachment".into(),
+            recognition_pending: false,
         });
     }
 
@@ -817,6 +833,7 @@ async fn import_standalone_remote(
         deduped: false,
         connector_item_id: Value::Null,
         item_type: "attachment".into(),
+        recognition_pending: false,
     })
 }
 
@@ -903,6 +920,57 @@ pub async fn save_attachment_from_resolver(
         return Err(AppError::message("Failed to save an attachment"));
     }
     Ok("Full Text PDF".into())
+}
+
+/// Queue layout analysis (and the optional import translation) after a
+/// Connector attachment wrote its PDF. Remote vaults keep their assets on the
+/// remote side, so layout only runs for local handles.
+pub fn spawn_layout_after_connector_pdf(
+    ctrl: &ConnectorController,
+    session_id: &str,
+    item_id: Option<&str>,
+) {
+    let Some(app) = ctrl.app_handle() else {
+        return;
+    };
+    let Ok((vault_handle, _)) = ctrl.vault_handle_and_parent() else {
+        return;
+    };
+    if parse_remote_handle(&vault_handle).is_some() {
+        return;
+    }
+    let Some(paper_rel) = ctrl.session_item_paper(session_id, item_id) else {
+        return;
+    };
+    let vault = PathBuf::from(vault_handle);
+    if !has_local_pdf(&vault.join(&paper_rel)) {
+        return;
+    }
+    crate::features::jobs::spawn_layout_after_import(Some(&app), &vault, &paper_rel);
+}
+
+/// Queue the layout follow-up for every paper in a finished Connector session,
+/// using the post-collection-move paths. Remote vaults are skipped.
+pub fn spawn_layout_after_session_papers(ctrl: &ConnectorController, session_id: &str) {
+    let Some(app) = ctrl.app_handle() else {
+        return;
+    };
+    let Ok((vault_handle, _)) = ctrl.vault_handle_and_parent() else {
+        return;
+    };
+    if parse_remote_handle(&vault_handle).is_some() {
+        return;
+    }
+    let Some(papers) = ctrl.session_layout_paths(session_id) else {
+        return;
+    };
+    let vault = PathBuf::from(vault_handle);
+    for paper in papers {
+        if !has_local_pdf(&vault.join(&paper)) {
+            continue;
+        }
+        crate::features::jobs::spawn_layout_after_import(Some(&app), &vault, &paper);
+    }
 }
 
 /// DOI / arXiv / local-PDF presence for resolver decisions.

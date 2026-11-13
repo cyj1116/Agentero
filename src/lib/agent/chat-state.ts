@@ -19,6 +19,10 @@ import type {
 	PromptImage,
 } from "@/lib/agent/api";
 import {
+	hasTranscriptChips,
+	inlineMarkupToPlain,
+} from "@/lib/agent/composer-inline-tokens";
+import {
 	isVisualAnnotationPromptText,
 	stripPromptEnvelopeForDisplay,
 } from "@/lib/agent/prompt-display";
@@ -75,6 +79,16 @@ export type ToolUiState = {
 	status: "pending" | "in_progress" | "completed" | "failed";
 	input?: unknown;
 	output?: unknown;
+	/** Locally recorded ask-user Q&A so the tool card can show it after answering. */
+	askUser?: ToolAskUserRecord;
+};
+
+/** Questions + answers recorded on an ask-user tool card (Grok ext / OpenCode question / elicitation). */
+export type ToolAskUserRecord = {
+	questions: AskUserQuestion[];
+	answers: AskUserAnswer[];
+	/** User dismissed the questionnaire without answering. */
+	cancelled?: boolean;
 };
 
 /** A selectable answer supplied by an ACP AskUserQuestion / form elicitation. */
@@ -84,6 +98,9 @@ export type AskUserQuestionOption = {
 	/** Stable value for elicitation content (defaults to label). */
 	value?: string;
 };
+
+/** Keep multi-select answers structured until a provider's response boundary. */
+export type AskUserAnswer = string | string[];
 
 /** A question supplied by AskUserQuestion tool or form elicitation. */
 export type AskUserQuestion = {
@@ -128,6 +145,11 @@ export type ChatLine =
 			kind: "user";
 			/** Free-form composer text (may be empty when only visual annotations / images). */
 			text: string;
+			/**
+			 * Composer draft with inline tokens, so the bubble and queue can redraw
+			 * @ / $ / / chips. Session-local: ACP `session/load` does not return it.
+			 */
+			markup?: string;
 			/** Local multimodal visual crops sent with this turn (session-local). */
 			visualAnnotations?: ChatVisualAnnotation[];
 			selections?: SelectionContext[];
@@ -158,6 +180,11 @@ export type ChatSessionHistoryItem = {
 	status: "running" | "completed" | "cancelled" | "failed";
 	/** Durable ACP provider session id used to resume this conversation. */
 	providerSessionId?: string | null;
+	/**
+	 * When true, the title was set by the user (#710) and must not be replaced
+	 * by ACP `session/list` titles or `session_info_update` pushes.
+	 */
+	titleLocked?: boolean;
 	/**
 	 * When false, never pass sessionId to runOnce (no ACP session/resume).
 	 * Used for PDF visual-trace pin chats whose multi-turn context lives in
@@ -201,6 +228,19 @@ export function upsertChatSessionTurn(
 	];
 }
 
+/**
+ * Attach the on-screen transcript when the provider session cannot be
+ * trusted: no resume id, or the previous turn failed before the agent saw it
+ * (dead ACP connection). A healthy resume omits this so history is not sent twice.
+ */
+export function shouldAttachLocalTranscript(input: {
+	resumeAllowed: boolean;
+	historyStatus?: string | null;
+}): boolean {
+	if (!input.resumeAllowed) return true;
+	return input.historyStatus === "failed";
+}
+
 /** Format prior user/agent turns for agents that cannot session/resume. */
 export function buildLocalTranscriptPrompt(
 	lines: ChatLine[],
@@ -211,7 +251,11 @@ export function buildLocalTranscriptPrompt(
 	let lastUserText: string | null = null;
 	for (const line of lines) {
 		if (line.kind === "user") {
-			const text = line.text.trim();
+			const text = (
+				line.markup && hasTranscriptChips(line.markup)
+					? inlineMarkupToPlain(line.markup)
+					: line.text
+			).trim();
 			const hasVisual = Boolean(line.visualAnnotations?.length);
 			const hasImages = Boolean(line.images?.length);
 			const references = selectionsPromptBlock(line.selections ?? []);
@@ -328,6 +372,29 @@ export const SUGGESTION_WORKFLOW: Record<SuggestionKey, string> = {
 	draftRelatedWork: "related_work",
 };
 
+/** Writing empty state. These are ordinary prompts; the open manuscript is the context. */
+export const WRITING_SUGGESTION_KEYS = [
+	"continueManuscript",
+	"tightenProse",
+	"pressArgument",
+	"citeFromLibrary",
+] as const;
+
+export type WritingSuggestionKey = (typeof WRITING_SUGGESTION_KEYS)[number];
+
+export function suggestionItems(writing: boolean): {
+	key: SuggestionKey | WritingSuggestionKey;
+	workflow?: string;
+}[] {
+	if (writing) {
+		return WRITING_SUGGESTION_KEYS.map((key) => ({ key }));
+	}
+	return SUGGESTION_KEYS.map((key) => ({
+		key,
+		workflow: SUGGESTION_WORKFLOW[key],
+	}));
+}
+
 export type AgentOption = {
 	key: string;
 	id: string | null;
@@ -341,10 +408,10 @@ export type AgentOption = {
 function catalogTemplateFromId(templateId: string): AgentTemplate | undefined {
 	switch (templateId) {
 		case "opencode":
-		case "openclaw":
 		case "hermes":
 		case "claude-acp":
 		case "codex-acp":
+		case "cursor-agent":
 		case "antigravity-acp":
 		case "qodercli":
 		case "grok-build":
@@ -353,6 +420,10 @@ function catalogTemplateFromId(templateId: string): AgentTemplate | undefined {
 		case "kimi-code":
 		case "zcode":
 		case "minimax-code":
+		case "mimo-code":
+		case "codebuddy":
+		case "qoder-cn":
+		case "zhihu":
 		case "custom":
 			return templateId;
 		default:
@@ -713,12 +784,12 @@ function parseOneAskUserQuestion(
 /** Format selected options as a concise, self-contained follow-up turn. */
 export function formatAskUserAnswers(
 	questions: AskUserQuestion[],
-	answers: string[],
+	answers: AskUserAnswer[],
 ): string {
 	return questions
 		.map(
 			(question, index) =>
-				`Question: ${question.question}\nAnswer: ${answers[index]}`,
+				`Question: ${question.question}\nAnswer: ${Array.isArray(answers[index]) ? answers[index].join(", ") : answers[index]}`,
 		)
 		.join("\n\n");
 }
@@ -746,7 +817,12 @@ function parseOtherFieldParentId(fieldId: string): string | null {
 
 function isTextishElicitationField(field: ElicitationFieldInput): boolean {
 	if (field.kind === "text") return true;
-	if (field.kind === "select" || field.kind === "boolean") return false;
+	if (
+		field.kind === "select" ||
+		field.kind === "multiselect" ||
+		field.kind === "boolean"
+	)
+		return false;
 	return field.options.length === 0;
 }
 
@@ -780,7 +856,12 @@ function isOtherCompanionElicitationField(
 function mapFieldOptions(
 	field: ElicitationFieldInput,
 ): AskUserQuestionOption[] {
-	if (field.kind !== "select" && field.kind !== "boolean") return [];
+	if (
+		field.kind !== "select" &&
+		field.kind !== "multiselect" &&
+		field.kind !== "boolean"
+	)
+		return [];
 	const options: AskUserQuestionOption[] = [];
 	for (const option of field.options) {
 		const label = (option.title || option.value).trim();
@@ -907,6 +988,7 @@ export function questionsFromElicitationFields(
 			question: displayQuestion || field.id,
 			options,
 			required: field.required !== false && !freeTextOnly,
+			...(field.kind === "multiselect" ? { multiSelect: true } : {}),
 			allowOther: Boolean(other) || freeTextOnly,
 			otherFieldId: other?.id ?? (freeTextOnly ? field.id : undefined),
 		});
@@ -922,12 +1004,31 @@ export function questionsFromElicitationFields(
  */
 export function elicitationContentFromAnswers(
 	questions: AskUserQuestion[],
-	answers: string[],
-): Record<string, string> {
-	const content: Record<string, string> = {};
+	answers: AskUserAnswer[],
+): Record<string, AskUserAnswer> {
+	const content: Record<string, AskUserAnswer> = {};
 	for (let i = 0; i < questions.length; i++) {
 		const q = questions[i];
-		const answer = answers[i]?.trim();
+		const raw = answers[i];
+		if (q?.multiSelect) {
+			const values = (Array.isArray(raw) ? raw : [raw ?? ""])
+				.map((value) => value.trim())
+				.filter(Boolean);
+			if (!values.length) continue;
+			const selected: string[] = [];
+			const custom: string[] = [];
+			for (const value of values) {
+				const option = q.options.find((entry) => entry.label === value);
+				if (option) selected.push(option.value ?? option.label);
+				else custom.push(value);
+			}
+			if (q.id && (selected.length || !q.otherFieldId))
+				content[q.id] = q.otherFieldId ? selected : [...selected, ...custom];
+			if (q.otherFieldId && custom.length)
+				content[q.otherFieldId] = custom.join(", ");
+			continue;
+		}
+		const answer = (Array.isArray(raw) ? raw[0] : raw)?.trim();
 		if (!q || !answer) continue;
 		const matched = q.options.find((option) => option.label === answer);
 		if (matched && q.id) {
@@ -952,6 +1053,7 @@ export type ToolPatch = {
 	input?: unknown;
 	output?: unknown;
 	full?: boolean;
+	askUser?: ToolAskUserRecord;
 };
 
 export function mergeToolState(
@@ -965,6 +1067,7 @@ export function mergeToolState(
 		status: mapToolStatus(patch.status ?? prev?.status),
 		input: patch.input !== undefined ? patch.input : prev?.input,
 		output: patch.output !== undefined ? patch.output : prev?.output,
+		askUser: patch.askUser ?? prev?.askUser,
 	};
 }
 
@@ -1164,4 +1267,30 @@ export function ensureModelsInclude(
 		});
 	}
 	return dedupeModelsClient([...extras, ...models]);
+}
+
+/**
+ * Union two model catalogs by id, keeping `primary` order and appending ids that
+ * only appear in `extra`.
+ *
+ * Guards the picker against a stale ACP catalog overwriting a richer one:
+ * opencode 2.x returns a partial model list on `session/new` and pushes the
+ * complete list moments later via `config_option_update`, while the warm result
+ * (and the pooled slot / run start) still carries the partial snapshot. The
+ * snapshot must not shrink the list (Fix #638).
+ */
+export function mergeModelChoices(
+	primary: AgentModelChoice[],
+	extra: AgentModelChoice[],
+): AgentModelChoice[] {
+	if (extra.length === 0) return primary;
+	const seen = new Set(primary.map((m) => m.id.trim()));
+	const out = [...primary];
+	for (const m of extra) {
+		const id = m.id.trim();
+		if (!id || seen.has(id)) continue;
+		seen.add(id);
+		out.push(m);
+	}
+	return out;
 }

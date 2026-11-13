@@ -1,6 +1,5 @@
 "use client";
 
-import type { TFunction } from "i18next";
 import {
 	type ClipboardEvent,
 	type FormEvent,
@@ -15,494 +14,35 @@ import {
 	useRef,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { usePromptInputAttachments } from "@/components/ai-elements/prompt-input";
+import { usePromptInputAttachments } from "@/components/agent/composer/prompt-input";
 import { useImeGuard } from "@/hooks/use-ime-guard";
 import { AGENT_COMPOSER_INPUT_ATTR } from "@/lib/agent/composer-focus";
 import {
-	encodeCommandToken,
-	encodeMentionToken,
-	encodeSelectionToken,
-	encodeSkillToken,
-	type InlineTokenPart,
 	parseInlineTokenParts,
 	stripInlineTokens,
 } from "@/lib/agent/composer-inline-tokens";
 import { decideComposerExternalValueSync } from "@/lib/agent/composer-sync";
-import { plazaMentionTitle } from "@/lib/agent/plaza-mention";
+import type { PdfVisualDraft } from "@/lib/agent/visual-context-store";
 import { filesFromDataTransfer } from "@/lib/core/file-accept";
 import { isImeKeyboardEvent } from "@/lib/core/ime";
-import { basenameOf } from "@/lib/core/path";
-import { cn, truncateToChars } from "@/lib/core/utils";
+import { cn } from "@/lib/core/utils";
+import { isFeedMentionPath } from "@/lib/plaza/feed-mention";
 
-const CHIP_ATTR = "data-composer-chip";
-const MAX_CHIP_TITLE_CHARS = 9;
-const TOKEN_ATTR = "data-composer-token";
-/** Zero-width, non-breaking padding after chips so the caret has a landing spot. */
-const CARET_PAD = "\u2060";
-
-const INLINE_CHIP_CLASS =
-	"composer-inline-chip mx-0.5 inline-flex max-w-[7rem] shrink-0 items-center gap-0.5 rounded-md border border-border/80 bg-muted/40 px-1 align-middle text-[0.8125em] leading-[1.25] text-foreground hover:bg-muted";
-
-const SELECTION_CHIP_CLASS =
-	"composer-inline-chip mx-0.5 inline-flex max-w-[10rem] shrink-0 items-center gap-0.5 rounded-md border border-primary/30 bg-primary/10 px-1 align-middle text-[0.8125em] leading-[1.25] text-foreground hover:bg-primary/20";
-
-const CHIP_ANIMATION_CLASS =
-	"motion-safe:animate-in motion-safe:fade-in-0 motion-safe:zoom-in-95 motion-safe:duration-200 motion-reduce:animate-none";
-
-function serializeEditor(root: HTMLElement): string {
-	let out = "";
-	const walk = (node: Node) => {
-		if (node.nodeType === Node.TEXT_NODE) {
-			out += (node.textContent ?? "").replaceAll(CARET_PAD, "");
-			return;
-		}
-		if (node.nodeType !== Node.ELEMENT_NODE) return;
-		const el = node as HTMLElement;
-		const token = el.getAttribute(TOKEN_ATTR);
-		if (token) {
-			out += token;
-			return;
-		}
-		const chip = el.getAttribute(CHIP_ATTR);
-		if (chip === "mention") {
-			const path = el.dataset.path ?? "";
-			if (path) out += encodeMentionToken(path);
-			return;
-		}
-		if (chip === "skill") {
-			const skillId = el.dataset.skillId ?? "";
-			if (skillId) out += encodeSkillToken(skillId);
-			return;
-		}
-		if (chip === "command") {
-			const name = el.dataset.commandName ?? "";
-			if (name) out += encodeCommandToken(name);
-			return;
-		}
-		if (chip === "selection") {
-			const selectionToken = el.dataset.selectionToken ?? "";
-			if (selectionToken) out += selectionToken;
-			return;
-		}
-		if (el.tagName === "BR") {
-			out += "\n";
-			return;
-		}
-		if (
-			(el.tagName === "DIV" || el.tagName === "P") &&
-			out.length > 0 &&
-			!out.endsWith("\n")
-		) {
-			out += "\n";
-		}
-		for (const child of el.childNodes) walk(child);
-	};
-	for (const child of root.childNodes) walk(child);
-	return out;
-}
-
-function appendPrefixLabel(
-	chip: HTMLElement,
-	prefix: string,
-	labelText: string,
-	title?: string,
-) {
-	const prefixEl = document.createElement("span");
-	prefixEl.className = "font-mono text-muted-foreground";
-	prefixEl.textContent = prefix;
-	const label = document.createElement("span");
-	label.className = "min-w-0 truncate";
-	label.textContent = labelText;
-	if (title) label.title = title;
-	chip.append(prefixEl, label);
-}
-
-/** Strip trigger / "skill :" chrome — chip shows the bare skill name. */
-function cleanSkillDisplayName(name: string): string {
-	return name
-		.trim()
-		.replace(/^[/$]+/, "")
-		.replace(/^skill\s*:\s*/i, "");
-}
-
-function appendLucideIcon(
-	chip: HTMLElement,
-	paths: string[],
-	className: string,
-) {
-	const ns = "http://www.w3.org/2000/svg";
-	const svg = document.createElementNS(ns, "svg");
-	svg.setAttribute("viewBox", "0 0 24 24");
-	svg.setAttribute("fill", "none");
-	svg.setAttribute("stroke", "currentColor");
-	svg.setAttribute("stroke-width", "2");
-	svg.setAttribute("stroke-linecap", "round");
-	svg.setAttribute("stroke-linejoin", "round");
-	svg.setAttribute("class", className);
-	svg.setAttribute("aria-hidden", "true");
-	for (const d of paths) {
-		const path = document.createElementNS(ns, "path");
-		path.setAttribute("d", d);
-		svg.appendChild(path);
-	}
-	chip.appendChild(svg);
-}
-
-/** Lucide `sparkles` glyph (skill affordance) for contenteditable chips. */
-function appendSkillIcon(chip: HTMLElement) {
-	appendLucideIcon(
-		chip,
-		[
-			"M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z",
-			"M20 3v4",
-			"M22 5h-4",
-			"M4 17v2",
-			"M5 18H3",
-		],
-		"size-3 shrink-0 text-muted-foreground",
-	);
-}
-
-function appendSkillLabel(chip: HTMLElement, name: string, skillId: string) {
-	appendSkillIcon(chip);
-	const label = document.createElement("span");
-	label.className = "min-w-0 truncate";
-	label.textContent = cleanSkillDisplayName(name);
-	label.title = skillId;
-	chip.appendChild(label);
-}
-
-function placeCaretAtEnd(el: HTMLElement) {
-	const selection = window.getSelection();
-	if (!selection) return;
-	const range = document.createRange();
-	let node: Node | null = el.lastChild;
-	// selectNodeContents + collapse(false) is unreliable when the editor ends
-	// with a contentEditable=false chip: browsers may normalize the caret to
-	// before the chip. Walk back to a real text node (caret pad / trailing text)
-	// and place the caret at its end.
-	while (node && node.nodeType !== Node.TEXT_NODE) {
-		node = node.previousSibling;
-	}
-	if (node) {
-		range.setStart(node, (node as Text).data.length);
-	} else {
-		range.setStart(el, el.childNodes.length);
-	}
-	range.collapse(true);
-	selection.removeAllRanges();
-	selection.addRange(range);
-}
-
-function placeCaretAfter(node: Node) {
-	const selection = window.getSelection();
-	if (!selection) return;
-	const range = document.createRange();
-	range.setStartAfter(node);
-	range.collapse(true);
-	selection.removeAllRanges();
-	selection.addRange(range);
-}
-
-function isZwspPad(node: Node | null): node is Text {
-	return (
-		node?.nodeType === Node.TEXT_NODE &&
-		(node as Text).data.replaceAll(CARET_PAD, "").length === 0
-	);
-}
-
-function leadingCaretPadLength(text: Text): number {
-	const match = text.data.match(/^\u2060+/);
-	return match?.[0].length ?? 0;
-}
-
-function findAdjacentTextNode(
-	start: Node | null,
-	direction: 1 | -1,
-): Text | null {
-	let node: Node | null = start;
-	while (node) {
-		if (node.nodeType === Node.TEXT_NODE) {
-			const text = node as Text;
-			if (text.data.replaceAll(CARET_PAD, "").length > 0) {
-				return text;
-			}
-		}
-		node = direction === 1 ? node.nextSibling : node.previousSibling;
-	}
-	return null;
-}
-
-function deleteChipElement(
-	chip: HTMLElement,
-	pads: Node[] = [],
-	direction: "before" | "after" = "before",
-) {
-	const parent = chip.parentNode;
-	if (!parent) return;
-
-	// Decide the caret landing spot before we mutate the DOM.
-	const previousText = findAdjacentTextNode(chip.previousSibling, -1);
-	const nextText = findAdjacentTextNode(chip.nextSibling, 1);
-	const landingText =
-		direction === "before"
-			? (previousText ?? nextText)
-			: (nextText ?? previousText);
-	// Backspace normally lands at the end of the previous text; Delete lands at
-	// the start of the next text. If one side is absent, use the available side.
-	let landingOffset =
-		landingText === previousText ? (landingText?.data.length ?? 0) : 0;
-
-	// Collect any caret pads touching the chip so they don't become
-	// invisible traps that need a second Backspace/Delete.
-	const adjacentPads: Node[] = [];
-	let prev = chip.previousSibling;
-	while (isZwspPad(prev)) {
-		adjacentPads.push(prev);
-		prev = prev.previousSibling;
-	}
-	let next = chip.nextSibling;
-	while (isZwspPad(next)) {
-		adjacentPads.push(next);
-		next = next.nextSibling;
-	}
-
-	for (const pad of pads) pad.parentNode?.removeChild(pad);
-	for (const pad of adjacentPads) pad.parentNode?.removeChild(pad);
-	// Chromium/WebView may merge the caret pad after a chip into the following
-	// text node. Remove only that prefix so the visible text stays intact.
-	if (landingText) {
-		const leadingPadLength = leadingCaretPadLength(landingText);
-		if (leadingPadLength > 0) {
-			landingText.deleteData(0, leadingPadLength);
-			landingOffset = Math.min(landingOffset, landingText.data.length);
-		}
-	}
-	chip.remove();
-
-	const selection = window.getSelection();
-	const range = document.createRange();
-	if (landingText) {
-		range.setStart(landingText, landingOffset);
-	} else {
-		range.setStart(parent, 0);
-	}
-	range.collapse(true);
-	selection?.removeAllRanges();
-	selection?.addRange(range);
-}
-
-function isChip(node: Node): node is HTMLElement {
-	return (
-		node.nodeType === Node.ELEMENT_NODE &&
-		(node as HTMLElement).getAttribute(CHIP_ATTR) !== null
-	);
-}
-
-function findChipBefore(
-	root: HTMLElement,
-	range: Range,
-): { chip: HTMLElement; pads: Node[] } | null {
-	const node = range.startContainer;
-	const offset = range.startOffset;
-	const pads: Node[] = [];
-	let target: Node | null = null;
-
-	// Caret landed inside a chip (e.g. user clicked the chip label): Backspace
-	// should delete the whole chip, not move the caret around it.
-	if (node.nodeType === Node.ELEMENT_NODE) {
-		const chipEl = (node as HTMLElement).closest?.(
-			`[${CHIP_ATTR}]`,
-		) as HTMLElement | null;
-		if (chipEl && root.contains(chipEl)) {
-			return { chip: chipEl, pads: [] };
-		}
-	}
-
-	if (node === root) {
-		if (offset === 0) return null;
-		target = root.childNodes[offset - 1];
-	} else if (node.nodeType === Node.TEXT_NODE) {
-		const text = node as Text;
-		if (offset === 0) {
-			// Caret at the start of a real text node: the chip could be right before it.
-			target = text.previousSibling;
-		} else if (offset <= leadingCaretPadLength(text)) {
-			// The browser can merge the chip's caret pad into the following text
-			// node; the caret immediately after that prefix is still next to the chip.
-			target = text.previousSibling;
-		} else if (offset === text.data.length && text.data.trim().length === 0) {
-			// Caret inside a whitespace-only pad: treat it as a pad and look further back.
-			pads.unshift(text);
-			target = text.previousSibling;
-		} else {
-			return null;
-		}
-	} else {
-		return null;
-	}
-
-	// Skip whitespace/caret pads between the caret and the chip.
-	while (
-		target?.nodeType === Node.TEXT_NODE &&
-		((target as Text).data.replaceAll(CARET_PAD, "").length === 0 ||
-			(target as Text).data.trim().length === 0)
-	) {
-		pads.unshift(target);
-		target = target.previousSibling;
-	}
-
-	return target && isChip(target) ? { chip: target, pads } : null;
-}
-
-function findChipAfter(
-	root: HTMLElement,
-	range: Range,
-): { chip: HTMLElement; pads: Node[] } | null {
-	const node = range.startContainer;
-	const offset = range.startOffset;
-	const pads: Node[] = [];
-	let target: Node | null = null;
-
-	// Caret landed inside a chip (e.g. user clicked the chip label): Delete
-	// should delete the whole chip, not move the caret around it.
-	if (node.nodeType === Node.ELEMENT_NODE) {
-		const chipEl = (node as HTMLElement).closest?.(
-			`[${CHIP_ATTR}]`,
-		) as HTMLElement | null;
-		if (chipEl && root.contains(chipEl)) {
-			return { chip: chipEl, pads: [] };
-		}
-	}
-
-	if (node === root) {
-		if (offset >= root.childNodes.length) return null;
-		target = root.childNodes[offset];
-	} else if (node.nodeType === Node.TEXT_NODE) {
-		const text = node as Text;
-		if (offset === text.data.length) {
-			// Caret at the end of a real text node: the chip could be right after it.
-			target = text.nextSibling;
-		} else if (offset === 0 && text.data.trim().length === 0) {
-			// Caret inside a whitespace-only pad: treat it as a pad and look further ahead.
-			pads.push(text);
-			target = text.nextSibling;
-		} else {
-			return null;
-		}
-	} else {
-		return null;
-	}
-
-	// Skip whitespace/caret pads between the caret and the chip.
-	while (
-		target?.nodeType === Node.TEXT_NODE &&
-		((target as Text).data.replaceAll(CARET_PAD, "").length === 0 ||
-			(target as Text).data.trim().length === 0)
-	) {
-		pads.push(target);
-		target = target.nextSibling;
-	}
-
-	return target && isChip(target) ? { chip: target, pads } : null;
-}
-
-function chipToken(part: InlineTokenPart): string {
-	switch (part.type) {
-		case "mention":
-			return encodeMentionToken(part.path);
-		case "skill":
-			return encodeSkillToken(part.skillId);
-		case "command":
-			return encodeCommandToken(part.name);
-		case "selection":
-			return encodeSelectionToken(part.selection);
-		default:
-			return "";
-	}
-}
-
-function renderChip(
-	part: InlineTokenPart,
-	{
-		labelForPath,
-		skillLabel,
-		t,
-		isNew,
-	}: {
-		labelForPath: (path: string) => string;
-		skillLabel: (skillId: string) => string;
-		t: TFunction<"agent", undefined>;
-		isNew?: boolean;
-	},
-): HTMLElement {
-	const chip = document.createElement("span");
-	chip.contentEditable = "false";
-	chip.className = cn(
-		part.type === "selection" ? SELECTION_CHIP_CLASS : INLINE_CHIP_CLASS,
-		isNew ? CHIP_ANIMATION_CLASS : undefined,
-	);
-
-	if (part.type === "mention") {
-		chip.setAttribute(CHIP_ATTR, "mention");
-		chip.dataset.path = part.path;
-		// Plaza mentions show the paper title; vault paths keep the basename.
-		const plazaTitle = plazaMentionTitle(part.path);
-		const short = plazaTitle
-			? truncateToChars(plazaTitle, MAX_CHIP_TITLE_CHARS)
-			: basenameOf(part.path) || labelForPath(part.path) || part.path;
-		appendPrefixLabel(chip, "@", short, part.path);
-		chip.setAttribute(
-			"aria-label",
-			t("composer.removeContext", { path: part.path }),
-		);
-		chip.setAttribute(TOKEN_ATTR, encodeMentionToken(part.path));
-	} else if (part.type === "skill") {
-		chip.setAttribute(CHIP_ATTR, "skill");
-		chip.dataset.skillId = part.skillId;
-		const name = skillLabel(part.skillId);
-		appendSkillLabel(chip, name, part.skillId);
-		chip.setAttribute(
-			"aria-label",
-			t("composer.removeSkill", {
-				skill: cleanSkillDisplayName(name),
-			}),
-		);
-		chip.setAttribute(TOKEN_ATTR, encodeSkillToken(part.skillId));
-	} else if (part.type === "command") {
-		chip.setAttribute(CHIP_ATTR, "command");
-		chip.dataset.commandName = part.name;
-		const commandLabel = cleanSkillDisplayName(part.name);
-		appendPrefixLabel(chip, "/", commandLabel);
-		chip.setAttribute("aria-label", `/${commandLabel}`);
-		chip.setAttribute(TOKEN_ATTR, encodeCommandToken(part.name));
-	} else if (part.type === "selection") {
-		chip.setAttribute(CHIP_ATTR, "selection");
-		const { selection } = part;
-		const token = encodeSelectionToken(selection);
-		chip.dataset.selectionToken = token;
-		chip.dataset.selectionId = selection.id;
-		chip.setAttribute(TOKEN_ATTR, token);
-
-		const label = document.createElement("span");
-		label.className = "min-w-0 truncate";
-		const title = truncateToChars(
-			labelForPath(selection.sourcePath),
-			MAX_CHIP_TITLE_CHARS,
-		);
-		label.textContent = selection.page
-			? t("composer.selectionChipWithPage", { title, page: selection.page })
-			: t("composer.selectionChip", { title });
-		label.title = [selection.text, selection.comment]
-			.filter(Boolean)
-			.join("\n\n");
-		chip.appendChild(label);
-
-		chip.setAttribute("aria-label", t("composer.removeSelection"));
-	}
-
-	return chip;
-}
+import {
+	CARET_PAD,
+	CHIP_ATTR,
+	chipToken,
+	deleteChipElement,
+	findChipAfter,
+	findChipBefore,
+	placeCaretAfter,
+	placeCaretAtEnd,
+	placeCaretAtSerializedOffset,
+	renderChip,
+	serializedOffset,
+	serializeEditor,
+	visualReferenceSnippet,
+} from "./composer-inline-dom";
 
 export type ComposerInlineInputHandle = {
 	/**
@@ -513,6 +53,16 @@ export type ComposerInlineInputHandle = {
 	insertAtCursor: (token: string, atEnd?: boolean) => void;
 	/** Return the underlying contenteditable element. */
 	getEditorElement: () => HTMLElement | null;
+	/**
+	 * Serialized caret from the last time the selection was inside the field.
+	 * Survives focus moving to the PDF or note that triggered Add to chat.
+	 */
+	getCaretOffset: () => number | null;
+	/**
+	 * After the next controlled render of `value`, put the caret at `offset`
+	 * instead of jumping to the end.
+	 */
+	setPendingCaret: (offset: number, value: string) => void;
 };
 
 export type ComposerInlineInputProps = {
@@ -525,6 +75,27 @@ export type ComposerInlineInputProps = {
 	autoFocus?: boolean;
 	labelForPath: (path: string) => string;
 	skillLabel: (skillId: string) => string;
+	visualDrafts?: readonly PdfVisualDraft[];
+	/** Hover a text-annotation reference. `leave` starts the card's close delay. */
+	onSelectionPointer?: (
+		phase: "enter" | "leave",
+		id: string,
+		anchor: HTMLElement,
+	) => void;
+	/** Hover a visual reference. `leave` starts the card's close delay. */
+	onVisualPointer?: (
+		phase: "enter" | "leave",
+		id: string,
+		anchor: HTMLElement,
+	) => void;
+	/** Click any mention chip: open its file / Plaza entry, never delete it. */
+	onOpenMention?: (path: string) => void;
+	/** Hover a Plaza feed reference. `leave` starts the card's close delay. */
+	onPlazaFeedPointer?: (
+		phase: "enter" | "leave",
+		path: string,
+		anchor: HTMLElement,
+	) => void;
 	"aria-expanded"?: boolean | undefined;
 	"aria-autocomplete"?: HTMLAttributes<HTMLDivElement>["aria-autocomplete"];
 	"aria-controls"?: string | undefined;
@@ -547,6 +118,11 @@ export const ComposerInlineInput = forwardRef<
 			autoFocus,
 			labelForPath,
 			skillLabel,
+			visualDrafts = [],
+			onSelectionPointer,
+			onVisualPointer,
+			onOpenMention,
+			onPlazaFeedPointer,
 			className,
 			...aria
 		},
@@ -562,6 +138,10 @@ export const ComposerInlineInput = forwardRef<
 		const { isBlockedByIme, isComposing, compositionProps } = useImeGuard();
 		const renderedTokensRef = useRef<Set<string>>(new Set());
 		const isFirstRenderRef = useRef(true);
+		const caretOffsetRef = useRef<number | null>(null);
+		const pendingCaretRef = useRef<{ offset: number; value: string } | null>(
+			null,
+		);
 
 		const emitFromDom = useCallback(() => {
 			const root = editorRef.current;
@@ -606,6 +186,7 @@ export const ComposerInlineInput = forwardRef<
 					const chip = renderChip(part, {
 						labelForPath,
 						skillLabel,
+						visualDrafts,
 						t,
 						isNew,
 					});
@@ -615,7 +196,7 @@ export const ComposerInlineInput = forwardRef<
 				renderedTokensRef.current = nextTokens;
 				isFirstRenderRef.current = false;
 			},
-			[labelForPath, skillLabel, t],
+			[labelForPath, skillLabel, t, visualDrafts],
 		);
 
 		useLayoutEffect(() => {
@@ -636,7 +217,14 @@ export const ComposerInlineInput = forwardRef<
 			awaitingParentEchoRef.current = false;
 			lastValueRef.current = value;
 			renderValue(value);
-			if (root && document.activeElement === root) {
+			const pending = pendingCaretRef.current;
+			if (pending && pending.value === value && root) {
+				pendingCaretRef.current = null;
+				root.focus({ preventScroll: true });
+				placeCaretAtSerializedOffset(root, pending.offset);
+				caretOffsetRef.current = pending.offset;
+				scrollEditorToBottom();
+			} else if (root && document.activeElement === root) {
 				placeCaretAtEnd(root);
 				scrollEditorToBottom();
 			}
@@ -651,6 +239,10 @@ export const ComposerInlineInput = forwardRef<
 			ref,
 			() => ({
 				getEditorElement: () => editorRef.current,
+				getCaretOffset: () => caretOffsetRef.current,
+				setPendingCaret: (offset: number, nextValue: string) => {
+					pendingCaretRef.current = { offset, value: nextValue };
+				},
 				insertAtCursor: (token: string, atEnd = false) => {
 					const root = editorRef.current;
 					if (!root) return;
@@ -666,6 +258,7 @@ export const ComposerInlineInput = forwardRef<
 						const chip = renderChip(parts[0], {
 							labelForPath,
 							skillLabel,
+							visualDrafts,
 							t,
 							isNew: true,
 						});
@@ -697,7 +290,14 @@ export const ComposerInlineInput = forwardRef<
 					scrollEditorToBottom();
 				},
 			}),
-			[emitFromDom, labelForPath, scrollEditorToBottom, skillLabel, t],
+			[
+				emitFromDom,
+				labelForPath,
+				scrollEditorToBottom,
+				skillLabel,
+				t,
+				visualDrafts,
+			],
 		);
 
 		const handleInput = (_event: FormEvent<HTMLDivElement>) => {
@@ -854,10 +454,58 @@ export const ComposerInlineInput = forwardRef<
 			emitFromDom();
 		};
 
+		useEffect(() => {
+			const onSelectionChange = () => {
+				const root = editorRef.current;
+				const selection = window.getSelection();
+				if (!root || !selection || selection.rangeCount === 0) return;
+				const range = selection.getRangeAt(0);
+				if (!root.contains(range.startContainer)) return;
+				caretOffsetRef.current = serializedOffset(
+					root,
+					range.startContainer,
+					range.startOffset,
+				);
+			};
+			document.addEventListener("selectionchange", onSelectionChange);
+			return () =>
+				document.removeEventListener("selectionchange", onSelectionChange);
+		}, []);
+
+		useEffect(() => {
+			const root = editorRef.current;
+			if (!root) return;
+			for (const node of root.querySelectorAll<HTMLElement>(
+				`[${CHIP_ATTR}="visual"]`,
+			)) {
+				const draft = visualDrafts.find(
+					(item) => item.id === node.dataset.visualId,
+				);
+				const label = node.querySelector("[data-chip-label]");
+				if (!label) continue;
+				const pageLabel = t("composer.visualAnnotationPage", {
+					page: draft?.page ?? 1,
+				});
+				const snippet = visualReferenceSnippet(draft, pageLabel);
+				if (label.textContent !== snippet) label.textContent = snippet;
+			}
+		}, [t, visualDrafts]);
+
 		const handleChipClick = (event: MouseEvent<HTMLDivElement>) => {
 			const target = event.target as HTMLElement | null;
 			const chip = target?.closest?.(`[${CHIP_ATTR}]`) as HTMLElement | null;
 			if (!chip || !editorRef.current?.contains(chip)) return;
+			const kind = chip.getAttribute(CHIP_ATTR);
+			// Mention chips navigate: a stray click must not drop the reference.
+			// Feed references also own a hover card; removal is card / Backspace.
+			if (kind === "mention") {
+				event.preventDefault();
+				event.stopPropagation();
+				onOpenMention?.(chip.dataset.path ?? "");
+				return;
+			}
+			// Text and visual references stay; their hover cards own edit and delete.
+			if (kind === "selection" || kind === "visual") return;
 			event.preventDefault();
 			event.stopPropagation();
 			// Focus before changing the DOM. Focusing after setting the Range lets
@@ -865,6 +513,44 @@ export const ComposerInlineInput = forwardRef<
 			editorRef.current?.focus({ preventScroll: true });
 			deleteChipElement(chip);
 			emitFromDom();
+		};
+
+		const handleReferencePointer = (
+			event: MouseEvent<HTMLDivElement>,
+			phase: "enter" | "leave",
+		) => {
+			const target = event.target as HTMLElement | null;
+			const chip = target?.closest?.(
+				`[${CHIP_ATTR}="selection"], [${CHIP_ATTR}="visual"], [${CHIP_ATTR}="mention"]`,
+			) as HTMLElement | null;
+			if (!chip || !editorRef.current?.contains(chip)) return;
+			const kind = chip.getAttribute(CHIP_ATTR);
+			if (phase === "leave") {
+				const next = event.relatedTarget;
+				if (next instanceof Node && chip.contains(next)) return;
+				if (
+					next instanceof Element &&
+					next.closest(
+						"[data-annotation-ui], [data-composer-chip='selection'], [data-composer-chip='visual']",
+					)
+				) {
+					return;
+				}
+			}
+			if (kind === "mention") {
+				const path = chip.dataset.path ?? "";
+				if (isFeedMentionPath(path)) onPlazaFeedPointer?.(phase, path, chip);
+				return;
+			}
+			if (kind === "selection") {
+				const id = chip.dataset.selectionId;
+				if (id) onSelectionPointer?.(phase, id, chip);
+				return;
+			}
+			if (kind === "visual") {
+				const id = chip.dataset.visualId;
+				if (id) onVisualPointer?.(phase, id, chip);
+			}
 		};
 
 		const isVisuallyEmpty = parseInlineTokenParts(value).every(
@@ -926,6 +612,8 @@ export const ComposerInlineInput = forwardRef<
 						onKeyDown={handleKeyDown}
 						onPaste={handlePaste}
 						onClick={handleChipClick}
+						onMouseOver={(event) => handleReferencePointer(event, "enter")}
+						onMouseOut={(event) => handleReferencePointer(event, "leave")}
 						onCompositionStart={handleCompositionStart}
 						onCompositionEnd={handleCompositionEnd}
 						{...aria}

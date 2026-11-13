@@ -1,15 +1,20 @@
+import { Loader2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { SelectionCopiedLabel } from "@/components/ui/selection-copied-label";
-import { AskPopover } from "@/components/viewer/pdf/cards/ask-popover";
-import { SelectionMenu } from "@/components/viewer/pdf/cards/selection-menu";
-import { TranslateCard } from "@/components/viewer/pdf/cards/translate-card";
+import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/ui/empty-state";
 import { useWebViewSelection } from "@/components/viewer/web-view/use-web-view-selection";
+import { useIframeDragShield } from "@/hooks/use-iframe-drag-shield";
 import { commands } from "@/lib/core/bindings";
 import { callApiResult } from "@/lib/core/ipc";
+import { openExternalUrl } from "@/lib/core/open-external";
 import { cn } from "@/lib/core/utils";
-import { arxivReaderUrl, isArxivHostedUrl } from "@/lib/paper/arxiv";
+import { isArxivHostedUrl } from "@/lib/paper/arxiv";
+import {
+	loadArxivHtml,
+	peekArxivHtml,
+	resolveArxivHtmlPage,
+} from "@/lib/paper/arxiv-html";
 import { webViewProxyUrl } from "@/lib/web-view/proxy-url";
 
 type HtmlViewerProps = {
@@ -18,7 +23,15 @@ type HtmlViewerProps = {
 	/** Paper title for ask-card / prompt context. */
 	title?: string;
 	className?: string;
+	/** Return a PDF paper to its PDF view when HTML cannot be shown. */
+	onShowPdf?: () => void;
 };
+
+/** arXiv HTML is a srcdoc of third-party markup. It must not share the app origin. */
+const ARXIV_HTML_SANDBOX =
+	"allow-scripts allow-popups allow-popups-to-escape-sandbox";
+
+type ArxivHtmlPhase = "loading" | "ready" | "missing" | "network" | "bad_url";
 
 /** Load-state of the built-in proxy for one paper host. */
 type ProxyGate = "pending" | "ready" | "denied";
@@ -27,34 +40,51 @@ type ProxyGate = "pending" | "ready" | "denied";
  * HTML paper viewer — remote page in a sandboxed iframe.
  * Does not fetch or cache HTML into the vault.
  *
- * arXiv pages keep their dedicated reader proxy; every other host is served
- * through the generic `agentero-web` proxy (host allowlisted via the Host
- * command first), which injects the selection bridge the toolbar below needs.
+ * arXiv papers are fetched in this webview and embedded as srcdoc. Every other
+ * host is served through the generic `agentero-web` proxy (host allowlisted
+ * via the Host command first), which injects the selection bridge the toolbar
+ * below needs.
  */
-export function HtmlViewer({ srcUrl, title, className }: HtmlViewerProps) {
+export function HtmlViewer({
+	srcUrl,
+	title,
+	className,
+	onShowPdf,
+}: HtmlViewerProps) {
 	const { t } = useTranslation("viewer");
 	const iframeRef = useRef<HTMLIFrameElement | null>(null);
-	/** While HTML5 DnD is active, disable iframe hit-testing so dragover
-	 * reaches dockview drop targets (sandboxed iframe swallows drag events). */
-	const [dragShield, setDragShield] = useState(false);
+	const dragShield = useIframeDragShield();
 	const [gate, setGate] = useState<ProxyGate>("pending");
-
-	useEffect(() => {
-		const arm = () => setDragShield(true);
-		const disarm = () => setDragShield(false);
-		// Capture phase: see tree/OS drags before the event enters the iframe.
-		window.addEventListener("dragstart", arm, true);
-		window.addEventListener("dragend", disarm, true);
-		window.addEventListener("drop", disarm, true);
-		return () => {
-			window.removeEventListener("dragstart", arm, true);
-			window.removeEventListener("dragend", disarm, true);
-			window.removeEventListener("drop", disarm, true);
-		};
-	}, []);
 
 	const remote = srcUrl && /^https?:\/\//i.test(srcUrl) ? srcUrl : null;
 	const trusted = remote ? isArxivHostedUrl(remote) : false;
+	const arxivTarget = remote && trusted ? resolveArxivHtmlPage(remote) : null;
+	const arxivPageUrl = arxivTarget?.pageUrl ?? null;
+	const [arxiv, setArxiv] = useState<{
+		url: string;
+		phase: ArxivHtmlPhase;
+		html: string | null;
+	} | null>(null);
+
+	useEffect(() => {
+		if (!arxivPageUrl) return;
+		const cached = peekArxivHtml(arxivPageUrl);
+		if (cached) {
+			setArxiv({ url: arxivPageUrl, phase: "ready", html: cached });
+		} else {
+			setArxiv({ url: arxivPageUrl, phase: "loading", html: null });
+		}
+		const controller = new AbortController();
+		void loadArxivHtml(arxivPageUrl, controller.signal).then((result) => {
+			if (controller.signal.aborted || result.status === "aborted") return;
+			setArxiv({
+				url: arxivPageUrl,
+				phase: result.status === "ready" ? "ready" : result.status,
+				html: result.status === "ready" ? result.html : null,
+			});
+		});
+		return () => controller.abort();
+	}, [arxivPageUrl]);
 
 	// Ensure the host may be served before the frame points at the proxy —
 	// the proxy answers 403 otherwise.
@@ -88,26 +118,57 @@ export function HtmlViewer({ srcUrl, title, className }: HtmlViewerProps) {
 		srcUrl: remote ?? "",
 		iframeRef,
 		title,
+		origin: trusted ? "null" : undefined,
 	});
 
 	if (!remote) {
+		return <EmptyState className={className}>{t("html.empty")}</EmptyState>;
+	}
+
+	if (trusted) {
+		const cachedHtml = arxivPageUrl ? peekArxivHtml(arxivPageUrl) : null;
+		const current = arxiv?.url === arxivPageUrl ? arxiv : null;
+		const arxivHtml = cachedHtml ?? current?.html ?? null;
+		const phase: ArxivHtmlPhase = !arxivTarget
+			? "bad_url"
+			: arxivHtml
+				? "ready"
+				: (current?.phase ?? "loading");
 		return (
 			<div
 				className={cn(
-					"flex h-full items-center justify-center p-6 text-center text-muted-foreground text-sm",
+					"relative h-full min-h-0 w-full min-w-0 overflow-hidden bg-background",
 					className,
 				)}
+				data-arxiv-html={phase}
+				aria-busy={phase === "loading" || undefined}
 			>
-				{t("html.empty")}
+				{phase === "ready" && arxivHtml ? (
+					<iframe
+						title={t("html.sandboxTitle")}
+						srcDoc={arxivHtml}
+						sandbox={ARXIV_HTML_SANDBOX}
+						referrerPolicy="no-referrer"
+						ref={iframeRef}
+						onLoad={selection.onFrameLoad}
+						className={cn(
+							"absolute inset-0 block h-full w-full border-0 bg-background",
+							dragShield && "pointer-events-none",
+						)}
+						style={{ colorScheme: "light dark" }}
+					/>
+				) : (
+					<ArxivHtmlStatus
+						phase={phase}
+						absUrl={arxivTarget?.absUrl ?? null}
+						onShowPdf={onShowPdf}
+					/>
+				)}
 			</div>
 		);
 	}
 
-	const iframeUrl = trusted
-		? arxivReaderUrl(remote)
-		: gate === "ready"
-			? webViewProxyUrl(remote)
-			: null;
+	const iframeUrl = gate === "ready" ? webViewProxyUrl(remote) : null;
 	const sandbox =
 		"allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox";
 
@@ -125,6 +186,7 @@ export function HtmlViewer({ srcUrl, title, className }: HtmlViewerProps) {
 					sandbox={sandbox}
 					referrerPolicy="no-referrer-when-downgrade"
 					ref={iframeRef}
+					onLoad={selection.onFrameLoad}
 					className={cn(
 						"absolute inset-0 block h-full w-full border-0 bg-background",
 						dragShield && "pointer-events-none",
@@ -132,63 +194,60 @@ export function HtmlViewer({ srcUrl, title, className }: HtmlViewerProps) {
 					style={{ colorScheme: "light dark" }}
 				/>
 			) : (
-				<div className="flex h-full items-center justify-center p-6 text-center text-muted-foreground text-sm">
-					{gate === "denied" ? t("html.denied") : null}
+				<EmptyState>{gate === "denied" ? t("html.denied") : null}</EmptyState>
+			)}
+		</div>
+	);
+}
+
+function ArxivHtmlStatus({
+	phase,
+	absUrl,
+	onShowPdf,
+}: {
+	phase: ArxivHtmlPhase;
+	absUrl: string | null;
+	onShowPdf?: () => void;
+}) {
+	const { t } = useTranslation("viewer");
+	return (
+		<div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center text-muted-foreground text-sm">
+			{phase === "loading" ? (
+				<Loader2 className="size-4 animate-spin" aria-hidden />
+			) : null}
+			<p>
+				{phase === "loading"
+					? t("html.loading")
+					: phase === "missing"
+						? t("html.missing")
+						: phase === "network"
+							? t("html.network")
+							: t("html.badUrl")}
+			</p>
+			{phase === "loading" ? null : (
+				<div className="flex flex-wrap items-center justify-center gap-2">
+					{onShowPdf ? (
+						<Button
+							type="button"
+							size="sm"
+							variant="outline"
+							onClick={onShowPdf}
+						>
+							{t("html.backToPdf")}
+						</Button>
+					) : null}
+					{absUrl ? (
+						<Button
+							type="button"
+							size="sm"
+							variant="outline"
+							onClick={() => openExternalUrl(absUrl)}
+						>
+							{t("html.openAbstract")}
+						</Button>
+					) : null}
 				</div>
 			)}
-			{iframeUrl && !trusted
-				? createPortal(
-						<>
-							{selection.menu && !selection.ask ? (
-								<SelectionMenu
-									screen={selection.menu.screen}
-									onHighlight={() => undefined}
-									onAsk={selection.handleAsk}
-									onAddToChat={selection.handleAddToChat}
-									onTranslate={selection.handleTranslate}
-									showHighlight={false}
-								/>
-							) : null}
-							{selection.copiedLabelPos ? (
-								<SelectionCopiedLabel
-									x={selection.copiedLabelPos.x}
-									y={selection.copiedLabelPos.y}
-								/>
-							) : null}
-							{selection.ask ? (
-								<AskPopover
-									thread={selection.ask.thread}
-									paperTitle={title}
-									paperLink={remote}
-									screen={selection.ask.screen}
-									streaming={selection.streaming}
-									error={selection.askError}
-									onSend={selection.sendAskQuestion}
-									onResend={selection.resendAskQuestion}
-									onHide={selection.hideAsk}
-									onDelete={selection.deleteAsk}
-									onStop={selection.stopAskStreaming}
-								/>
-							) : null}
-							{selection.translateRec && selection.translateScreen ? (
-								<TranslateCard
-									screen={selection.translateScreen}
-									result={selection.translateRec.result ?? ""}
-									streaming={selection.translateStreaming}
-									error={
-										selection.translateError ??
-										selection.translateRec.error ??
-										null
-									}
-									onOpenSettings={selection.openTranslateSettings}
-									onHide={selection.hideTranslate}
-									onDelete={selection.deleteTranslateCard}
-								/>
-							) : null}
-						</>,
-						document.body,
-					)
-				: null}
 		</div>
 	);
 }

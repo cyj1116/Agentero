@@ -1,5 +1,6 @@
 import { Loader2 } from "lucide-react";
 import type { ReactNode } from "react";
+import { agentLogoKeyForTemplate } from "@/components/agent/agent-logo";
 import type {
 	AgentDescriptor,
 	AgentTemplate,
@@ -124,8 +125,8 @@ export function showUpdateAgent(entry: CatalogEntry): boolean {
 
 /**
  * Row can be uninstalled/removed: a registry entry always qualifies; otherwise
- * an installed CLI of a lifecycle template (excludes plain-PATH templates like
- * qodercli that we never installed).
+ * an installed CLI of a lifecycle template (`canInstall`). Templates without a
+ * silent installer stay out.
  */
 export function showUninstallAgent(entry: CatalogEntry): boolean {
 	return (
@@ -146,27 +147,6 @@ export type DefaultAgentChoice = {
 	isDefault: boolean;
 };
 
-function catalogTemplateFromId(templateId: string): AgentTemplate {
-	switch (templateId) {
-		case "opencode":
-		case "openclaw":
-		case "hermes":
-		case "claude-acp":
-		case "codex-acp":
-		case "antigravity-acp":
-		case "qodercli":
-		case "grok-build":
-		case "pi":
-		case "dsh":
-		case "kimi-code":
-		case "zcode":
-		case "minimax-code":
-			return templateId;
-		default:
-			return "custom";
-	}
-}
-
 export function buildDefaultAgentChoices(
 	scan: CatalogScanResponse | null | undefined,
 ): DefaultAgentChoice[] {
@@ -182,7 +162,7 @@ export function buildDefaultAgentChoices(
 		choices.push({
 			value: `catalog:${entry.templateId}`,
 			name: entry.name,
-			template: catalogTemplateFromId(entry.templateId),
+			template: agentLogoKeyForTemplate(entry.templateId),
 			source: "catalog",
 			templateId: entry.templateId,
 			agentId: entry.registeredId ?? undefined,

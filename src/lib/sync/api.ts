@@ -1,6 +1,6 @@
 /**
  * Vault cloud sync (S3-compatible / WebDAV) — Host command wrappers.
- * Design: docs/development/cloud-sync-s3.md
+ * Design: docs/backend/sync.md
  */
 
 import {
@@ -23,7 +23,7 @@ export type SyncScope = {
 };
 
 /** Storage backend discriminator; legacy configs without one are S3. */
-export type SyncBackendKind = "s3" | "webdav";
+export type SyncBackendKind = "s3" | "webdav" | "git" | "agentero";
 
 export type SyncBackendConfig = {
 	backend: SyncBackendKind;
@@ -40,6 +40,16 @@ export type SyncBackendConfig = {
 	webdavUsername: string;
 	/** Masked like the S3 secret key. */
 	webdavPassword: string;
+	/** Git remote URL or local path; credentials come from system Git. */
+	gitRemote: string;
+	/** Branch synced by the Git backend (default `main`). */
+	gitBranch: string;
+	/** `user` or `organization` for official cloud sync. */
+	agenteroSubject: "user" | "organization";
+	/** Organization id when `agenteroSubject` is `organization`. */
+	agenteroOrgId: string;
+	/** API origin. Empty until the host fills the signed-in origin. */
+	agenteroApi: string;
 	/** Background sync: on open, after 30s quiet, and every intervalMinutes. */
 	autoSync: boolean;
 	intervalMinutes: number;
@@ -92,7 +102,7 @@ export function isSyncProgressPhase(phase: string): phase is SyncPhase {
 }
 
 export const emptySyncConfig = (
-	backend: SyncBackendKind = "s3",
+	backend: SyncBackendKind = "agentero",
 ): SyncBackendConfig => ({
 	backend,
 	endpoint: "",
@@ -105,6 +115,11 @@ export const emptySyncConfig = (
 	webdavUrl: "",
 	webdavUsername: "",
 	webdavPassword: "",
+	gitRemote: "",
+	gitBranch: "main",
+	agenteroSubject: "user",
+	agenteroOrgId: "",
+	agenteroApi: "",
 	autoSync: true,
 	intervalMinutes: 30,
 	conditionalWrites: true,
@@ -146,6 +161,12 @@ function configFromWire(config: SyncBackendConfigWire): SyncBackendConfig {
 		webdavUrl: config.webdavUrl ?? "",
 		webdavUsername: config.webdavUsername ?? "",
 		webdavPassword: config.webdavPassword ?? "",
+		gitRemote: config.gitRemote ?? "",
+		gitBranch: config.gitBranch ?? "main",
+		agenteroSubject:
+			config.agenteroSubject === "organization" ? "organization" : "user",
+		agenteroOrgId: config.agenteroOrgId ?? "",
+		agenteroApi: config.agenteroApi ?? "",
 		autoSync: config.autoSync ?? true,
 		intervalMinutes: config.intervalMinutes ?? 30,
 		conditionalWrites: config.conditionalWrites ?? true,
@@ -182,4 +203,21 @@ export async function syncDisconnect(vaultPath: string): Promise<void> {
 
 export function syncNow(vaultPath: string): Promise<SyncOutcome> {
 	return callApiResult(() => commands.syncNow({ vaultPath }));
+}
+
+export type SyncCloudUsage = {
+	signedIn: boolean;
+	used: number;
+	limit: number;
+	tier: string;
+	planKey: string;
+};
+
+export function syncCloudUsage(
+	subject: "user" | "organization",
+	orgId?: string,
+): Promise<SyncCloudUsage> {
+	return callApiResult(() =>
+		commands.syncCloudUsage({ subject, orgId: orgId ?? null }),
+	);
 }

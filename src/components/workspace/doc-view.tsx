@@ -1,11 +1,18 @@
-import { lazy, memo, Suspense, useCallback } from "react";
+import { Loader2 } from "lucide-react";
+import { lazy, memo, Suspense, useCallback, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { PapersLibrary } from "@/components/library/papers-library";
+import { PlazaTabView } from "@/components/plaza/plaza-tab-view";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { PdfViewerHandle } from "@/components/viewer";
 import { HtmlViewer, ImageViewer } from "@/components/viewer";
+import { LocalHtmlViewer } from "@/components/viewer/local-html-viewer";
 import { RecycleBinView } from "@/components/workspace/recycle-bin-view";
+import { TexProjectView } from "@/components/writing/tex-project-view";
+import { useSharedWritingEditor } from "@/components/writing/writing-cloud-context";
 import { useSettings } from "@/hooks/use-app-stores";
+import { errorText } from "@/lib/core/error";
+import { notifyError } from "@/lib/core/notify";
 import type { PaperLibraryRow, PaperMetadata } from "@/lib/paper";
 import { isRemoteArxivPath } from "@/lib/paper";
 import type { PdfVisualSessionTrace } from "@/lib/pdf/agent-trace/types";
@@ -14,8 +21,22 @@ import type { PdfHighlight } from "@/lib/pdf/highlight/types";
 import type { LibraryColumnPref } from "@/lib/settings";
 import { isMarkdownPath, paperRelFromNotes } from "@/lib/vault";
 import type { WikiRenameHeadingRequest } from "@/lib/wiki";
+import {
+	openWritingFile,
+	rememberWritingSource,
+} from "@/lib/workspace/navigation";
+import { updateTab } from "@/lib/workspace/store";
 import { type DocTab, tabIsPaperNotes } from "@/lib/workspace/tabs";
-import { isPlainPdfPath } from "@/lib/workspace/viewer";
+import {
+	isHtmlPath,
+	isPlainPdfPath,
+	viewerModeSpec,
+} from "@/lib/workspace/viewer";
+import { isWritingSource } from "@/lib/workspace/writing-focus";
+import {
+	isWritingPath,
+	resolveWritingTarget,
+} from "@/lib/writing/project-target";
 
 // Heavyweight viewers are lazy-loaded so the EmbedPDF (PDFium) and Plate
 // editor bundles stay out of the initial chunk and are fetched on first use.
@@ -29,19 +50,25 @@ const MarkdownEditor = lazy(() =>
 		default: m.MarkdownEditor,
 	})),
 );
-const PlazaView = lazy(() =>
-	import("@/components/plaza/plaza-view").then((m) => ({
-		default: m.PlazaView,
-	})),
-);
 const ExcalidrawViewer = lazy(() =>
 	import("@/components/viewer/excalidraw-viewer").then((m) => ({
 		default: m.ExcalidrawViewer,
 	})),
 );
+
+const TableViewer = lazy(() =>
+	import("@/components/research-table/table-viewer").then((m) => ({
+		default: m.TableViewer,
+	})),
+);
 const TextEditor = lazy(() =>
 	import("@/components/viewer/text-editor").then((m) => ({
 		default: m.TextEditor,
+	})),
+);
+const TexLiveViewer = lazy(() =>
+	import("@/components/viewer/texlive/tex-live-viewer").then((m) => ({
+		default: m.TexLiveViewer,
 	})),
 );
 
@@ -74,7 +101,13 @@ export type DocViewEditorProps = {
 		path: string,
 		md: string,
 		lastSaved: string,
+		tabId: string,
 	) => Promise<boolean>;
+	onResolveMarkdownConflict?: (
+		tabId: string,
+		action: "keep" | "load" | "hold",
+		disk: string,
+	) => void;
 	onAssetsChanged: () => void;
 	onTabPatch: (id: string, patch: Partial<DocTab>) => void;
 	onRenameHeading?: (
@@ -187,11 +220,31 @@ function TexCompilingPlaceholder() {
 	);
 }
 
+function TexCompilingIndicator() {
+	const { t } = useTranslation("app");
+	return (
+		<div
+			role="status"
+			aria-live="polite"
+			className="pointer-events-none absolute bottom-12 left-1/2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full border bg-background/95 px-3 py-1.5 text-xs shadow-raised"
+		>
+			<Loader2
+				className="size-3.5 animate-spin motion-reduce:animate-none"
+				aria-hidden
+			/>
+			{t("tabs.texCompiling")}
+		</div>
+	);
+}
+
 /**
  * DocView routes by tab kind/mode and only reads the matching domain props.
  * Compare just the fields the active branch consumes so a change in one
  * domain (e.g. library query keystrokes) does not re-render PDF / editor
- * panes. Must mirror the routing order below.
+ * panes. The mode → props-domain mapping comes from the viewer registry
+ * (`props` in viewer/index.ts) — a hand-written mirror of the render switch
+ * below whose correspondence is pinned by
+ * test/workspace-viewer-modes.test.ts, not enforced structurally.
  */
 function docViewPropsEqual(prev: DocViewProps, next: DocViewProps): boolean {
 	if (
@@ -212,16 +265,22 @@ function docViewPropsEqual(prev: DocViewProps, next: DocViewProps): boolean {
 		);
 	}
 	if (tab.kind === "plaza") return true;
-	if (tab.mode === "markdown") return prev.editor === next.editor;
-	if (tab.mode === "excalidraw") return prev.excalidraw === next.excalidraw;
-	if (tab.mode === "text") return prev.text === next.text;
-	if (tab.mode === "pdf" || tab.mode === "translation")
-		return prev.pdf === next.pdf;
-	return true;
+	switch (viewerModeSpec(tab.mode).props) {
+		case "editor":
+			return prev.editor === next.editor;
+		case "excalidraw":
+			return prev.excalidraw === next.excalidraw;
+		case "text":
+			return prev.text === next.text;
+		case "pdf":
+			return prev.pdf === next.pdf;
+		case "none":
+			return true;
+	}
 }
 
 /** Document content router by tab.kind / mode (library, trash, editor, PDF, image, HTML). */
-export const DocView = memo(function DocView({
+const DocumentContent = memo(function DocumentContent({
 	tab,
 	active,
 	keepMounted,
@@ -235,6 +294,7 @@ export const DocView = memo(function DocView({
 	trashReloadSignal = 0,
 }: DocViewProps) {
 	const plazaEnabled = useSettings((s) => s.plazaEnabled);
+	const cloud = useSharedWritingEditor(tab.path);
 	// Bind tab.id once per tab so PdfViewer's memo bails out when only the tab
 	// record changes (highlight / ask patches via updateTab).
 	const handlePdfHandle = useCallback(
@@ -253,10 +313,44 @@ export const DocView = memo(function DocView({
 		(list: PdfVisualSessionTrace[]) => pdf.onVisualTracesChange(tab.id, list),
 		[pdf, tab.id],
 	);
-	if (tab.texCompiling) {
+	const isNotes = tabIsPaperNotes(tab);
+	const handleEditorPersist = useCallback(
+		(path: string, md: string, lastSaved: string) =>
+			editor.onPersistFile(path, md, lastSaved, tab.id),
+		[editor.onPersistFile, tab.id],
+	);
+	// Stable identity: an inline lambda here is a new prop on every DocView
+	// render, which defeats the memo boundary around MarkdownEditor.
+	const handleEditorDirtyChange = useCallback(
+		(dirty: boolean) => {
+			editor.onTabPatch(
+				tab.id,
+				isNotes ? { notesDirty: dirty } : { markdownDirty: dirty },
+			);
+		},
+		[editor.onTabPatch, isNotes, tab.id],
+	);
+	if (tab.texLive) {
+		if (!active && !keepMounted) return null;
+		const texRoot = tab.texRoot ?? tab.path.replace(/\.pdf$/i, ".tex");
+		return (
+			<div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
+				<Suspense fallback={<TabLoadingSkeleton />}>
+					<TexLiveViewer
+						rootPath={texRoot}
+						vaultPath={vaultPath}
+						active={active}
+					/>
+				</Suspense>
+			</div>
+		);
+	}
+	if (tab.texCompiling && !tab.pdfBytes && !tab.pdfUrl) {
+		if (!active && !keepMounted) return null;
 		return <TexCompilingPlaceholder />;
 	}
 	if (!tab.loaded) {
+		if (!active && !keepMounted) return null;
 		return <TabLoadingSkeleton />;
 	}
 	if (tab.kind === "library") {
@@ -291,22 +385,30 @@ export const DocView = memo(function DocView({
 	}
 	if (tab.kind === "plaza") {
 		if (!plazaEnabled) return null;
-		// Embedded remote site: don't mount (and don't start its requests) until active.
-		if (!active) return null;
+		// The tab owns its embedded page until close, independent of the editor LRU.
 		return (
 			<Suspense fallback={<TabLoadingSkeleton />}>
-				<PlazaView path={tab.path} className="bg-background" />
+				<PlazaTabView
+					key={`${tab.id}:${tab.path}`}
+					path={tab.path}
+					active={active}
+					className="bg-background"
+				/>
 			</Suspense>
 		);
 	}
-	const isNotes = tabIsPaperNotes(tab);
 	if (tab.mode === "markdown") {
 		// PERF: same keep-alive gate as PDF. Dockview keeps the panel shell
 		// mounted (`renderer: 'always'` in dock-workspace); the workspace host
 		// LRU (`keepMounted`) decides whether the heavyweight Plate editor stays
 		// alive. Evicted editors unmount (their pending autosave flushes on
 		// unmount) and re-deserialize from the seed when shown again.
-		if (!active && !keepMounted) return <TabLoadingSkeleton />;
+		if (
+			!active &&
+			!keepMounted &&
+			!(isNotes ? tab.notesDirty : tab.markdownDirty)
+		)
+			return null;
 		return (
 			<div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-muted/30">
 				<Suspense fallback={<TabLoadingSkeleton />}>
@@ -315,6 +417,8 @@ export const DocView = memo(function DocView({
 						// `reloadKey` instead of remounting the whole editor.
 						key={isNotes ? `notes-center-${tab.id}` : `file-${tab.id}`}
 						className="h-full min-h-0"
+						tabId={tab.id}
+						active={active}
 						initialMarkdown={isNotes ? tab.notesSeed : tab.markdownSeed}
 						reloadKey={isNotes ? tab.notesKey : tab.seedKey}
 						filePath={
@@ -332,15 +436,12 @@ export const DocView = memo(function DocView({
 						placeholder={
 							isNotes ? editor.notesPlaceholder : editor.markdownPlaceholder
 						}
-						onPersist={editor.onPersistFile}
+						onPersist={handleEditorPersist}
+						saveConflict={tab.markdownConflict}
+						onResolveSaveConflict={editor.onResolveMarkdownConflict}
 						onAssetsChanged={editor.onAssetsChanged}
 						onRenameHeading={editor.onRenameHeading}
-						onDirtyChange={(d) =>
-							editor.onTabPatch(
-								tab.id,
-								isNotes ? { notesDirty: d } : { markdownDirty: d },
-							)
-						}
+						onDirtyChange={handleEditorDirtyChange}
 					/>
 				</Suspense>
 			</div>
@@ -375,6 +476,8 @@ export const DocView = memo(function DocView({
 						isActive={active}
 						isRemotePaper={isRemoteArxivPath(tab.path)}
 						plainViewer={isPlainPdfPath(tab.path)}
+						texRootPath={tab.texRoot}
+						pdfPath={tab.path}
 						importIdentifier={tab.paperMeta?.source_url ?? undefined}
 						onOpenSettings={pdf.onOpenSettings}
 						className="h-full w-full"
@@ -385,6 +488,7 @@ export const DocView = memo(function DocView({
 						onOpenTranslationTab={pdf.onOpenTranslationTab}
 					/>
 				</Suspense>
+				{tab.texCompiling && <TexCompilingIndicator />}
 			</div>
 		);
 	}
@@ -458,17 +562,42 @@ export const DocView = memo(function DocView({
 			</div>
 		);
 	}
+	if (tab.mode === "research-table") {
+		if (!active && !keepMounted) return <TabLoadingSkeleton />;
+		return (
+			<div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
+				<Suspense fallback={<TabLoadingSkeleton />}>
+					<TableViewer
+						key={tab.id}
+						path={tab.path}
+						seed={tab.textSeed}
+						reloadKey={tab.textKey}
+						vaultPath={vaultPath}
+						onPersist={text.onPersistFile}
+						onDirtyChange={(dirty) =>
+							text.onTabPatch(tab.id, { textDirty: dirty })
+						}
+					/>
+				</Suspense>
+			</div>
+		);
+	}
 	if (tab.mode === "text") {
+		if (cloud.pending || (cloud.session && !cloud.shared))
+			return <TabLoadingSkeleton />;
 		// Same keep-alive gate as the Markdown editor: an evicted tab's
 		// unmount flushes its pending autosave; remount re-seeds from disk.
 		if (!active && !keepMounted) return <TabLoadingSkeleton />;
-		return (
+		const source = (
 			<div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
 				<Suspense fallback={<TabLoadingSkeleton />}>
 					<TextEditor
 						// Stable per-tab key: external disk changes swap the document
 						// in place via `reloadKey` (view state and scroll survive).
-						key={`text-${tab.id}`}
+						key={`text-${tab.id}-${cloud.shared ? (cloud.shared.readOnly ? "cloud-view" : "cloud-edit") : "local"}`}
+						shared={cloud.shared ?? undefined}
+						panelId={tab.id}
+						hideLintFooter={isWritingSource(tab, vaultPath)}
 						seed={tab.textSeed}
 						path={tab.path}
 						reloadKey={tab.textKey}
@@ -481,17 +610,82 @@ export const DocView = memo(function DocView({
 				</Suspense>
 			</div>
 		);
+		return source;
 	}
-	// HTML pages are remote documents. Do not create their iframe (and therefore
-	// do not start a network request) until the panel is actually activated.
+	// HTML pages. Do not create their iframe (and therefore do not start a
+	// request) until the panel is actually activated. A `.html` file in the
+	// vault is a local preview; a paper body with `htmlUrl` stays remote.
 	if (!active) return null;
+	if (isHtmlPath(tab.path)) {
+		return (
+			<div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
+				<LocalHtmlViewer
+					path={tab.path}
+					reloadKey={tab.htmlKey}
+					title={tab.title}
+					className="h-full w-full"
+				/>
+			</div>
+		);
+	}
 	return (
 		<div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
 			<HtmlViewer
 				srcUrl={tab.htmlUrl}
 				title={tab.title}
 				className="h-full w-full"
+				onShowPdf={
+					tab.paperMeta?.type === "html"
+						? undefined
+						: () => updateTab(tab.id, { mode: "pdf" })
+				}
 			/>
 		</div>
 	);
 }, docViewPropsEqual);
+
+/** The project frame belongs to every project file, independent of viewer mode. */
+export function DocView(props: DocViewProps) {
+	const { tab, vaultPath, active, keepMounted } = props;
+	useEffect(() => {
+		if (active && tab.writingRoot)
+			rememberWritingSource(tab.path, tab.writingRoot);
+	}, [active, tab.path, tab.writingRoot]);
+	useEffect(() => {
+		if (
+			!active ||
+			!vaultPath ||
+			tab.writingRoot ||
+			!isWritingPath(vaultPath, tab.path)
+		)
+			return;
+		let cancelled = false;
+		void resolveWritingTarget(vaultPath, tab.path)
+			.then((project) => {
+				if (cancelled || !project) return;
+				if (project.compiledPdf) openWritingFile(tab.path, project.root, true);
+				else updateTab(tab.id, { writingRoot: project.root });
+			})
+			.catch((error) => {
+				if (!cancelled) notifyError(errorText(error));
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [active, vaultPath, tab.id, tab.path, tab.writingRoot]);
+	const content = <DocumentContent {...props} />;
+	if (vaultPath && tab.writingRoot && (active || keepMounted)) {
+		return (
+			<TexProjectView
+				panelId={tab.id}
+				sourcePath={tab.path}
+				projectRoot={tab.writingRoot}
+				vaultPath={vaultPath}
+				active={active}
+			>
+				{content}
+			</TexProjectView>
+		);
+	}
+	return content;
+}

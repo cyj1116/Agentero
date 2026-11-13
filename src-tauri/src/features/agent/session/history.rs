@@ -3,7 +3,7 @@
 use crate::core::error::AppError;
 use crate::features::agent::acp::client::{
     acp_terminals, agentero_acp_builder, client_initialize_request, timed_acp_initialize,
-    timed_acp_request, to_acp_agent,
+    timed_acp_load_session, timed_acp_request, to_acp_agent,
 };
 use crate::features::agent::acp::interaction::permission_response;
 use crate::features::agent::acp::updates::{
@@ -14,9 +14,12 @@ use crate::features::agent::models::{
     AcpSessionInfo, AgentDescriptor, AgentPlanEntry,
 };
 
+#[path = "dsh_history.rs"]
+mod dsh_history;
+
 use agent_client_protocol::schema::v1::{
-    ListSessionsRequest, LoadSessionRequest, RequestPermissionRequest, SessionId,
-    SessionNotification, SessionUpdate,
+    DeleteSessionRequest, ListSessionsRequest, LoadSessionRequest, RequestPermissionRequest,
+    SessionId, SessionNotification, SessionUpdate,
 };
 use agent_client_protocol::{Agent, ConnectionTo};
 use std::collections::HashSet;
@@ -157,6 +160,63 @@ pub async fn list_acp_sessions(
     match result {
         Ok(r) => Ok(r),
         Err(e) => Err(AppError::domain("acp", format!("acp: list sessions: {e}"))),
+    }
+}
+
+/// Delete one session via ACP `session/delete`.
+///
+/// `Ok(true)` means the agent accepted the delete. `Ok(false)` means it did
+/// not advertise `sessionCapabilities.delete` — the caller still hides the id
+/// locally. Errors are RPC failures after the capability was advertised.
+pub async fn delete_acp_session(
+    desc: &AgentDescriptor,
+    session_id: &str,
+    cwd: PathBuf,
+    remote: Option<&dyn crate::features::agent::remote_host::RemoteAgentLaunch>,
+) -> Result<bool, AppError> {
+    let acp = to_acp_agent(desc, Some(&cwd), remote)?;
+    let terminals = acp_terminals(Some(cwd));
+    let session_id = session_id.to_string();
+
+    let result = agentero_acp_builder!(terminals)
+        .on_receive_request(
+            async move |request: RequestPermissionRequest, responder, _cx| {
+                let _ = responder.respond(permission_response(&request, false));
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(acp, {
+            move |connection: ConnectionTo<Agent>| async move {
+                let init = timed_acp_initialize(
+                    connection
+                        .send_request(client_initialize_request())
+                        .block_task(),
+                )
+                .await?;
+                if init
+                    .agent_capabilities
+                    .session_capabilities
+                    .delete
+                    .is_none()
+                {
+                    return Ok(false);
+                }
+                timed_acp_request(
+                    "session/delete",
+                    connection
+                        .send_request(DeleteSessionRequest::new(session_id))
+                        .block_task(),
+                )
+                .await?;
+                Ok(true)
+            }
+        })
+        .await;
+
+    match result {
+        Ok(deleted) => Ok(deleted),
+        Err(e) => Err(AppError::domain("acp", format!("acp: delete session: {e}"))),
     }
 }
 
@@ -378,14 +438,6 @@ impl ReplayBuilder {
     }
 }
 
-/// Settle limits for `session/load` history replay. Agents push replayed turns
-/// as `session/update` notifications without a completion marker, so wait until
-/// they quiet down (`REPLAY_SETTLE_QUIET`) instead of always sleeping a fixed
-/// 800 ms; `REPLAY_SETTLE_CAP` keeps the previous worst-case capture window.
-const REPLAY_SETTLE_CAP: std::time::Duration = std::time::Duration::from_millis(800);
-const REPLAY_SETTLE_QUIET: std::time::Duration = std::time::Duration::from_millis(200);
-const REPLAY_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
-
 /// Load a session using the cwd resolved by `agent_spawn_cwd` at the service boundary.
 pub async fn load_acp_session(
     desc: &AgentDescriptor,
@@ -394,22 +446,24 @@ pub async fn load_acp_session(
     remote: Option<&dyn crate::features::agent::remote_host::RemoteAgentLaunch>,
 ) -> Result<AcpLoadSessionResult, AppError> {
     let acp = to_acp_agent(desc, Some(&cwd), remote)?;
+    let dsh_home = if remote.is_none()
+        && desc.template == crate::features::agent::models::AgentTemplate::Dsh
+    {
+        Some(dsh_history::home(
+            &crate::features::agent::acp::client::effective_local_agent_env(desc),
+            &cwd,
+        ))
+    } else {
+        None
+    };
 
     let builder: Arc<Mutex<ReplayBuilder>> = Arc::new(Mutex::new(ReplayBuilder::default()));
     let builder_for_notif = builder.clone();
-    // Last time a replay notification arrived; lets the settle loop below wait
-    // on actual replay activity instead of a fixed sleep.
-    let last_replay: Arc<Mutex<std::time::Instant>> =
-        Arc::new(Mutex::new(std::time::Instant::now()));
-    let last_replay_for_notif = last_replay.clone();
     let terminals = acp_terminals(Some(cwd.clone()));
 
     let result = agentero_acp_builder!(terminals)
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
-                if let Ok(mut at) = last_replay_for_notif.lock() {
-                    *at = std::time::Instant::now();
-                }
                 let Ok(mut b) = builder_for_notif.lock() else {
                     return Ok(());
                 };
@@ -483,17 +537,36 @@ pub async fn load_acp_session(
         )
         .connect_with(acp, {
             let sid = session_id.clone();
-            let last_replay = last_replay.clone();
+            let agent_id = desc.id.clone();
             move |connection: ConnectionTo<Agent>| async move {
-                timed_acp_initialize(
+                let init = timed_acp_initialize(
                     connection
                         .send_request(client_initialize_request())
                         .block_task(),
                 )
                 .await?;
 
-                timed_acp_request(
-                    "session/load",
+                if !init.agent_capabilities.load_session {
+                    // resume restores model context, but does not replay a transcript.
+                    // Dsh currently only implements resume; recover its local durable log.
+                    if let Some(home) = dsh_home {
+                        let home = home.map_err(agent_client_protocol::util::internal_error)?;
+                        return tokio::task::spawn_blocking(move || {
+                            dsh_history::load(&home, &sid, &cwd)
+                        })
+                        .await
+                        .map_err(agent_client_protocol::util::internal_error)?
+                        .map(Some)
+                        .map_err(agent_client_protocol::util::internal_error);
+                    }
+                    return Err(agent_client_protocol::util::internal_error(
+                        "This agent does not support history replay (session/load)".to_string(),
+                    ));
+                }
+
+                timed_acp_load_session(
+                    &agent_id,
+                    &sid,
                     connection
                         .send_request(
                             LoadSessionRequest::new(SessionId::new(sid.as_str()), cwd)
@@ -503,28 +576,17 @@ pub async fn load_acp_session(
                 )
                 .await?;
 
-                // Settle until replayed notifications quiet down instead of always
-                // sleeping 800 ms; the capture window stays capped at 800 ms.
-                let settle_start = std::time::Instant::now();
-                loop {
-                    tokio::time::sleep(REPLAY_SETTLE_POLL).await;
-                    let last = last_replay
-                        .lock()
-                        .map(|at| *at)
-                        .unwrap_or_else(|_| std::time::Instant::now());
-                    if last.elapsed() >= REPLAY_SETTLE_QUIET
-                        || settle_start.elapsed() >= REPLAY_SETTLE_CAP
-                    {
-                        break;
-                    }
-                }
-                Ok(())
+                // ACP replies only after replaying the history. The SDK dispatches
+                // notifications in order and completes each handler before the next
+                // message, so the load response is the replay completion boundary.
+                Ok(None)
             }
         })
         .await;
 
     match result {
-        Ok(()) => {
+        Ok(Some(history)) => Ok(history),
+        Ok(None) => {
             let taken = builder
                 .lock()
                 .map(|mut g| std::mem::take(&mut *g))
@@ -555,6 +617,62 @@ mod replay_builder_tests {
 
     fn id(v: &str) -> Option<String> {
         Some(v.to_string())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn load_response_waits_for_all_replay_notification_handlers() {
+        use agent_client_protocol::schema::v1::{
+            ContentChunk, LoadSessionRequest, LoadSessionResponse, SessionNotification,
+            SessionUpdate,
+        };
+        use agent_client_protocol::{Agent, Client};
+        use std::sync::{Arc, Mutex};
+
+        let replay = Arc::new(Mutex::new(ReplayBuilder::default()));
+        let notifications = replay.clone();
+        let agent = Agent.builder().on_receive_request(
+            async |request: LoadSessionRequest, responder, connection| {
+                for text in ["first", "second"] {
+                    connection.send_notification(SessionNotification::new(
+                        request.session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(text.into())),
+                    ))?;
+                }
+                responder.respond(LoadSessionResponse::new())?;
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+        Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _connection| {
+                    // Even asynchronously handled replay must finish before the
+                    // subsequent response resolves the load request.
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    if let SessionUpdate::AgentMessageChunk(chunk) = notification.update {
+                        let text = super::text_from_content_block(&chunk.content).unwrap();
+                        notifications
+                            .lock()
+                            .unwrap()
+                            .push_agent_chunk(false, text, None);
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(agent, async |connection| {
+                connection
+                    .send_request(LoadSessionRequest::new("history", "/vault"))
+                    .block_task()
+                    .await?;
+                let (lines, _) = std::mem::take(&mut *replay.lock().unwrap()).finish();
+                assert_eq!(lines.len(), 1);
+                assert_eq!(lines[0].text, "firstsecond");
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     #[test]

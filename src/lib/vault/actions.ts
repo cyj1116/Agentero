@@ -44,10 +44,14 @@ import {
 	openNewWindow,
 	pickCreateVaultDirectory,
 	pickVaultDirectory,
+	planVaultRename,
+	readVaultFile,
 	removeRecentVault,
 	removeTreeNode,
+	removeVaultPath,
 	saveVaultPath,
 	seededSkillIdsFromCreated,
+	treeFindNode,
 	vaultPathExists,
 	vaultRelativePath,
 	writeVaultFile,
@@ -100,22 +104,18 @@ import { basenameOf } from "@/lib/workspace/tabs";
 import { isExcalidrawPath } from "@/lib/workspace/viewer";
 
 export async function activateVault(path: string): Promise<void> {
-	bumpTreeGeneration();
-	setTree([]);
-	setTreeLoading(true);
 	// Tear down previous remote session so work catalogs are flushed.
 	const prev = getVaultPath();
 	if (prev && isRemoteVaultHandle(prev) && prev !== path) {
 		const prevId = remoteSessionIdFromHandle(prev);
 		if (prevId) {
-			try {
-				await remoteDisconnect(prevId);
-			} catch {
-				// best-effort
-			}
+			await remoteDisconnect(prevId);
 		}
 		clearRemoteSessionMeta();
 	}
+	bumpTreeGeneration();
+	setTree([]);
+	setTreeLoading(true);
 	saveVaultPath(path);
 	setVaultPath(path);
 	void import("@/lib/activity").then(({ track }) => {
@@ -167,6 +167,12 @@ export async function openRemoteVault(args: {
 		}
 		setVaultBusy(true);
 		const info = await remoteConnect(args);
+		try {
+			await activateVault(info.vaultHandle);
+		} catch (error) {
+			await remoteDisconnect(info.sessionId);
+			throw error;
+		}
 		saveRemoteSessionMeta(info);
 		rememberRecentRemoteVault({
 			kind: "remote",
@@ -175,8 +181,6 @@ export async function openRemoteVault(args: {
 			remotePath: args.remotePath,
 			label: info.displayName,
 		});
-		// Pseudo-handle routes tree / IO through Host remote_* commands.
-		await activateVault(info.vaultHandle);
 	} catch (e) {
 		notifyError(
 			e instanceof Error ? e.message : i18n.t("app:vault.remoteConnectFailed"),
@@ -371,6 +375,7 @@ export async function trashPathsAndNotify(absPaths: string[]): Promise<void> {
 				p.startsWith(`${rootNorm}/`),
 		);
 	if (valid.length === 0) return;
+	if (!(await confirmEmbeddedTableDelete(vaultPath, valid))) return;
 	setVaultBusy(true);
 	trackInternalRenamePaths(valid, Number.POSITIVE_INFINITY);
 	try {
@@ -638,17 +643,21 @@ type PasteDestination = {
 	isPaperLeaf: boolean;
 };
 
+/** A source path and the absolute path it now lives at. */
+export type MovedPathPair = { from: string; to: string };
+
 /** Move a list of absolute source paths into a resolved destination parent. */
 async function movePathsToDestination(
 	vaultPath: string,
 	srcAbsPaths: string[],
 	dest: PasteDestination,
-): Promise<{ failed: string[]; blocked: string[] }> {
+): Promise<{ failed: string[]; blocked: string[]; moved: MovedPathPair[] }> {
 	const destRel = normalizeVaultRel(dest.rel);
 	const destUnderPapers = destRel === "papers" || destRel.startsWith("papers/");
 	const rootKey = pathKey(vaultPath);
 	const failed: string[] = [];
 	const blocked: string[] = [];
+	const moved: MovedPathPair[] = [];
 
 	for (const srcAbs of srcAbsPaths) {
 		const normSrc = srcAbs.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -725,48 +734,52 @@ async function movePathsToDestination(
 		} catch {
 			trackInternalRenamePaths(pendingEventPaths, Date.now() + 2000);
 			failed.push(srcAbs);
+			continue;
 		}
+		moved.push({ from: normSrc, to: toAbs });
 	}
 
-	return { failed, blocked };
+	return { failed, blocked, moved };
 }
 
 /** Paste previously cut paths into the given target (folder, file, or vault root). */
 export async function pasteCutPaths(
 	targetPath: string | null | undefined,
-): Promise<void> {
+): Promise<MovedPathPair[]> {
 	const vaultPath = getVaultPath();
 	if (!vaultPath) {
 		notifyError(i18n.t("sidebar:fileTree.needsVault"));
-		return;
+		return [];
 	}
 	if (!isTauri()) {
 		notifyError(i18n.t("sidebar:fileTree.pasteDesktopOnly"));
-		return;
+		return [];
 	}
 	if (isRemoteVaultHandle(vaultPath)) {
 		notifyWarning(i18n.t("sidebar:fileTree.remoteCutPasteDisabled"));
-		return;
+		return [];
 	}
 
 	const { cutPaths } = vaultStore.getState();
-	if (cutPaths.length === 0) return;
+	if (cutPaths.length === 0) return [];
 
 	const { tree } = vaultStore.getState();
 	const dest = resolvePasteDestination(vaultPath, tree, targetPath);
 	if (!dest) {
 		notifyError(i18n.t("sidebar:fileTree.pasteNeedsSelection"));
-		return;
+		return [];
 	}
 
 	setVaultBusy(true);
+	let moved: MovedPathPair[] = [];
 
 	try {
-		const { failed, blocked } = await movePathsToDestination(
-			vaultPath,
-			cutPaths,
-			dest,
-		);
+		const {
+			failed,
+			blocked,
+			moved: applied,
+		} = await movePathsToDestination(vaultPath, cutPaths, dest);
+		moved = applied;
 		// Clear successfully moved items; keep failed/blocked ones staged so the
 		// user sees what did not move.
 		setCutPaths([...failed, ...blocked]);
@@ -789,6 +802,7 @@ export async function pasteCutPaths(
 	} finally {
 		setVaultBusy(false);
 	}
+	return moved;
 }
 
 /** Move a list of paths to the destination implied by the drop target. */
@@ -888,12 +902,29 @@ export async function confirmRenamePath(
 	const parent = fromRel.includes("/")
 		? fromRel.slice(0, fromRel.lastIndexOf("/"))
 		: "";
-	const toRel = parent ? `${parent}/${trimmed}` : trimmed;
+	const node = treeFindNode(vaultStore.getState().tree, path);
+	const plan = planVaultRename({
+		parentRel: parent,
+		currentName,
+		nextName: trimmed,
+		kind: node?.kind ?? "directory",
+	});
+	const toRel = plan.toRel;
 	const toAbs = joinVaultPath(vaultPath, toRel);
-	const pendingEventPaths = [path, toAbs];
+	const folderAbs = plan.folderRel
+		? joinVaultPath(vaultPath, plan.folderRel)
+		: null;
+	const pendingEventPaths = folderAbs
+		? [path, folderAbs, toAbs]
+		: [path, toAbs];
 	trackInternalRenamePaths(pendingEventPaths, Number.POSITIVE_INFINITY);
 	setVaultBusy(true);
+	let createdFolder = false;
 	try {
+		if (folderAbs && !(await vaultPathExists(folderAbs))) {
+			await createVaultDirectory(folderAbs);
+			createdFolder = true;
+		}
 		const result = await moveVaultPath(
 			vaultPath,
 			fromRel,
@@ -910,6 +941,15 @@ export async function confirmRenamePath(
 			}),
 		);
 	} catch (error) {
+		if (createdFolder && folderAbs) {
+			// Do not leave an empty folder behind when the move is rejected.
+			try {
+				await removeVaultPath(folderAbs);
+				await refreshTree(vaultPath);
+			} catch {
+				// Best-effort cleanup; the original error is more useful.
+			}
+		}
 		trackInternalRenamePaths(pendingEventPaths, Date.now() + 2000);
 		notifyError(
 			error instanceof Error
@@ -919,6 +959,106 @@ export async function confirmRenamePath(
 	} finally {
 		setVaultBusy(false);
 	}
+}
+
+async function tableIdOf(absPath: string): Promise<string | null> {
+	try {
+		const text = await readVaultFile(absPath);
+		const id = (JSON.parse(text) as { id?: unknown }).id;
+		return typeof id === "string" && id.trim() ? id : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Confirm before deleting a research table that notes embed.
+ * A failed lookup reports the error and still allows the delete.
+ */
+async function confirmEmbeddedTableDelete(
+	vaultPath: string,
+	absPaths: string[],
+): Promise<boolean> {
+	const { isResearchTablePath } = await import("@/lib/research-table/model");
+	const tables = absPaths.filter((path) => isResearchTablePath(path));
+	if (tables.length === 0) return true;
+	const { researchTableBacklinks } = await import(
+		"@/lib/research-table/catalog"
+	);
+	let count = 0;
+	for (const abs of tables) {
+		const rel = vaultRelativePath(vaultPath, abs);
+		if (!rel) continue;
+		try {
+			const id = await tableIdOf(abs);
+			const notes = await researchTableBacklinks({
+				vaultPath,
+				path: rel,
+				id: id ?? undefined,
+			});
+			count += notes.length;
+		} catch (error) {
+			notifyError(errorText(error));
+		}
+	}
+	if (count < 1) return true;
+	return window.confirm(
+		i18n.t("sidebar:fileTree.deleteTableConfirm", { count }),
+	);
+}
+
+async function writeExperimentPair(
+	vaultPath: string,
+	parent: string,
+	name: string,
+): Promise<void> {
+	const { createResearchTable, TABLE_SUFFIX } = await import(
+		"@/lib/research-table/model"
+	);
+	const { experimentFileStem, experimentNoteMarkdown } = await import(
+		"@/lib/markdown/experiment"
+	);
+	const stem = experimentFileStem(name);
+	const tableName = `${stem}${TABLE_SUFFIX}`;
+	const noteName = `${stem}.md`;
+	if (
+		!stem ||
+		!isValidVaultEntryName(tableName) ||
+		!isValidVaultEntryName(noteName)
+	) {
+		notifyError(i18n.t("sidebar:fileTree.invalidName"));
+		return;
+	}
+	const tableAbs = joinVaultPath(parent, tableName);
+	const noteAbs = joinVaultPath(parent, noteName);
+	if (await vaultPathExists(tableAbs)) {
+		notifyError(i18n.t("sidebar:fileTree.alreadyExists", { name: tableName }));
+		return;
+	}
+	if (await vaultPathExists(noteAbs)) {
+		notifyError(i18n.t("sidebar:fileTree.alreadyExists", { name: noteName }));
+		return;
+	}
+	const rel = vaultRelativePath(vaultPath, tableAbs);
+	if (!rel) {
+		notifyError(i18n.t("sidebar:fileTree.invalidName"));
+		return;
+	}
+	const table = createResearchTable(stem);
+	table.fields[0].name = i18n.t("editor:researchTable.name");
+	await writeVaultFile(tableAbs, `${JSON.stringify(table, null, 2)}\n`);
+	try {
+		await writeVaultFile(noteAbs, experimentNoteMarkdown(table.id, rel));
+	} catch (error) {
+		try {
+			await removeVaultPath(tableAbs);
+		} catch {
+			// The note error is the one the caller should see.
+		}
+		throw error;
+	}
+	await refreshTree(vaultPath);
+	openPath(noteAbs);
 }
 
 export function startCreate(kind: TreeCreateKind, parentPath: string): void {
@@ -952,21 +1092,33 @@ export async function confirmCreate(name: string): Promise<void> {
 	setCreateDraft(null);
 	try {
 		setVaultBusy(true);
+		if (kind === "experiment") {
+			await writeExperimentPair(vaultPath, createDraft.parentPath, trimmed);
+			return;
+		}
 		// Use vault-aware exists: local FS plugin cannot see `remote:<id>/…`.
 		if (await vaultPathExists(full)) {
 			notifyError(i18n.t("sidebar:fileTree.alreadyExists", { name: trimmed }));
 			return;
 		}
-		if (kind === "file") {
-			const initialContent = isExcalidrawPath(trimmed)
-				? JSON.stringify({
-						type: "excalidraw",
-						version: 2,
-						source: "https://excalidraw.com",
-						elements: [],
-						appState: { collaborators: [] },
-					})
-				: "";
+		if (kind !== "folder") {
+			const { createResearchTable, isResearchTablePath, researchTableStem } =
+				await import("@/lib/research-table/model");
+			const table = isResearchTablePath(trimmed)
+				? createResearchTable(researchTableStem(trimmed))
+				: null;
+			if (table) table.fields[0].name = i18n.t("editor:researchTable.name");
+			const initialContent = table
+				? `${JSON.stringify(table, null, 2)}\n`
+				: isExcalidrawPath(trimmed)
+					? JSON.stringify({
+							type: "excalidraw",
+							version: 2,
+							source: "https://excalidraw.com",
+							elements: [],
+							appState: { collaborators: [] },
+						})
+					: "";
 			await writeVaultFile(full, initialContent);
 			await refreshTree(vaultPath);
 			openPath(full);

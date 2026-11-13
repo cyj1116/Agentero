@@ -1,4 +1,10 @@
-import { FolderOpen, FolderPlus, Server, Trash2 } from "lucide-react";
+import {
+	FolderOpen,
+	FolderPlus,
+	Server,
+	Trash2,
+	UserRound,
+} from "lucide-react";
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { SiZotero } from "react-icons/si";
@@ -7,8 +13,10 @@ import {
 	RemoteVaultDialog,
 } from "@/components/dialogs/remote-vault-dialog";
 import { Button } from "@/components/ui/button";
+import { accountSurfaceEnabled } from "@/features/account/visibility";
 import { displayPath } from "@/lib/core/path";
 import { cn } from "@/lib/core/utils";
+import { openSettingsWindow } from "@/lib/shell/settings-window";
 import { vaultDisplayName } from "@/lib/vault";
 import {
 	getRecentRemoteVaults,
@@ -94,7 +102,7 @@ export function VaultWelcome({
 	onRemoveRecent: (path: string) => void;
 	className?: string;
 }) {
-	const { t } = useTranslation(["app", "sidebar"]);
+	const { t } = useTranslation(["app", "sidebar", "settings"]);
 	const [remoteOpen, setRemoteOpen] = useState(false);
 	const [connecting, setConnecting] = useState(false);
 	const [recentRemotes, setRecentRemotes] = useState<RecentRemoteVault[]>(() =>
@@ -119,7 +127,17 @@ export function VaultWelcome({
 			)}
 		>
 			<div className="flex w-full max-w-lg flex-col gap-6">
-				<div className="mx-auto flex size-12 items-center justify-center rounded-xl border bg-background shadow-sm">
+				{accountSurfaceEnabled ? (
+					<Button
+						variant="ghost"
+						className="self-center"
+						onClick={() => openSettingsWindow("account")}
+					>
+						<UserRound className="size-4" />
+						{t("settings:nav.account")}
+					</Button>
+				) : null}
+				<div className="mx-auto flex size-12 items-center justify-center rounded-xl border bg-background shadow-raised">
 					<FolderOpen className="size-6 text-muted-foreground" />
 				</div>
 
@@ -167,7 +185,7 @@ export function VaultWelcome({
 				</div>
 
 				{recentVaults.length > 0 || recentRemotes.length > 0 ? (
-					<div className="overflow-hidden rounded-lg border bg-background shadow-sm">
+					<div className="overflow-hidden rounded-lg border bg-background shadow-raised">
 						<div className="border-b px-3 py-2">
 							<p className="font-medium text-muted-foreground text-xs">
 								{t("vault.recentTitle")}

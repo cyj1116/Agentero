@@ -6,13 +6,11 @@ use crate::core::log_util::{trunc, OpTimer};
 use crate::core::remote::parse_remote_handle;
 use crate::features::paper::catalog::papers::PaperRecord;
 use crate::features::paper::catalog::CapsCache;
-use crate::features::paper::import::pdf_parse::{PaperParseBodyArgs, PaperParseResult};
 use crate::features::paper::import::search_router::needs_s2_venue_enrichment;
 use crate::features::paper::import::RemoteImportOps;
 use crate::features::paper::import::{
-    AssetDownloadResult, ImportLocalPdfArgs, ImportLocalPdfResult, LookupImportBatchArgs,
-    LookupImportBatchResult, PaperDownloadAssetsArgs, SkillImportResult, StageImportFileArgs,
-    StageImportFileResult,
+    ImportLocalPdfArgs, ImportLocalPdfResult, LookupImportBatchArgs, LookupImportBatchResult,
+    SkillImportResult, StageImportFileArgs, StageImportFileResult,
 };
 use crate::features::paper::scholar_api::sources::semantic_scholar::{
     better_publication, SemanticScholarApi,
@@ -46,14 +44,99 @@ pub async fn lookup_import_batch(
                     Some(&host_app),
                     &vault_id,
                     &paper.id,
+                    &paper.path,
                 );
             }
         }
         return Ok(op.finish_result(result));
     }
+    let vault_path = args.vault_path.clone();
     let result =
         super::import_by_identifier_batch(args, Some(&host_app), Some(&cache), note_mode).await;
+    if let Ok(batch) = &result {
+        if let Ok(vault) = resolve_vault(&vault_path) {
+            for paper in &batch.imported {
+                crate::features::host_hooks::enqueue_preparation_plan(
+                    &app,
+                    &vault,
+                    &paper.preparation,
+                );
+            }
+            // Dedupe preserves the catalog entry, but should not hide a missing
+            // source behind an older OCR body when the user imports its ID again.
+            for skipped in batch
+                .skipped
+                .iter()
+                .filter(|item| item.kind == "arxiv" && item.reason == "already_in_library")
+            {
+                if let Ok(Some(paper)) = crate::features::paper::catalog::papers::find_by_identifier(
+                    &vault,
+                    "arxiv_id",
+                    &skipped.value,
+                ) {
+                    if agentero_core::features::paper::source::needs_preparation(&vault, &paper) {
+                        crate::features::jobs::spawn_parse_body_after_assets(
+                            Some(&app),
+                            &vault,
+                            &paper.path,
+                            false,
+                        );
+                    }
+                }
+            }
+        }
+    }
     Ok(op.finish_result(result))
+}
+
+#[derive(Debug, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatImportExtractArgs {
+    /// Pasted chat text, or a bare AI-chat share URL (chatgpt.com/share/...).
+    pub text: String,
+}
+
+#[derive(Debug, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatImportExtractResult {
+    pub arxiv: Vec<String>,
+    pub dois: Vec<String>,
+    pub pmids: Vec<String>,
+    /// Set when the input was a share link whose page we fetched.
+    pub fetched_from: Option<String>,
+}
+
+/// Extract paper identifiers from pasted chat text or an AI-chat share URL
+/// (#652). Deterministic scanner — no LLM; pasted text never leaves the
+/// machine, share pages are fetched once and the page text is dropped after
+/// extraction.
+#[tauri::command]
+#[specta::specta]
+pub async fn chat_import_extract(
+    args: ChatImportExtractArgs,
+) -> Result<ApiResult<ChatImportExtractResult>, String> {
+    let share_url = super::chat_extract::is_share_url(&args.text);
+    let op = OpTimer::start_with(
+        "chat_import_extract",
+        if share_url { "share-url" } else { "text" },
+    );
+    let result: Result<(super::chat_extract::ExtractedIdentifiers, Option<String>), AppError> =
+        if share_url {
+            let url = args.text.trim().to_string();
+            super::chat_extract::extract_from_share_url(&url)
+                .await
+                .map(|ids| (ids, Some(url)))
+        } else {
+            Ok((super::chat_extract::extract_identifiers(&args.text), None))
+        };
+    Ok(
+        op.finish_result(result.map(|(ids, fetched_from)| ChatImportExtractResult {
+            arxiv: ids.arxiv,
+            dois: ids.dois,
+            pmids: ids.pmids,
+            fetched_from,
+        })),
+    )
 }
 
 #[derive(Debug, serde::Deserialize, specta::Type)]
@@ -93,27 +176,6 @@ pub fn skill_discard(discovery_id: String) -> ApiResult<()> {
     op.finish_result(super::discard_skill_discovery(&discovery_id))
 }
 
-/// Download PDF (+ arXiv LaTeX) for an existing paper folder that is missing local assets.
-/// When no TeX remains after download, also tries liteparse → PAPER.md.
-#[tauri::command]
-#[specta::specta]
-pub async fn paper_download_assets(
-    app: tauri::AppHandle,
-    remote: State<'_, Arc<dyn RemoteImportOps>>,
-    cache: State<'_, CapsCache>,
-    args: PaperDownloadAssetsArgs,
-) -> Result<ApiResult<AssetDownloadResult>, String> {
-    let path = trunc(&args.path, 120);
-    let op = OpTimer::start_with("paper_download_assets", format!("path={path}"));
-    if let Some(session_id) = parse_remote_handle(&args.vault_path).map(str::to_owned) {
-        return Ok(op.finish_result(remote.download_paper_assets_remote(&session_id, args).await));
-    }
-    let host_app = crate::features::host_hooks::wrap(&app);
-    let result =
-        super::download_paper_assets_with_progress(args, Some(&host_app), Some(&cache)).await;
-    Ok(op.finish_result(result))
-}
-
 /// Import local PDF file(s) into the vault as paper folders (copy + catalog + liteparse).
 #[tauri::command]
 #[specta::specta]
@@ -139,38 +201,30 @@ pub async fn paper_import_local_pdf(
                     Some(&host_app),
                     &vault_id,
                     &paper.id,
+                    &paper.path,
                 );
             }
         }
         result
     } else {
-        super::import_local_pdfs(args, Some(&host_app), Some(&cache), note_mode).await
+        let vault_path = args.vault_path.clone();
+        let result = super::import_local_pdfs(args, Some(&host_app), Some(&cache), note_mode).await;
+        if let Ok(imported) = &result {
+            if let Ok(vault) = resolve_vault(&vault_path) {
+                for paper in &imported.papers {
+                    crate::features::host_hooks::enqueue_preparation_plan(
+                        &app,
+                        &vault,
+                        &paper.preparation,
+                    );
+                }
+            }
+        }
+        result
     };
     Ok(op.finish_result_ok_extra(result, |r| {
         format!("imported={} errors={}", r.papers.len(), r.errors.len())
     }))
-}
-
-/// Parse a paper's local PDF into `PAPER.md` using liteparse.
-/// `task_id` is the cooperative-cancel polling id (the JobCenter job id).
-#[tauri::command]
-#[specta::specta]
-pub async fn paper_parse_body(
-    remote: State<'_, Arc<dyn RemoteImportOps>>,
-    cache: State<'_, CapsCache>,
-    args: PaperParseBodyArgs,
-) -> Result<ApiResult<PaperParseResult>, String> {
-    let path = trunc(&args.path, 120);
-    let op = OpTimer::start_with("paper_parse_body", format!("path={path}"));
-
-    if let Some(session_id) = parse_remote_handle(&args.vault_path).map(str::to_owned) {
-        let result = remote.parse_paper_body_remote(&session_id, args).await;
-        return Ok(op.finish_result(result));
-    }
-
-    let result =
-        crate::features::paper::import::pdf_parse::parse_paper_body(args, Some(&cache)).await;
-    Ok(op.finish_result(result))
 }
 
 /// Stage a path-less OS drop (File bytes as base64) into `~/.agentero/import-tmp/`.
@@ -192,8 +246,6 @@ pub async fn paper_stage_import_file(
 pub struct PaperResolveIdentifierArgs {
     /// DOI / arXiv id / URL / title text.
     pub text: String,
-    #[serde(default)]
-    pub translator_base_url: Option<String>,
 }
 
 /// Resolve an identifier (DOI/arXiv) to metadata without importing — backs
@@ -213,12 +265,10 @@ pub async fn paper_resolve_identifier(args: PaperResolveIdentifierArgs) -> ApiRe
             && super::search_router::extract_primary_identifier(&args.text).is_some();
 
     if try_identifier {
-        let base = args
-            .translator_base_url
-            .clone()
-            .unwrap_or_else(|| super::DEFAULT_TRANSLATOR_BASE_URL.to_string());
+        let base = super::DEFAULT_TRANSLATOR_BASE_URL.to_string();
         match super::resolve_metadata(&args.text, &base, None).await {
-            Ok((mut meta, _used_translator)) => {
+            Ok(resolved) => {
+                let mut meta = resolved.record;
                 enrich_publication_from_s2(&mut meta).await;
                 super::enrich_remote_urls(&mut meta);
                 op.finish_ok();

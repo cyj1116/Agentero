@@ -28,8 +28,10 @@ import { formatLocaleTimestamp } from "@/i18n";
 import {
 	type AgentListResponse,
 	type AgentModeChoice,
+	agentTemplateById,
 	cancelAgentRun,
 	ensureCatalogAgent,
+	isChatOnlyAgentTemplate,
 	loadModelPref,
 	loadReasoningEffortPref,
 	type PromptImage,
@@ -42,21 +44,34 @@ import {
 	useAgentSessionStore,
 } from "@/lib/agent/agent-session-store";
 import {
+	planAnnotationRefs,
+	visualDraftsInAnnotationOrder,
+} from "@/lib/agent/annotation-prompt";
+import {
 	type AgentOption,
+	type AskUserAnswer,
+	type AskUserQuestion,
 	applyToolToLines,
+	buildLocalTranscriptPrompt,
 	type ChatLine,
 	type ChatSessionHistoryItem,
 	errorChatLine,
 	errorText,
 	type PendingSessionEvent,
 	type PendingTerminalEvent,
+	shouldAttachLocalTranscript,
 	upsertChatSessionTurn,
 } from "@/lib/agent/chat-state";
 import {
+	extractMentionPaths,
 	extractSelectionTokens,
+	extractSkillIds,
+	extractVisualIds,
 	stripInlineTokens,
+	transcriptMarkup,
 } from "@/lib/agent/composer-inline-tokens";
 import type { AgentComposerState } from "@/lib/agent/composer-state";
+import { sidebarContextRequest } from "@/lib/agent/context-request";
 import {
 	isPlazaMentionPath,
 	parseNeedFulltextIds,
@@ -68,14 +83,19 @@ import {
 	currentSelections,
 	type SelectionContext,
 } from "@/lib/agent/selection-store";
-import type { AcpCommand } from "@/lib/agent/slash-commands";
+import {
+	type AcpCommand,
+	matchAcpCommandText,
+} from "@/lib/agent/slash-commands";
 import { assembleTurnPrompt } from "@/lib/agent/turn-prompt";
 import {
-	consumeVisualDrafts,
-	currentVisualDrafts,
+	activeVisualDraftSessionKey,
 	type PdfVisualDraft,
+	takeVisualDrafts,
+	visualDraftsForSession,
 } from "@/lib/agent/visual-context-store";
 import { isTauri } from "@/lib/core/tauri";
+import type { PaperMetadata } from "@/lib/paper";
 import {
 	bindVisualTracesForTurn,
 	isVisualTraceHistoryId,
@@ -167,6 +187,8 @@ export type UseAgentSendOptions = {
 	setHistoryOpen: Dispatch<SetStateAction<boolean>>;
 	setSelectedAgentId: Dispatch<SetStateAction<string | null>>;
 	selectedVaultPath: string | null;
+	/** Catalog metadata for the focused paper (chat-only agent context). */
+	selectedPaperMeta: PaperMetadata | null;
 	contextPaths: string[];
 	/** Live composer state plus the session-scoped persistence API. */
 	composer: SessionComposerStateApi;
@@ -186,7 +208,19 @@ export type AgentSend = {
 	removeQueuedMessage: (id: string) => void;
 	clearMessageQueue: () => void;
 	cancelCurrentRun: () => Promise<void>;
-	answerToolAskUser: (answer: string, toolCallId: string) => Promise<boolean>;
+	answerToolAskUser: (input: {
+		answer: string;
+		toolCallId: string;
+		questions: AskUserQuestion[];
+		answers: AskUserAnswer[];
+	}) => Promise<boolean>;
+	recordAskUserAnswers: (input: {
+		sessionId: string;
+		toolCallId: string | null | undefined;
+		questions: AskUserQuestion[];
+		answers?: AskUserAnswer[];
+		cancelled?: boolean;
+	}) => void;
 };
 
 export function useAgentSend({
@@ -218,6 +252,7 @@ export function useAgentSend({
 	setHistoryOpen,
 	setSelectedAgentId,
 	selectedVaultPath,
+	selectedPaperMeta,
 	contextPaths,
 	composer: {
 		snapshot: snapshotComposerState,
@@ -419,6 +454,8 @@ export function useAgentSend({
 		modelId: string | undefined;
 		preferredEffort: string | null;
 		skillIds: string[];
+		context: ReturnType<typeof sidebarContextRequest>;
+		resumeTranscript?: string;
 	}) =>
 		runOnce({
 			agentId: turn.agentId,
@@ -445,17 +482,17 @@ export function useAgentSend({
 			fastMode: fastAvailable ? fastEnabled : undefined,
 			skillIds: turn.skillIds,
 			permissionMode: loadSettings().agentPermissionMode,
+			context: turn.context ?? undefined,
+			resumeTranscript: turn.resumeTranscript,
 		});
 
 	/**
-	 * Pin-binding fields for the turn: without new visual drafts the turn
-	 * continues the pin bound to the history row / options; with drafts the
-	 * first draft's pin wins for the new history entry.
+	 * Pin binding for a session opened from a visual mark. Composer reference
+	 * crops are not a pin: they must not become this session's mark id.
 	 */
 	const visualTraceBinding = (
 		activeHistory: ChatSessionHistoryItem | undefined,
 		options: SendOptions | undefined,
-		resolvedVisualDrafts: PdfVisualDraft[],
 	): {
 		continueVisualTraceId: string | undefined;
 		continuePaperAbs: string | undefined;
@@ -470,24 +507,17 @@ export function useAgentSend({
 			activeHistory && "paperAbsPath" in activeHistory
 				? (activeHistory as { paperAbsPath?: string }).paperAbsPath
 				: undefined;
-		const continuesPin = resolvedVisualDrafts.length === 0;
+		const continueVisualTraceId =
+			options?.visualTraceId?.trim() ||
+			historyVisualTraceId?.trim() ||
+			undefined;
+		const continuePaperAbs =
+			options?.paperAbsPath?.trim() || historyPaperAbs?.trim() || undefined;
 		return {
-			continueVisualTraceId: continuesPin
-				? options?.visualTraceId?.trim() ||
-					historyVisualTraceId?.trim() ||
-					undefined
-				: undefined,
-			continuePaperAbs: continuesPin
-				? options?.paperAbsPath?.trim() || historyPaperAbs?.trim() || undefined
-				: undefined,
-			boundVisualTraceId:
-				options?.visualTraceId?.trim() ||
-				historyVisualTraceId ||
-				resolvedVisualDrafts[0]?.id,
-			boundPaperAbs:
-				options?.paperAbsPath?.trim() ||
-				historyPaperAbs ||
-				resolvedVisualDrafts[0]?.paperAbsPath,
+			continueVisualTraceId,
+			continuePaperAbs,
+			boundVisualTraceId: continueVisualTraceId,
+			boundPaperAbs: continuePaperAbs,
 		};
 	};
 
@@ -601,9 +631,17 @@ export function useAgentSend({
 		textRaw: string,
 		options?: SendOptions,
 	): Promise<boolean> => {
-		// Inline @/$ markers stay in the draft; the user bubble / ACP body is plain.
+		// ACP body is plain text. `markup` keeps the chips for the user bubble.
 		const text = stripInlineTokens(textRaw).trim();
-		const resolvedVisualDrafts = options?.visualDrafts ?? currentVisualDrafts();
+		const markup = transcriptMarkup(textRaw);
+		const draftSessionKey = activeVisualDraftSessionKey();
+		const annotationRefs = planAnnotationRefs(textRaw);
+		const resolvedVisualDrafts =
+			options?.visualDrafts ??
+			visualDraftsInAnnotationOrder(
+				annotationRefs,
+				visualDraftsForSession(draftSessionKey),
+			);
 		const hasVisualDrafts = resolvedVisualDrafts.length > 0;
 		const attachedImages = (options?.images ?? []).filter(
 			(img) => img.data.trim().length > 0,
@@ -633,14 +671,26 @@ export function useAgentSend({
 					...snap,
 					text: textRaw,
 				};
-		const resolvedContextPaths = options?.contextPaths ?? contextPaths;
+		// Chips live in the draft. Union them with the composer snapshot so an
+		// edit-resend still hands the file / skill to the agent after the
+		// composer has been cleared.
+		const resolvedContextPaths = [
+			...new Set([
+				...(options?.contextPaths ?? contextPaths),
+				...extractMentionPaths(textRaw),
+			]),
+		];
 		const inlineSelections = extractSelectionTokens(textRaw);
 		const storeSelections = currentSelections();
 		const resolvedSelections =
 			options?.selections ??
 			(inlineSelections.length > 0 ? inlineSelections : storeSelections);
-		const resolvedSkillIds =
-			options?.skillIds ?? submittedComposerState.selectedSkillIds;
+		const resolvedSkillIds = [
+			...new Set([
+				...(options?.skillIds ?? submittedComposerState.selectedSkillIds),
+				...extractSkillIds(textRaw),
+			]),
+		];
 		const submissionGeneration = ++submissionGenRef.current;
 		const sessionContextGeneration = sessionContextGenRef.current;
 		const requestVaultPath = vaultPath;
@@ -655,36 +705,70 @@ export function useAgentSend({
 			const agent = await resolveTurnAgentAndModel(options, forceNewSession);
 			if (!agent) return false;
 			// Options are availability-filtered in buildOptions; unavailable agents
-			// never appear in the switcher.
-			const isAcpCommand = (acpCommandsByAgent[agent.agentId] ?? []).some(
-				(command) =>
-					text === `/${command.name}` || text.startsWith(`/${command.name} `),
+			// never appear in the switcher. Match both `/name` and `$name` so a
+			// skill inserted by either prefix is sent in the advertised form.
+			const acpCommand = matchAcpCommandText(
+				acpCommandsByAgent[agent.agentId] ?? [],
+				text,
 			);
+			const isAcpCommand = acpCommand !== null;
+			const turnText = acpCommand?.text ?? text;
 			if (forceNewSession) {
 				// Drop any panel-level continue target before resolving resume.
 				activeConversationRef.current = null;
 			}
 			const target = resolveResumeTarget(options, forceNewSession);
+			// Chat-only built-in agents (e.g. the Zhihu agent) cannot read Vault
+			// files; injecting the read-instruction block would leak local paths to
+			// a third-party service, so drop the auto-added context entirely and
+			// send only public paper metadata instead.
+			const chatOnly = isChatOnlyAgentTemplate(
+				agentTemplateById(registry, agent.agentId),
+			);
+			const turnContextPaths = chatOnly ? [] : resolvedContextPaths;
+			// Chat-only agents get the focused paper's public metadata (never a
+			// local path) so they can answer about "this paper".
+			const turnPaper = chatOnly ? (selectedPaperMeta ?? null) : null;
 			const plazaScratchByPath = await preparePlazaScratchFor(
-				resolvedContextPaths,
+				turnContextPaths,
 				isAcpCommand,
 			);
 			const { prompt, images, visualAnnotations, historyTitle } =
 				assembleTurnPrompt({
-					text,
-					contextPaths: resolvedContextPaths,
-					selections: resolvedSelections,
+					// ACP command chips already collapsed into `turnText`; keep the raw
+					// draft for mention / visual markers on normal turns.
+					text: isAcpCommand ? turnText : textRaw,
+					contextPaths: turnContextPaths,
+					paper: turnPaper,
 					visualDrafts: resolvedVisualDrafts,
 					attachedImages,
 					isAcpCommand,
 					plazaScratchByPath,
 					t,
 				});
+			const attachTranscript =
+				!isAcpCommand &&
+				shouldAttachLocalTranscript({
+					resumeAllowed: target.resumeAllowed,
+					historyStatus: target.activeHistory?.status,
+				});
+			const priorTranscript = isAcpCommand
+				? ""
+				: buildLocalTranscriptPrompt(target.priorLines);
+			const promptWithHistory =
+				attachTranscript && priorTranscript
+					? `${priorTranscript}\n\n${prompt}`
+					: prompt;
+			// Resume is decided before the host sees the context fingerprint.
+			// Hold the transcript aside so a refused resume can still show it.
+			const resumeTranscript =
+				!attachTranscript && priorTranscript ? priorTranscript : undefined;
 			const workflow = isAcpCommand ? undefined : options?.workflow;
 			const userLine: ChatLine = {
 				id: nextLineId("user"),
 				kind: "user",
-				text,
+				text: turnText,
+				...(markup ? { markup } : {}),
 				...(visualAnnotations?.length ? { visualAnnotations } : {}),
 				...(resolvedSelections.length
 					? {
@@ -706,14 +790,28 @@ export function useAgentSend({
 				resumeSessionId: target.resumeAllowed
 					? (target.providerContinueId ?? undefined)
 					: undefined,
-				prompt,
+				prompt: promptWithHistory,
 				isAcpCommand,
 				images,
 				workflow,
-				workflowTarget: resolveWorkflowTarget(resolvedContextPaths, workflow),
+				workflowTarget: resolveWorkflowTarget(turnContextPaths, workflow),
 				modelId: agent.modelId,
 				preferredEffort: agent.preferredEffort,
 				skillIds: resolvedSkillIds,
+				context: isAcpCommand
+					? null
+					: sidebarContextRequest({
+							contextPaths: turnContextPaths,
+							selections: resolvedSelections,
+							selectionAnnotations: new Map(
+								annotationRefs.flatMap((ref) =>
+									ref.kind === "selection"
+										? [[ref.selection.id, ref.n] as const]
+										: [],
+								),
+							),
+						}),
+				resumeTranscript,
 			});
 			if (
 				sessionContextGeneration !== sessionContextGenRef.current ||
@@ -726,22 +824,14 @@ export function useAgentSend({
 			}
 			knownSessionIdsRef.current.add(accepted.sessionId);
 			pendingSubmissionSessionIdRef.current = accepted.sessionId;
-			const binding = visualTraceBinding(
-				target.activeHistory,
-				options,
-				resolvedVisualDrafts,
-			);
-			// Bind disk finalizers for this runtime session:
-			// - first turn with visualDrafts → create mark files
-			// - follow-up on a bound pin (no new drafts) → re-register pending
-			//   so complete/fail still patches marks/<id>.json
+			const binding = visualTraceBinding(target.activeHistory, options);
+			// Reference crops stay in the prompt. Only a session opened from a
+			// visual mark patches that mark when the turn completes.
 			await bindVisualTracesForTurn({
 				runtimeSessionId: accepted.sessionId,
 				messageId: accepted.messageId,
 				agentId: agent.agentId,
-				vaultPath,
 				userText: text,
-				visualDrafts: resolvedVisualDrafts,
 				continueVisualTraceId: binding.continueVisualTraceId,
 				continuePaperAbs: binding.continuePaperAbs,
 			});
@@ -753,7 +843,9 @@ export function useAgentSend({
 			});
 			// A submitted turn consumes its selection chips (queued turns already did).
 			if (!options?.selections) consumeSelections();
-			if (!options?.visualDrafts) consumeVisualDrafts();
+			if (!options?.visualDrafts) {
+				takeVisualDrafts(extractVisualIds(textRaw), draftSessionKey);
+			}
 			const pendingTerminal = pendingTerminalEventsRef.current.get(
 				accepted.sessionId,
 			);
@@ -794,7 +886,11 @@ export function useAgentSend({
 	const enqueueMessage = useCallback(
 		(textRaw: string, workflow?: string, images?: PromptImage[]): boolean => {
 			const text = stripInlineTokens(textRaw).trim();
-			const liveVisualDrafts = currentVisualDrafts();
+			const draftSessionKey = activeVisualDraftSessionKey();
+			const referencedVisualDrafts = visualDraftsInAnnotationOrder(
+				planAnnotationRefs(textRaw),
+				visualDraftsForSession(draftSessionKey),
+			);
 			const attached = (images ?? []).filter((img) => img.data.trim().length);
 			const snap = snapshotComposerState();
 			const hasInlineContext =
@@ -803,7 +899,7 @@ export function useAgentSend({
 				(snap.includeSelectedFile && Boolean(selectedVaultPath));
 			if (
 				(!text &&
-					!liveVisualDrafts.length &&
+					!referencedVisualDrafts.length &&
 					!attached.length &&
 					!hasInlineContext) ||
 				switchingRef.current
@@ -816,12 +912,16 @@ export function useAgentSend({
 					: []),
 				...snap.mentionedPaths,
 			];
-			const frozenVisualDrafts = consumeVisualDrafts();
+			const frozenVisualDrafts = takeVisualDrafts(
+				referencedVisualDrafts.map((draft) => draft.id),
+				draftSessionKey,
+			);
 			const inlineSelections = extractSelectionTokens(textRaw);
 			const item: QueuedPrompt = {
 				id: nextLineId("queue"),
-				// Keep the typed text only; visual drafts / images carry their payload.
-				text,
+				// Keep reference tokens so a later send can put [Annotation N]
+				// back where the block sat. The queue row shows the stripped text.
+				text: textRaw,
 				workflow,
 				contextPaths: paths,
 				skillIds: [...snap.selectedSkillIds],
@@ -880,18 +980,21 @@ export function useAgentSend({
 	 * (same net effect as enqueue + stop, without the extra click).
 	 * Grok ext / elicitation use dedicated respond paths and do not need this.
 	 */
-	const answerToolAskUser = async (
-		answer: string,
-		toolCallId: string,
-	): Promise<boolean> => {
+	const answerToolAskUser = async (input: {
+		answer: string;
+		toolCallId: string;
+		questions: AskUserQuestion[];
+		answers: AskUserAnswer[];
+	}): Promise<boolean> => {
 		if (switchingRef.current || submittingRef.current) return false;
 		resetPromptHistoryBrowse();
-		const text = answer.trim();
+		const text = input.answer.trim();
 		if (!text) return false;
 
 		const completedLines = applyToolToLines(lines, {
-			id: toolCallId,
+			id: input.toolCallId,
 			status: "completed",
+			askUser: { questions: input.questions, answers: input.answers },
 		});
 
 		if (!activeTabIsRunning) {
@@ -915,6 +1018,36 @@ export function useAgentSend({
 		}
 		return true;
 	};
+
+	/**
+	 * Persist an answered / cancelled ext or elicitation questionnaire on the
+	 * matching transcript tool card. The provider's tool mirror often carries
+	 * no output, so this local record is what the collapsed card can show.
+	 */
+	const recordAskUserAnswers = useCallback(
+		(input: {
+			sessionId: string;
+			toolCallId: string | null | undefined;
+			questions: AskUserQuestion[];
+			answers?: AskUserAnswer[];
+			cancelled?: boolean;
+		}) => {
+			const toolCallId = input.toolCallId?.trim();
+			if (!toolCallId) return;
+			agentSessionStore.getState().updateSessionLines(input.sessionId, (prev) =>
+				applyToolToLines(prev, {
+					id: toolCallId,
+					...(input.cancelled ? {} : { status: "completed" }),
+					askUser: {
+						questions: input.questions,
+						answers: input.answers ?? [],
+						...(input.cancelled ? { cancelled: true } : {}),
+					},
+				}),
+			);
+		},
+		[],
+	);
 
 	const removeQueuedMessage = useCallback((id: string) => {
 		setMessageQueue((prev) => prev.filter((item) => item.id !== id));
@@ -1159,5 +1292,6 @@ export function useAgentSend({
 		clearMessageQueue,
 		cancelCurrentRun,
 		answerToolAskUser,
+		recordAskUserAnswers,
 	};
 }

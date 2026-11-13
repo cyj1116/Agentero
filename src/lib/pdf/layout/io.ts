@@ -3,17 +3,17 @@ import {
 	LAYOUT_INDEX_FILE,
 	type LayoutIndexItem,
 	type LayoutIndexSidecar,
+	parseBbox,
 	parseLayoutIndexSidecar,
 } from "@/lib/pdf/layout/layout-index";
 import { mergeCaptionsIntoHosts } from "@/lib/pdf/layout/merge-captions";
+import { parseLayoutSourceStyle } from "@/lib/pdf/layout/source-style";
 import type { PdfLayoutKind, PdfLayoutRegion } from "@/lib/pdf/layout/types";
 import { joinVaultPath, readVaultFile, writeVaultFile } from "@/lib/vault";
 
 /** Bump when label mapping / stored region semantics change (invalidates cache). */
 export const LAYOUT_SIDECAR_SCHEMA_VERSION = 3;
 export const LAYOUT_SIDECAR_FILE = "layout.json";
-/** Re-export for consumers that only import from `io`. */
-export { LAYOUT_INDEX_FILE } from "@/lib/pdf/layout/layout-index";
 
 /** Producer recorded in `source.mode` — which backend generated the regions. */
 export type LayoutSidecarMode =
@@ -32,6 +32,16 @@ export type PdfLayoutSidecar = {
 	source: {
 		mode: LayoutSidecarMode;
 		generatedAt: string;
+		/**
+		 * The PDF text layer was walked for this parse. Boxes that stayed
+		 * empty still count. Absent on sidecars written before that walk
+		 * was recorded, including ones that already stored text.
+		 */
+		textLayerExtracted?: boolean;
+		/** Numbered captions have been recovered directly from PDF text runs. */
+		figureCaptionsExtracted?: boolean;
+		/** Rich PDF run styles sampled; old caches need only a text walk. */
+		sourceStylesExtracted?: boolean;
 	};
 	/** Raw text-enriched model regions, before caption/formula merge. */
 	regions: PdfLayoutRegion[];
@@ -58,20 +68,6 @@ function isFiniteNumber(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value);
 }
 
-function parseRect(value: unknown): PdfLayoutRegion["rect"] | null {
-	if (!isObject(value)) return null;
-	const { x, y, w, h } = value;
-	if (
-		!isFiniteNumber(x) ||
-		!isFiniteNumber(y) ||
-		!isFiniteNumber(w) ||
-		!isFiniteNumber(h)
-	) {
-		return null;
-	}
-	return { x, y, w, h };
-}
-
 function parseRegion(value: unknown): PdfLayoutRegion | null {
 	if (!isObject(value)) return null;
 	const { id, pageIndex, kind, label, score, readingOrder, rect, bbox } = value;
@@ -86,8 +82,8 @@ function parseRegion(value: unknown): PdfLayoutRegion | null {
 	) {
 		return null;
 	}
-	const parsedRect = parseRect(rect);
-	const parsedBbox = parseRect(bbox);
+	const parsedRect = parseBbox(rect);
+	const parsedBbox = parseBbox(bbox);
 	if (!parsedRect || !parsedBbox) return null;
 	const out: PdfLayoutRegion = {
 		id,
@@ -101,8 +97,18 @@ function parseRegion(value: unknown): PdfLayoutRegion | null {
 	};
 	if (typeof value.title === "string") out.title = value.title;
 	if (typeof value.text === "string") out.text = value.text;
-	const titleBbox = parseRect(value.titleBbox);
+	const sourceStyle = parseLayoutSourceStyle(value.sourceStyle);
+	if (sourceStyle) out.sourceStyle = sourceStyle;
+	const titleBbox = parseBbox(value.titleBbox);
 	if (titleBbox) out.titleBbox = titleBbox;
+	if (
+		Number.isInteger(value.captionPageIndex) &&
+		(value.captionPageIndex as number) >= 0
+	) {
+		out.captionPageIndex = value.captionPageIndex as number;
+		const captionBbox = parseBbox(value.captionBbox);
+		if (captionBbox) out.captionBbox = captionBbox;
+	}
 	if (
 		value.captionRole === "figure_main" ||
 		value.captionRole === "table_main" ||
@@ -142,14 +148,88 @@ export function parseLayoutSidecar(raw: unknown): PdfLayoutSidecar | null {
 	if (!Array.isArray(raw.regions)) return null;
 	const regions = raw.regions.map(parseRegion);
 	if (regions.some((r) => !r)) return null;
+	const source: PdfLayoutSidecar["source"] = {
+		mode: raw.source.mode as LayoutSidecarMode,
+		generatedAt: raw.source.generatedAt,
+	};
+	if (raw.source.textLayerExtracted === true) source.textLayerExtracted = true;
+	if (raw.source.sourceStylesExtracted === true)
+		source.sourceStylesExtracted = true;
+	if (raw.source.figureCaptionsExtracted === true)
+		source.figureCaptionsExtracted = true;
 	return {
 		schemaVersion: LAYOUT_SIDECAR_SCHEMA_VERSION,
-		source: {
-			mode: raw.source.mode as LayoutSidecarMode,
-			generatedAt: raw.source.generatedAt,
-		},
+		source,
 		regions: regions as PdfLayoutRegion[],
 	};
+}
+
+/**
+ * The open viewer should merge this sidecar into its tab store.
+ * Empty and unchanged parses are ignored so a text-layer write-back of the
+ * same `generatedAt` does not reload forever.
+ */
+export function layoutSidecarNeedsViewerReload(
+	appliedGeneratedAt: string | null | undefined,
+	sidecar: { generatedAt: string; regionCount: number } | null,
+): boolean {
+	if (!sidecar || sidecar.regionCount <= 0 || !sidecar.generatedAt)
+		return false;
+	return appliedGeneratedAt !== sidecar.generatedAt;
+}
+
+/**
+ * A cache merge started on `startedAt` must not publish if a newer parse
+ * landed while it was reading. Otherwise a force re-run's result is
+ * overwritten by the one-page sidecar the viewer already had in memory.
+ */
+export function layoutSidecarWasReplaced(
+	startedAt: string,
+	latestGeneratedAt: string | null | undefined,
+): boolean {
+	return latestGeneratedAt != null && latestGeneratedAt !== startedAt;
+}
+
+/**
+ * A non-empty sidecar is a finished parse. `force` is the only way through
+ * it: headless analysis used to return here even when the job was enqueued
+ * with `force: true`.
+ */
+export function layoutSidecarBlocksAnalysis(
+	force: boolean | undefined,
+	regionCount: number,
+): boolean {
+	return force !== true && regionCount > 0;
+}
+
+/** Old sidecars, and reads that did not finish, still need the text layer. */
+export function layoutSidecarNeedsTextLayer(
+	sidecar: PdfLayoutSidecar,
+): boolean {
+	return (
+		sidecar.source.sourceStylesExtracted !== true ||
+		sidecar.source.textLayerExtracted !== true ||
+		(sidecar.source.mode === "mineru-layout" &&
+			sidecar.source.figureCaptionsExtracted !== true)
+	);
+}
+
+type LayoutWriteListener = (paperAbsPath: string) => void;
+
+const layoutWriteListeners = new Set<LayoutWriteListener>();
+
+/** Completion caches parsed anchors; layout writes drop that cache. */
+export function subscribeLayoutSidecarWrite(
+	listener: LayoutWriteListener,
+): () => void {
+	layoutWriteListeners.add(listener);
+	return () => {
+		layoutWriteListeners.delete(listener);
+	};
+}
+
+function notifyLayoutSidecarWrite(paperAbsPath: string): void {
+	for (const listener of layoutWriteListeners) listener(paperAbsPath);
 }
 
 export async function readLayoutSidecar(
@@ -168,20 +248,104 @@ export async function writeLayoutSidecar(
 	paperAbsPath: string | null | undefined,
 	regions: PdfLayoutRegion[],
 	mode: LayoutSidecarMode = "embedpdf-layout",
+	options: { textLayerExtracted?: boolean } = {},
 ): Promise<void> {
 	if (!paperAbsPath) return;
+	const source: PdfLayoutSidecar["source"] = {
+		mode,
+		generatedAt: new Date().toISOString(),
+	};
+	if (options.textLayerExtracted === true) {
+		source.textLayerExtracted = true;
+		source.figureCaptionsExtracted = true;
+		source.sourceStylesExtracted = true;
+	}
 	const sidecar: PdfLayoutSidecar = {
 		schemaVersion: LAYOUT_SIDECAR_SCHEMA_VERSION,
-		source: {
-			mode,
-			generatedAt: new Date().toISOString(),
-		},
+		source,
 		regions,
 	};
 	await writeVaultFile(
 		layoutSidecarPath(paperAbsPath),
 		`${JSON.stringify(sidecar, null, 2)}\n`,
 	);
+	notifyLayoutSidecarWrite(paperAbsPath);
+}
+
+function layoutRectEqual(
+	a: PdfLayoutRegion["rect"],
+	b: PdfLayoutRegion["rect"],
+): boolean {
+	return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
+}
+
+function layoutRegionGeometryEqual(
+	a: PdfLayoutRegion,
+	b: PdfLayoutRegion,
+): boolean {
+	return (
+		a.id === b.id &&
+		a.pageIndex === b.pageIndex &&
+		a.kind === b.kind &&
+		a.label === b.label &&
+		a.score === b.score &&
+		a.readingOrder === b.readingOrder &&
+		layoutRectEqual(a.rect, b.rect) &&
+		layoutRectEqual(a.bbox, b.bbox)
+	);
+}
+
+/** Same model parse: mode, timestamp, and box geometry. Text may differ. */
+export function sameLayoutParse(
+	a: PdfLayoutSidecar,
+	b: PdfLayoutSidecar,
+): boolean {
+	if (a.source.mode !== b.source.mode) return false;
+	if (a.source.generatedAt !== b.source.generatedAt) return false;
+	if (a.regions.length !== b.regions.length) return false;
+	return a.regions.every((region, index) => {
+		const other = b.regions[index];
+		return other ? layoutRegionGeometryEqual(region, other) : false;
+	});
+}
+
+/** Text-layer backfill keeps the parse timestamp and records the walk. */
+export function layoutTextBackfillSidecar(
+	expected: PdfLayoutSidecar,
+	regions: PdfLayoutRegion[],
+): PdfLayoutSidecar {
+	return {
+		schemaVersion: LAYOUT_SIDECAR_SCHEMA_VERSION,
+		source: {
+			mode: expected.source.mode,
+			generatedAt: expected.source.generatedAt,
+			textLayerExtracted: true,
+			figureCaptionsExtracted: true,
+			sourceStylesExtracted: true,
+		},
+		regions,
+	};
+}
+
+/**
+ * Write extracted text only when `layout.json` is still the parse we read.
+ * A newer headless analysis wins; a partial walk must not call this.
+ */
+export async function writeLayoutTextBackfill(
+	paperAbsPath: string | null | undefined,
+	expected: PdfLayoutSidecar,
+	regions: PdfLayoutRegion[],
+): Promise<boolean> {
+	if (!paperAbsPath) return false;
+	const current = await readLayoutSidecar(paperAbsPath);
+	if (!current || !sameLayoutParse(current, expected)) return false;
+	const sidecar = layoutTextBackfillSidecar(expected, regions);
+	await writeVaultFile(
+		layoutSidecarPath(paperAbsPath),
+		`${JSON.stringify(sidecar, null, 2)}\n`,
+	);
+	notifyLayoutSidecarWrite(paperAbsPath);
+	return true;
 }
 
 export async function readLayoutIndex(

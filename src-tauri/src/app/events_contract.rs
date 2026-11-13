@@ -46,6 +46,11 @@ pub struct JobChangedEvent(pub crate::features::jobs::JobChangedPayload);
 pub struct JobTerminalPayload {
     pub job_id: String,
     pub kind: crate::features::jobs::JobKind,
+    /// Vault root as passed by the enqueuing caller (`JobSnapshot.vault_id`):
+    /// frontend-initiated jobs carry the exact `getVaultPath()` string;
+    /// host-internal jobs the Host's (usually canonical) form. Consumers
+    /// must tolerate both spellings; see docs/backend/api.md (`job:completed`).
+    pub vault_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paper_id: Option<String>,
     pub timestamp: i64,
@@ -72,6 +77,10 @@ pub struct MenuInvokedEvent {
 #[tauri_specta(event_name = "vault:open-request")]
 pub struct VaultOpenRequestEvent(pub agentero_core::features::open_request::VaultOpenPayload);
 
+#[derive(specta::Type, tauri_specta::Event)]
+#[tauri_specta(event_name = "ui:request")]
+pub struct UiRequestEvent(pub agentero_core::features::open_request::UiRequestPayload);
+
 /// Mirror of the inline `json!({ "message": ... })` in `app::open_request`.
 #[derive(specta::Type, tauri_specta::Event)]
 #[tauri_specta(event_name = "vault:open-error")]
@@ -97,6 +106,14 @@ pub struct VaultFileChangedEvent(pub crate::features::vault::watcher::FileChange
 #[derive(specta::Type, tauri_specta::Event)]
 #[tauri_specta(event_name = "settings:changed")]
 pub struct SettingsChangedEvent(pub crate::features::system::settings::AppSettings);
+
+#[derive(specta::Type, tauri_specta::Event)]
+#[tauri_specta(event_name = "settings:section-requested")]
+pub struct SettingsSectionRequestedEvent(pub String);
+
+#[derive(specta::Type, tauri_specta::Event)]
+#[tauri_specta(event_name = "settings:vault-requested")]
+pub struct SettingsVaultRequestedEvent(pub String);
 
 #[derive(specta::Type, tauri_specta::Event)]
 #[tauri_specta(event_name = "job:progress")]
@@ -242,6 +259,14 @@ pub struct McpStatusEvent(pub crate::integration::mcp::McpStatus);
 #[tauri_specta(event_name = "mcp:tunnel-status")]
 pub struct McpTunnelStatusEvent(pub crate::integration::mcp::tunnel::McpTunnelStatus);
 
+#[derive(specta::Type, tauri_specta::Event)]
+#[tauri_specta(event_name = "plugins:changed")]
+pub struct PluginsChangedEvent(pub ());
+
+#[derive(specta::Type, tauri_specta::Event)]
+#[tauri_specta(event_name = "plugins:data-changed")]
+pub struct PluginsDataChangedEvent(pub String);
+
 /// Owned mirror of the private borrowed `SyncStateEvent` in
 /// `integration::sync::commands`.
 #[derive(serde::Serialize, specta::Type, tauri_specta::Event)]
@@ -273,6 +298,8 @@ pub struct SyncProgressEvent {
 pub struct PaperFactPayload {
     pub vault_id: String,
     pub paper_id: String,
+    /// Vault-relative paper folder. Empty when the emitter only knows the id.
+    pub path: String,
     pub timestamp: i64,
 }
 
@@ -307,8 +334,28 @@ pub struct PaperRenamedEventPayload {
 #[serde(rename_all = "camelCase")]
 #[tauri_specta(event_name = "compile:log")]
 pub struct CompileLogEvent {
+    pub job_id: String,
+    pub root_path: String,
     pub line: String,
 }
+
+/// Owned mirror of `features::rtex::RtexEventPayload`. The real payload lives
+/// in a desktop-only module, but the event contract must also compile for
+/// mobile targets, so the shape is mirrored here (pinned by the shape test
+/// below). `event` is rtex's own tagged JSON.
+#[derive(serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RtexEventPayload {
+    pub session_id: String,
+    /// Specta's built-in `serde_json::Value` shape is inline-recursive and
+    /// cannot be expanded by the TS exporter; use the named `Json` union.
+    #[specta(type = crate::core::json::Json)]
+    pub event: serde_json::Value,
+}
+
+#[derive(specta::Type, tauri_specta::Event)]
+#[tauri_specta(event_name = "rtex:event")]
+pub struct RtexEventEvt(pub RtexEventPayload);
 
 /// Anti-drift: event names registered here must equal the literals/constants
 /// used by the emit sites.
@@ -332,6 +379,10 @@ fn event_names_match_emit_literals() {
     assert_eq!(
         VaultOpenRequestEvent::NAME,
         agentero_core::features::open_request::EVENT_VAULT_OPEN_REQUEST
+    );
+    assert_eq!(
+        UiRequestEvent::NAME,
+        agentero_core::features::open_request::EVENT_UI_REQUEST
     );
     assert_eq!(
         WindowClosedEvent::NAME,
@@ -361,6 +412,11 @@ fn event_names_match_emit_literals() {
         McpTunnelStatusEvent::NAME,
         crate::integration::mcp::tunnel::MCP_TUNNEL_STATUS_EVENT
     );
+    #[cfg(all(
+        feature = "desktop",
+        not(any(target_os = "ios", target_os = "android"))
+    ))]
+    assert_eq!(RtexEventEvt::NAME, crate::features::rtex::RTEX_EVENT);
 }
 
 // ---------------------------------------------------------------------------
@@ -368,8 +424,9 @@ fn event_names_match_emit_literals() {
 //
 // `event_names_match_emit_literals` only covers the 13 events whose names live
 // in `const`s reachable from this crate. The scan below walks every `.rs` file
-// under `src-tauri/src` and `crates/agentero-core/src`, extracts the event name
-// of every Tauri emit call site and asserts the set equals the 43 names
+// under `src-tauri/src`, `crates/agentero-core/src`, and
+// `crates/agentero-mcp/src`, extracts the event name
+// of every Tauri emit call site and asserts the set equals the names
 // registered in this file. Scan rules (comments/strings are tokenized first):
 //
 // - `.emit(<name>, ..)` / `.emit_to(<target>, <name>, ..)`:
@@ -401,17 +458,21 @@ use std::path::{Path, PathBuf};
 /// Every event name registered in this file (the desktop contract surface).
 fn registered_event_names() -> BTreeSet<String> {
     use tauri_specta::Event as _;
-    let names: [&str; 44] = [
+    let mut names: Vec<&str> = vec![
         JobOfferEvent::NAME,
         JobChangedEvent::NAME,
         JobCompletedEvent::NAME,
         JobFailedEvent::NAME,
         MenuInvokedEvent::NAME,
         VaultOpenRequestEvent::NAME,
+        UiRequestEvent::NAME,
         VaultOpenErrorEvent::NAME,
         WindowClosedEvent::NAME,
         VaultFileChangedEvent::NAME,
         SettingsChangedEvent::NAME,
+        SettingsSectionRequestedEvent::NAME,
+        SettingsVaultRequestedEvent::NAME,
+        WordChangedEvent::NAME,
         JobProgressEvent::NAME,
         LayoutRemoteProgressEvent::NAME,
         AgentLifecycleProgressEvent::NAME,
@@ -440,13 +501,17 @@ fn registered_event_names() -> BTreeSet<String> {
         ConnectorErrorEvent::NAME,
         McpStatusEvent::NAME,
         McpTunnelStatusEvent::NAME,
+        PluginsChangedEvent::NAME,
+        PluginsDataChangedEvent::NAME,
         SyncStateEvent::NAME,
         SyncProgressEvent::NAME,
         PaperImportedEvent::NAME,
         PaperAssetsReadyEvent::NAME,
         PaperRenamedEventPayload::NAME,
         CompileLogEvent::NAME,
+        crate::features::compile::types::LatexCompileResult::NAME,
     ];
+    names.push(RtexEventEvt::NAME);
     let set: BTreeSet<String> = names.iter().map(|n| n.to_string()).collect();
     assert_eq!(set.len(), names.len(), "duplicate NAME in registered list");
     set
@@ -806,7 +871,7 @@ fn scan_file_emits(
     out
 }
 
-/// Scan every Rust source of the desktop Host + shared core crate and return
+/// Scan every Rust source of the desktop Host + shared core/MCP crates and return
 /// the set of event names reaching the frontend through Tauri emits.
 fn scan_emit_event_names() -> BTreeSet<String> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -816,14 +881,19 @@ fn scan_emit_event_names() -> BTreeSet<String> {
         .join("crates")
         .join("agentero-core")
         .join("src");
-    // Relative to `src-tauri/src` (the core root has no exclusions).
+    let mcp_root = manifest_dir
+        .join("..")
+        .join("crates")
+        .join("agentero-mcp")
+        .join("src");
+    // Relative to `src-tauri/src` (the shared crates have no exclusions).
     let excluded = [
         "integration/bridge/client.rs",
         "app/bindings_test.rs",
         "app/events_contract.rs",
     ];
     let mut files: Vec<PathBuf> = Vec::new();
-    for root in [&host_root, &core_root] {
+    for root in [&host_root, &core_root, &mcp_root] {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
             .filter_map(Result::ok)
@@ -1112,11 +1182,7 @@ fn menu_invoked_mirror_matches_inline_json_shape() {
 #[test]
 fn vault_open_error_mirror_matches_inline_json_shape() {
     let sites = inline_json_keys("src/app/open_request/mod.rs", "\"vault:open-error\"");
-    assert_eq!(
-        sites.len(),
-        3,
-        "expected the three vault:open-error emit sites"
-    );
+    assert_eq!(sites.len(), 1, "expected the single emit_open_error site");
     let mirror = specta_field_keys::<VaultOpenErrorEvent>();
     for site in &sites {
         assert_eq!(
@@ -1189,8 +1255,18 @@ fn paper_fact_mirror_matches_core_emit_shape() {
     use tauri_specta::Event as _;
     let hooks = std::sync::Arc::new(CaptureHooks::default());
     let app = agentero_core::app_handle::AppHandle::with_hooks(hooks.clone());
-    emit_paper_imported(Some(&app), Path::new("/tmp/vault"), "paper-1");
-    emit_paper_assets_ready(Some(&app), Path::new("/tmp/vault"), "paper-1");
+    emit_paper_imported(
+        Some(&app),
+        Path::new("/tmp/vault"),
+        "paper-1",
+        "papers/paper-1",
+    );
+    emit_paper_assets_ready(
+        Some(&app),
+        Path::new("/tmp/vault"),
+        "paper-1",
+        "papers/paper-1",
+    );
     let captured = hooks.captured.lock().expect("hooks lock");
     let events: Vec<&str> = captured.iter().map(|(e, _)| e.as_str()).collect();
     assert_eq!(
@@ -1202,6 +1278,7 @@ fn paper_fact_mirror_matches_core_emit_shape() {
         &serde_json::to_value(&PaperFactPayload {
             vault_id: "/tmp/vault".to_string(),
             paper_id: "paper-1".to_string(),
+            path: "papers/paper-1".to_string(),
             timestamp: 0,
         })
         .unwrap(),
@@ -1260,3 +1337,30 @@ fn paper_renamed_mirror_matches_core_emit_shape() {
          (vaultId + PaperRenamedEvent + timestamp, camelCase)"
     );
 }
+
+#[test]
+fn rtex_event_mirror_matches_emit_shape() {
+    #[cfg(all(
+        feature = "desktop",
+        not(any(target_os = "ios", target_os = "android"))
+    ))]
+    {
+        let actual = crate::features::rtex::RtexEventPayload {
+            session_id: "session".to_string(),
+            event: serde_json::json!({ "kind": "page", "page": 1 }),
+        };
+        let mirror = RtexEventPayload {
+            session_id: actual.session_id.clone(),
+            event: actual.event.clone(),
+        };
+        assert_eq!(
+            key_paths(&serde_json::to_value(actual).unwrap()),
+            key_paths(&serde_json::to_value(mirror).unwrap()),
+            "RtexEventPayload mirror drifted from the features::rtex emit shape"
+        );
+    }
+}
+
+#[derive(specta::Type, tauri_specta::Event)]
+#[tauri_specta(event_name = "word:changed")]
+pub struct WordChangedEvent(pub ());

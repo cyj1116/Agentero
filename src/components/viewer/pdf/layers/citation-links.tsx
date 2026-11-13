@@ -20,7 +20,15 @@ import {
 	PdfZoomMode,
 } from "@embedpdf/models";
 import { memo } from "react";
+import type { ScreenPoint } from "@/components/viewer/pdf/types";
 import { normalizeArxivId } from "@/lib/paper/arxiv";
+import {
+	linkHoverSuppressed,
+	linkPreviewDragActive,
+} from "@/lib/pdf/link-preview-drag";
+import { linkTargetUrl } from "@/lib/pdf/link-target";
+
+export { linkTargetUrl };
 
 export function isLinkObject(
 	object: PdfAnnotationObject,
@@ -125,6 +133,7 @@ export const CitationLinkLayer = memo(function CitationLinkLayer({
 	onActivate,
 	onTextActivate,
 	onHover,
+	onUrlHover,
 }: {
 	links: PdfLinkAnnoObject[];
 	textLinks: readonly PdfTextLink[];
@@ -135,7 +144,12 @@ export const CitationLinkLayer = memo(function CitationLinkLayer({
 	label: string;
 	onActivate: (link: PdfLinkAnnoObject) => void;
 	onTextActivate: (url: string) => void;
-	onHover: (link: PdfLinkAnnoObject | null) => void;
+	onHover: (
+		link: PdfLinkAnnoObject | null,
+		clientPoint?: ScreenPoint | null,
+	) => void;
+	/** Full external URL (annotation URI / Launch, or detected page text). */
+	onUrlHover?: (url: string | null, clientPoint?: ScreenPoint | null) => void;
 }) {
 	if (
 		(!links.length && !textLinks.length) ||
@@ -165,13 +179,26 @@ export const CitationLinkLayer = memo(function CitationLinkLayer({
 					}}
 					// Match floating preview cards (pointerenter/leave) so hide
 					// timers do not race mouse-only leave on trackpads.
-					// Skip while a primary button is held so drag-select across
-					// citations does not flash hover cards mid-gesture.
+					// Skip while a primary button is held, and while a translation
+					// DOM drag is in progress (`pointerenter.buttons` stays 0 then).
 					onPointerEnter={(e) => {
-						if ((e.buttons & 1) === 1) return;
-						onHover(link);
+						if (linkHoverSuppressed(e.buttons)) return;
+						const box = e.currentTarget.getBoundingClientRect();
+						const point = {
+							x: box.left + box.width / 2,
+							y: box.bottom,
+							top: box.top,
+							bottom: box.bottom,
+						};
+						onHover(link, point);
+						const url = linkTargetUrl(link.target);
+						onUrlHover?.(url, url ? point : null);
 					}}
-					onPointerLeave={() => onHover(null)}
+					onPointerLeave={() => {
+						if (linkPreviewDragActive()) return;
+						onHover(null);
+						onUrlHover?.(null);
+					}}
 				/>
 			))}
 			{textLinks.map((link) => (
@@ -180,7 +207,7 @@ export const CitationLinkLayer = memo(function CitationLinkLayer({
 					type="button"
 					tabIndex={-1}
 					aria-label={link.url}
-					title={link.url}
+					data-url={link.url}
 					className="absolute z-[2] cursor-pointer rounded-[2px] border-0 bg-transparent p-0 hover:bg-primary/10"
 					style={{
 						left: `${(link.rect.origin.x / pageWidthPt) * 100}%`,
@@ -191,6 +218,20 @@ export const CitationLinkLayer = memo(function CitationLinkLayer({
 					onClick={(e) => {
 						e.stopPropagation();
 						onTextActivate(link.url);
+					}}
+					onPointerEnter={(e) => {
+						if (linkHoverSuppressed(e.buttons)) return;
+						const box = e.currentTarget.getBoundingClientRect();
+						onUrlHover?.(link.url, {
+							x: box.left + box.width / 2,
+							y: box.bottom,
+							top: box.top,
+							bottom: box.bottom,
+						});
+					}}
+					onPointerLeave={() => {
+						if (linkPreviewDragActive()) return;
+						onUrlHover?.(null);
 					}}
 				/>
 			))}
@@ -203,6 +244,19 @@ export const CitationLinkLayer = memo(function CitationLinkLayer({
  * Coordinates are PDF-native (origin bottom-left). `pdfX` is null when the
  * destination only pins a row (FitH) or the viewer does not expose x.
  */
+/** URI action target, when this link opens an external URL. */
+export function linkAnnotationUri(link: PdfLinkAnnoObject): string | null {
+	const target = link.target;
+	if (
+		target?.type === "action" &&
+		target.action.type === PdfActionType.URI &&
+		target.action.uri
+	) {
+		return target.action.uri;
+	}
+	return null;
+}
+
 export function getLinkDestination(
 	target: PdfLinkTarget | undefined,
 ): { pageIndex: number; pdfX: number | null; pdfY: number } | null {

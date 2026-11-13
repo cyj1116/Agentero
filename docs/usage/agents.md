@@ -10,9 +10,14 @@ Agentero 使用 **BYOA**（Bring Your Own Agent）：Agent 由你安装和登录
 
 - Claude ACP
 - Codex（经 ACP 适配器）
-- OpenCode、Qoder、Grok、Kimi Code、ZCode、MiniMax Code 等兼容 ACP 的 CLI（ZCode 经 `zcode-acp-server` 适配器，复用桌面版登录）
+- Cursor Agent（原生 ACP，`cursor-agent acp`）
+- OpenCode、Qoder、Qoder CN、Grok、Kimi Code、ZCode、MiniMax Code、MiMo Code、CodeBuddy 等兼容 ACP 的 CLI（ZCode 经 `zcode-acp-server` 适配器，复用桌面版登录；Qoder CN 为大陆版 `qodercn --acp`；MiMo Code 为 `mimo acp`，npm 包 `mimocode`；CodeBuddy 为腾讯 CodeBuddy Code，`codebuddy --acp`）
 - [GenericAgent ACP](genericagent-acp.md)
 - 自定义 `command` / `args` / `env`
+
+千问办公 / QwenWork 桌面端在应用包里自带 Qoder CLI（`Contents/Resources/bin/qoderclicn`，国际版与大陆版当前内置的都是大陆版引擎），因此只装桌面端、没装独立 CLI 的机器也能直接接入 Qoder CN：PATH 上找不到 `qodercn` 时，Agentero 用应用包里的那份，PATH 安装始终优先。国际版 Qoder（`qodercli`）不会回退到这份引擎——它连的是大陆服务。桌面端登录状态与独立 CLI 共用（`~/.qoder-cn`），未登录时仍需在终端跑一次 `qodercn login`。
+
+同样的兜底也适用于 ChatGPT（内置 Codex）、WorkBuddy（内置 CodeBuddy）与 Dsh 桌面版（内置 `dsh`）：装了桌面端就不必再单独装 CLI。这类 CLI 的卡片会带「桌面内置」标记，扫一眼就能看出它不是 PATH 安装。
 
 自定义项与内置目录相同：Agentero 在当前 Vault 根目录启动你填写的命令，经标准输入/输出走 ACP。参数按空格拆分。命令本身必须是 ACP 服务（如 `opencode acp`、`grok agent stdio`），或指向一个 ACP bridge（如 `python /绝对路径/bridge.py`）。脚本和解释器请用绝对路径；图形应用的 PATH 往往和终端不一致。设置里新增或编辑自定义 Agent 时会显示同一段说明。
 
@@ -27,11 +32,11 @@ Agentero 使用 **BYOA**（Bring Your Own Agent）：Agent 由你安装和登录
 | 应用 | 当前状态 | 说明 |
 |---|---|---|
 | **OpenAI Codex 桌面版** | 不支持 | Agentero 通过 ACP 接入的是 **Codex CLI**（命令行版）+ `@agentclientprotocol/codex-acp` 适配器；独立的 Codex 桌面 App 未暴露可被 Agentero 连接的 ACP/MCP 接口。 |
-| **WorkBuddy（腾讯）** | 不支持 | Agentero 当前没有 WorkBuddy 的 ACP 适配模板；即使 WorkBuddy 支持 ACP，也需要额外适配才能接入。 |
+| **WorkBuddy（腾讯）** | 通过内置 CLI 接入 | WorkBuddy 桌面端自带 CodeBuddy CLI（`WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy`），Agentero 在 PATH 上没有 `codebuddy` 时直接用它（`codebuddy --acp`）。 |
 
 如果你希望这些应用操作 Vault，可参考：
 
-- **Codex**：安装 Codex CLI 并通过 `codex-acp` 接入（见上表）。
+- **Codex**：安装 Codex CLI 并通过 `codex-acp` 接入（见上表）。`codex-acp` 是 Node 包；Codex 自身的官方安装器只安装 host CLI，不能替代它，所以 Agentero 的 Codex 接入仍需要 Node.js/npm。
 - **WorkBuddy**：暂无可行接入方式；如 WorkBuddy 后续提供兼容 ACP 的 CLI/bridge，可尝试「自定义 `command` / `args` / `env`」，但未经官方测试。
 
 ## 添加 Agent
@@ -50,19 +55,25 @@ Agentero 使用 **BYOA**（Bring Your Own Agent）：Agent 由你安装和登录
 
 1. 打开 **Settings → Agent**，在已安装或已注册的 Agent 行点 **Trash** 按钮。
 2. 确认对话框展示该 Agent 的 logo 与将要执行的清理项：
-   - Agentero 静默安装的 npm 全局包（如 `@opencode/cli`、`@anthropic-ai/claude-code`、`@minimax-ai/code` 等）逐个 `npm uninstall -g`；OpenCode 会额外清理旧版 `opencode-ai`。
+   - Agentero 静默安装的 npm 全局包（如 `@opencode/cli`、`@anthropic-ai/claude-code`、`@minimax-ai/code`、`@qoder-ai/qodercli`、`@qodercn-ai/qoderclicn` 等）逐个 `npm uninstall -g`；OpenCode 会额外清理旧版 `opencode-ai`。
    - Agentero 管理的目录（Kimi Code 的 `~/.kimi-code`、dsh 旧方案的遗留 `~/.agentero/dsh-acp`）整体删除。
-3. 确认后行内显示卸载进度，完成后注册项一并移除，行回到「未安装」状态。
+  - CodeBuddy 官方脚本安装会删除 `~/.local/bin/codebuddy`（Unix）或 `%USERPROFILE%\AppData\Local\codebuddy\bin`（Windows），保留 `~/.codebuddy` 里的登录和配置。
+   - Qoder CLI 官方脚本安装会删除 `~/.qoder/bin/qodercli`、`~/.qoder/entry`，以及 `~/.local/bin/qodercli` 这个链接（不删除整个 `~/.local/bin`）。
+   - Qoder CN 官方脚本安装会删除 `~/.qoder-cn/bin/qoderclicn`、`~/.qoder-cn/entry`，以及 `~/.local/bin/qoderclicn` 这个链接。
+3. 确认后行内显示卸载进度；npm 卸载失败或命令仍可解析时会明确报错，不会再把失败显示为完成。成功后注册项一并移除，行回到「未安装」状态。
 
 清理范围与保留项：
 
-- **不清理**：官方安装器或 Homebrew 安装的 CLI、shell 配置中官方 installer 写入的 PATH 行、Agent 会话历史。这些无法可靠定位或属于用户数据，均保留。
+- **不清理**：Homebrew 安装的 CLI、shell 配置中官方 installer 写入的 PATH 行、Agent 会话历史（包括 `~/.qoder` / `~/.qoder-cn` 里的登录和会话）。除上面列出的 Qoder 系列脚本安装文件外，其它官方脚本安装的 CLI 无法可靠定位，保留。
+- **ZCode**：只清理 `zcode-acp-server` ACP 适配器；ZCode 桌面应用、其登录状态和 `~/.zcode` 数据始终保留。
 - **仅移除注册项**：对没有可管理卸载路径的 Agent（如 Hermes、纯 PATH 探测到的 CLI），对话框会注明只删 Agentero 注册项，磁盘文件不动。
 - **自定义 Agent**：走同一确认对话框，但只移除注册项（自定义 Agent 的二进制由用户自管）。
 
 ## 使用 Skill
 
 Agentero 的 Skill 是放在 Vault `.agents/skills/<name>/` 下的 prompt 包，含 `SKILL.md` 与可选的 `scripts/`、`references/`、`assets/`。
+
+侧栏把库根的 `AGENTS.md` 和 `.agents/` 收成一行 **Agent**。展开后第一行是 `AGENTS.md`，下面每个技能显示 frontmatter 里的 `name`。单击技能打开它的 `SKILL.md`。磁盘上的路径不变。
 
 Claude Code 只读项目内的 `.claude/skills/`：检测到 `claude` CLI 时，Agentero 会自动创建 `.claude/skills → ../.agents/skills` 链接，无需手动复制，新建/删除 Skill 自动同步。若你在 Vault 里已有自己的 `.claude/skills` 目录，则保持原样、不做链接。
 
@@ -78,6 +89,8 @@ Skill 来源不受 Agentero 审计，安装第三方 Skill 等于引入外部指
 ### 运行 Skill
 
 在 Agent 面板 Composer 中按 Agent 约定触发：Claude 用 `/skill-id`，其他 Agent 由 `SKILL.md` 自动注入。具体写法见 Skill 自身的 `SKILL.md`。
+
+Pi 只有在信任 Vault 后才会加载项目内的 `.agents/skills` 和 `.pi/*`。未信任时 Pi 面板输入框上方会显示提示；点「信任此 Vault」会写入 `~/.pi/agent/trust.json`，下一条消息起生效。也可以先在 pi 自己的 TUI 里信任该目录：回到 Agentero 后提示会自动消失，下一轮会重新启动 pi 进程并加载 Skill。
 
 ## 第一次对话
 
@@ -116,6 +129,10 @@ Settings → Agent → 全局权限模式（对所有 Agent 生效，非 per-pro
 ### 自动精读
 
 Settings → Agent 开启 **自动精读**（`autoPaperReader`，默认关）。魔棒入库或单篇 Download 资源就绪后可自动启动。**批量**导入 / 批量 Download **不会**连跑精读。
+
+### 选择精读用的模型
+
+Settings → Agent → **精读论文** 可单独指定「精读 Agent」与「精读模型」，与「PDF 划词提问」互不影响。留空则跟随默认 Agent 及其上次在输入区选择的模型；若两者都未确定，精读会使用 Agent CLI 自身的默认模型（例如 OpenCode 的免费 Zen 模型，额度用尽时报 `Free usage limit reached`），此时在该处显式选一个模型即可。
 
 ## 常见问题
 

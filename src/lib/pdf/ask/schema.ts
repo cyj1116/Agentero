@@ -6,7 +6,8 @@ import type {
 	PdfAskTrigger,
 	PdfAskVisualKind,
 } from "@/lib/pdf/ask/types";
-import { isRecord, isRect } from "@/lib/pdf/marks/schema";
+import { sanitizeTranslatedRects } from "@/lib/pdf/highlight/translated-geometry";
+import { isRecord, isRect, shorten } from "@/lib/pdf/marks/schema";
 import { pinFromRects } from "@/lib/pdf/selection/pin";
 
 function isTrigger(v: unknown): v is PdfAskTrigger {
@@ -58,6 +59,9 @@ function parseAnchor(v: unknown): PdfAskAnchor | null {
 	};
 	if (typeof v.quote === "string") anchor.quote = v.quote;
 	if (isVisualKind(v.visualKind)) anchor.visualKind = v.visualKind;
+	// A missing or unusable list must not reject threads written before this field.
+	const translated = sanitizeTranslatedRects(v.translatedRects);
+	if (translated.length > 0) anchor.translatedRects = translated;
 	return anchor;
 }
 
@@ -92,12 +96,6 @@ export function parsePdfAskThread(raw: unknown): PdfAskThread | null {
 		anchor,
 		messages,
 	};
-}
-
-function shorten(text: string, max: number): string {
-	const t = text.trim().replace(/\s+/g, " ");
-	if (!t) return "";
-	return t.length > max ? `${t.slice(0, Math.max(1, max - 1))}…` : t;
 }
 
 /** True once the user has sent at least one turn. */

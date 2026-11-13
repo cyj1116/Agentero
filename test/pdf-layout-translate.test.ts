@@ -1,24 +1,33 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+	applyHeadingBodyFloor,
+	bodyReferenceFontSize,
 	expandLayoutTranslateBbox,
 	fontSizeForLayoutTranslateBox,
+	HEADING_TO_BODY_SIZE_RATIO,
 } from "@/components/viewer/pdf/layers/layout-translate-overlay";
 import {
 	applyLayoutTranslateSidecar,
+	countPendingLayoutTranslateItems,
+	flushLayoutTranslateSidecar,
 	groupLayoutTranslateItemsByPage,
 	hasPendingLayoutTranslateItems,
+	hydrateLayoutTranslateItems,
 	LAYOUT_TRANSLATE_WRITE_DEBOUNCE_MS,
 	type LayoutTranslateCacheKey,
 	type LayoutTranslateItem,
 	type LayoutTranslateItemStatus,
 	layoutRegionSourceText,
+	layoutTranslatePendingPageRange,
 	listTranslatableLayoutRegions,
 	parseLayoutTranslateSidecar,
 	persistLayoutTranslateSidecarBestEffort,
 	toLayoutTranslateItems,
 	translateServiceKey,
+	writeLayoutTranslateSidecar,
 } from "@/lib/pdf/layout/layout-translate";
+import { preservedLayoutRegions } from "@/lib/pdf/layout/translation-exclusions";
 import type { PdfLayoutRegion } from "@/lib/pdf/layout/types";
 import { DEFAULT_TRANSLATE_SETTINGS } from "@/lib/translate/defaults";
 
@@ -83,6 +92,20 @@ describe("listTranslatableLayoutRegions", () => {
 		]);
 		expect(list.map((r) => r.id)).toEqual(["abs", "t2"]);
 		expect(list[0]?.source).toBe("This is the abstract.");
+		expect(list[0]?.raw).toBe("This is the abstract.");
+	});
+
+	it("keeps the text-layer hyphen in raw and heals it in source", () => {
+		const list = listTranslatableLayoutRegions([
+			region({
+				id: "hyphen",
+				kind: "text",
+				pageIndex: 0,
+				text: "A repre- sentation helps.",
+			}),
+		]);
+		expect(list[0]?.raw).toBe("A repre- sentation helps.");
+		expect(list[0]?.source).toBe("A representation helps.");
 	});
 
 	it("prefers text over title for source", () => {
@@ -173,7 +196,7 @@ describe("listTranslatableLayoutRegions", () => {
 		expect(list[1]?.source).toContain("Table 2");
 	});
 
-	it("skips reference entries and the References heading", () => {
+	it("excludes reference entries and their heading from translation and missing counts", () => {
 		const list = listTranslatableLayoutRegions([
 			region({
 				id: "ref1",
@@ -208,6 +231,51 @@ describe("listTranslatableLayoutRegions", () => {
 			}),
 		]);
 		expect(list.map((r) => r.id)).toEqual(["body"]);
+		const hydration = hydrateLayoutTranslateItems(
+			toLayoutTranslateItems(list),
+			{
+				schemaVersion: 2,
+				source: {
+					mode: "pdf-layout-translate",
+					generatedAt: "2026-11-11T00:00:00Z",
+					providerId: "tencenttransmart",
+					sourceLang: "auto",
+					targetLang: "zh-CN",
+					serviceKey: "tencenttransmart",
+				},
+				items: [...list, { ...list[0], id: "ref1" }].map((r) => ({
+					...r,
+					translated: "Cached translation",
+				})),
+			},
+		);
+		expect(hydration.items.map((item) => item.id)).toEqual(["body"]);
+		expect(hydration.pendingRequired).toBe(0);
+	});
+
+	it.each([
+		"Bibliography",
+		"Works Cited",
+		"参考文献",
+		"參考文獻",
+		"9. References",
+	])("preserves the standalone %s heading while keeping inline citations and appendices translatable", (title) => {
+		const list = listTranslatableLayoutRegions([
+			region({ id: "heading", kind: "header", pageIndex: 0, text: title }),
+			region({
+				id: "body",
+				kind: "text",
+				pageIndex: 0,
+				text: "References [1, 2] support our approach.",
+			}),
+			region({
+				id: "appendix",
+				kind: "header",
+				pageIndex: 1,
+				text: "A. Additional experiments",
+			}),
+		]);
+		expect(list.map((r) => r.id)).toEqual(["body", "appendix"]);
 	});
 
 	it("skips aside_text side-margin regions", () => {
@@ -227,6 +295,372 @@ describe("listTranslatableLayoutRegions", () => {
 				pageIndex: 0,
 				bbox: { x: 0.12, y: 0.2, w: 0.7, h: 0.15 },
 				text: "Normal paragraph on the page.",
+			}),
+		]);
+		expect(list.map((r) => r.id)).toEqual(["body"]);
+	});
+
+	it("keeps bibliographic metadata and page furniture in the source language", () => {
+		const list = listTranslatableLayoutRegions([
+			region({
+				id: "title",
+				kind: "header",
+				label: "doc_title",
+				pageIndex: 0,
+				readingOrder: 0,
+				bbox: { x: 0.2, y: 0.05, w: 0.6, h: 0.04 },
+				text: "Attention Is All You Need",
+			}),
+			region({
+				id: "authors",
+				kind: "text",
+				pageIndex: 0,
+				readingOrder: 1,
+				bbox: { x: 0.2, y: 0.1, w: 0.6, h: 0.03 },
+				text: "Ada Lovelace and Alan Turing",
+			}),
+			region({
+				id: "affiliation",
+				kind: "text",
+				pageIndex: 0,
+				readingOrder: 2,
+				bbox: { x: 0.2, y: 0.14, w: 0.6, h: 0.03 },
+				text: "Institute for Advanced Study, ada@example.org",
+			}),
+			region({
+				id: "abstract",
+				kind: "abstract",
+				pageIndex: 0,
+				readingOrder: 3,
+				bbox: { x: 0.1, y: 0.22, w: 0.8, h: 0.12 },
+				text: "The abstract stays translatable.",
+			}),
+			region({
+				id: "section",
+				kind: "header",
+				label: "paragraph_title",
+				pageIndex: 0,
+				readingOrder: 4,
+				bbox: { x: 0.1, y: 0.37, w: 0.4, h: 0.03 },
+				text: "1 Introduction",
+			}),
+			region({
+				id: "body",
+				kind: "text",
+				pageIndex: 0,
+				readingOrder: 5,
+				bbox: { x: 0.1, y: 0.42, w: 0.8, h: 0.1 },
+				text: "Body prose.",
+			}),
+			region({
+				id: "caption",
+				kind: "figure_title",
+				pageIndex: 0,
+				readingOrder: 6,
+				bbox: { x: 0.1, y: 0.55, w: 0.8, h: 0.04 },
+				title: "Figure 1: Overview.",
+			}),
+			region({
+				id: "footnote",
+				kind: "text",
+				label: "footnote",
+				pageIndex: 0,
+				readingOrder: 7,
+				bbox: { x: 0.1, y: 0.9, w: 0.8, h: 0.04 },
+				text: "1 Corresponding author.",
+			}),
+			region({
+				id: "footer",
+				kind: "text",
+				label: "footer",
+				pageIndex: 0,
+				readingOrder: 8,
+				bbox: { x: 0.4, y: 0.97, w: 0.2, h: 0.02 },
+				text: "Published 2026",
+			}),
+			region({
+				id: "header-1",
+				kind: "header",
+				label: "header",
+				pageIndex: 0,
+				readingOrder: 9,
+				bbox: { x: 0.1, y: 0.01, w: 0.5, h: 0.02 },
+				text: "Journal of Testing 2026",
+			}),
+			region({
+				id: "header-2",
+				kind: "header",
+				label: "header",
+				pageIndex: 1,
+				readingOrder: 0,
+				bbox: { x: 0.1, y: 0.01, w: 0.5, h: 0.02 },
+				text: "Journal of Testing 2026",
+			}),
+			region({
+				id: "banner",
+				kind: "header",
+				label: "header",
+				pageIndex: 1,
+				readingOrder: 0,
+				bbox: { x: 0.1, y: 0.04, w: 0.7, h: 0.02 },
+				text: "Proceedings of Testing 2026",
+			}),
+			region({
+				id: "body-2",
+				kind: "text",
+				pageIndex: 1,
+				readingOrder: 1,
+				bbox: { x: 0.1, y: 0.2, w: 0.8, h: 0.1 },
+				text: "Second-page body prose.",
+			}),
+		]);
+		expect(list.map((r) => r.id)).toEqual([
+			"abstract",
+			"section",
+			"body",
+			"caption",
+			"body-2",
+		]);
+	});
+
+	it("preserves explicit metadata labels below the normal confidence gate", () => {
+		const regions = [
+			region({
+				id: "title",
+				kind: "header",
+				label: "doc_title",
+				pageIndex: 0,
+				score: 0.05,
+				bbox: { x: 0.2, y: 0.05, w: 0.6, h: 0.04 },
+				text: "A Low-Confidence Paper Title",
+			}),
+			region({
+				id: "authors",
+				kind: "text",
+				pageIndex: 0,
+				score: 0.05,
+				bbox: { x: 0.2, y: 0.11, w: 0.6, h: 0.03 },
+				text: "Ada Lovelace and Alan Turing",
+			}),
+			region({
+				id: "footnote",
+				kind: "text",
+				label: "footnote",
+				pageIndex: 0,
+				score: 0.05,
+				bbox: { x: 0.1, y: 0.9, w: 0.8, h: 0.03 },
+				text: "Corresponding author.",
+			}),
+			region({
+				id: "footer",
+				kind: "text",
+				label: "footer",
+				pageIndex: 0,
+				score: 0.05,
+				bbox: { x: 0.4, y: 0.97, w: 0.2, h: 0.02 },
+				text: "Published 2026",
+			}),
+			region({
+				id: "number",
+				kind: "text",
+				label: "number",
+				pageIndex: 0,
+				score: 0.05,
+				bbox: { x: 0.48, y: 0.95, w: 0.04, h: 0.02 },
+				text: "7",
+			}),
+			region({
+				id: "seal",
+				kind: "text",
+				label: "seal",
+				pageIndex: 0,
+				score: 0.05,
+				bbox: { x: 0.85, y: 0.85, w: 0.1, h: 0.1 },
+				text: "Received",
+			}),
+			region({
+				id: "aside",
+				kind: "text",
+				label: "aside_text",
+				pageIndex: 0,
+				score: 0.05,
+				bbox: { x: 0.01, y: 0.2, w: 0.04, h: 0.6 },
+				text: "arXiv:2608.00881v1",
+			}),
+			region({
+				id: "body",
+				kind: "text",
+				pageIndex: 0,
+				score: 0.9,
+				bbox: { x: 0.1, y: 0.35, w: 0.8, h: 0.1 },
+				text: "Body prose stays translatable.",
+			}),
+		];
+		const preserved = preservedLayoutRegions(regions);
+		expect(preserved.get("title")).toBe("paper-title");
+		expect(preserved.get("authors")).toBe("metadata-band");
+		expect(preserved.get("footnote")).toBe("footnote");
+		expect(preserved.get("footer")).toBe("footer");
+		expect(preserved.get("number")).toBe("page-number");
+		expect(preserved.get("seal")).toBe("seal");
+		expect(preserved.get("aside")).toBe("aside-text");
+		expect(preserved.has("body")).toBe(false);
+	});
+
+	it("infers a MinerU paper title when Content List labels it as a paragraph title", () => {
+		const list = listTranslatableLayoutRegions([
+			region({
+				id: "title",
+				kind: "header",
+				label: "paragraph_title",
+				pageIndex: 0,
+				readingOrder: 0,
+				bbox: { x: 0.2, y: 0.07, w: 0.6, h: 0.04 },
+				text: "Attention Is All You Need",
+			}),
+			region({
+				id: "authors",
+				kind: "text",
+				pageIndex: 0,
+				readingOrder: 1,
+				bbox: { x: 0.2, y: 0.14, w: 0.6, h: 0.03 },
+				text: "Ada Lovelace and Alan Turing",
+			}),
+			region({
+				id: "abstract",
+				kind: "abstract",
+				pageIndex: 0,
+				readingOrder: 2,
+				bbox: { x: 0.1, y: 0.22, w: 0.8, h: 0.12 },
+				text: "The abstract stays translatable.",
+			}),
+			region({
+				id: "section",
+				kind: "header",
+				label: "paragraph_title",
+				pageIndex: 0,
+				readingOrder: 3,
+				bbox: { x: 0.1, y: 0.4, w: 0.4, h: 0.03 },
+				text: "1 Introduction",
+			}),
+		]);
+		expect(list.map((item) => item.id)).toEqual(["abstract", "section"]);
+	});
+
+	it("keeps numbered leading section headings translatable", () => {
+		const list = listTranslatableLayoutRegions([
+			region({
+				id: "section",
+				kind: "header",
+				label: "paragraph_title",
+				pageIndex: 0,
+				readingOrder: 0,
+				bbox: { x: 0.1, y: 0.08, w: 0.4, h: 0.03 },
+				text: "1 Introduction",
+			}),
+			region({
+				id: "body",
+				kind: "text",
+				pageIndex: 0,
+				readingOrder: 1,
+				bbox: { x: 0.1, y: 0.14, w: 0.8, h: 0.1 },
+				text: "Body prose remains translatable.",
+			}),
+		]);
+		expect(list.map((item) => item.id)).toEqual(["section", "body"]);
+	});
+
+	it("preserves short journal names repeated at the same page margin", () => {
+		const list = listTranslatableLayoutRegions([
+			region({
+				id: "header-1",
+				kind: "header",
+				label: "header",
+				pageIndex: 0,
+				readingOrder: 0,
+				bbox: { x: 0.08, y: 0.01, w: 0.16, h: 0.02 },
+				text: "Nature",
+			}),
+			region({
+				id: "body-1",
+				kind: "text",
+				pageIndex: 0,
+				readingOrder: 1,
+				bbox: { x: 0.1, y: 0.2, w: 0.8, h: 0.1 },
+				text: "First-page body.",
+			}),
+			region({
+				id: "header-2",
+				kind: "header",
+				label: "header",
+				pageIndex: 1,
+				readingOrder: 0,
+				bbox: { x: 0.08, y: 0.01, w: 0.16, h: 0.02 },
+				text: "Nature",
+			}),
+			region({
+				id: "body-2",
+				kind: "text",
+				pageIndex: 1,
+				readingOrder: 1,
+				bbox: { x: 0.1, y: 0.2, w: 0.8, h: 0.1 },
+				text: "Second-page body.",
+			}),
+		]);
+		expect(list.map((item) => item.id)).toEqual(["body-1", "body-2"]);
+	});
+
+	it("does not mistake figure captions or section headings for running headers", () => {
+		const list = listTranslatableLayoutRegions([
+			region({
+				id: "caption-header",
+				kind: "header",
+				label: "header",
+				pageIndex: 0,
+				readingOrder: 0,
+				bbox: { x: 0.1, y: 0.03, w: 0.8, h: 0.04 },
+				text: "Figure 2: Translation quality.",
+				captionRole: "figure_main",
+			}),
+			region({
+				id: "section",
+				kind: "header",
+				label: "paragraph_title",
+				pageIndex: 0,
+				readingOrder: 1,
+				bbox: { x: 0.1, y: 0.2, w: 0.4, h: 0.03 },
+				text: "2 Method",
+			}),
+		]);
+		expect(list.map((r) => r.id)).toEqual(["caption-header", "section"]);
+	});
+
+	it("limits the first-page metadata fallback when no abstract anchor exists", () => {
+		const list = listTranslatableLayoutRegions([
+			region({
+				id: "title",
+				kind: "header",
+				label: "doc_title",
+				pageIndex: 0,
+				readingOrder: 0,
+				bbox: { x: 0.2, y: 0.05, w: 0.6, h: 0.04 },
+				text: "A Paper Without An Abstract",
+			}),
+			region({
+				id: "authors",
+				kind: "text",
+				pageIndex: 0,
+				readingOrder: 1,
+				bbox: { x: 0.2, y: 0.1, w: 0.6, h: 0.03 },
+				text: "Ada Lovelace",
+			}),
+			region({
+				id: "body",
+				kind: "text",
+				pageIndex: 0,
+				readingOrder: 2,
+				bbox: { x: 0.1, y: 0.32, w: 0.8, h: 0.1 },
+				text: "Body prose remains translatable.",
 			}),
 		]);
 		expect(list.map((r) => r.id)).toEqual(["body"]);
@@ -267,6 +701,57 @@ describe("fontSizeForLayoutTranslateBox", () => {
 		expect(withZh).toBeGreaterThanOrEqual(paperLike * 0.95);
 		expect(withZh).toBeLessThanOrEqual(paperLike * 1.25 + 0.5);
 	});
+
+	it("keeps a longer heading at the source size instead of shrinking to fit", () => {
+		const bbox = { x: 0.1, y: 0.08, w: 0.7, h: 0.035 };
+		const pageW = 800;
+		const pageH = 1100;
+		const en = "Introduction";
+		const zh = "这是一个明显更长的章节标题用来验证字号不会被压扁";
+		const english = fontSizeForLayoutTranslateBox(bbox, pageW, pageH, en, en, {
+			heading: true,
+		});
+		const chinese = fontSizeForLayoutTranslateBox(bbox, pageW, pageH, en, zh, {
+			heading: true,
+		});
+		const shrunk = fontSizeForLayoutTranslateBox(bbox, pageW, pageH, en, zh);
+		expect(Math.abs(chinese - english) / english).toBeLessThanOrEqual(0.02);
+		expect(chinese).toBeGreaterThan(shrunk);
+	});
+
+	it("sizes a one-line heading from the raw box when padding would hit the floor", () => {
+		// A section-title strip is about one em tall. Subtracting paragraph
+		// padding used to clamp "1. Introduction" to FS_MIN, below body text.
+		const pageW = 600;
+		const pageH = 400;
+		const bbox = { x: 0.12, y: 0.2, w: 0.4, h: 12 / pageH };
+		const fs = fontSizeForLayoutTranslateBox(
+			bbox,
+			pageW,
+			pageH,
+			"1. Introduction",
+			"1. 介绍",
+			{ heading: true },
+		);
+		expect(fs).toBeGreaterThan(7);
+		expect(fs).toBeLessThanOrEqual(20);
+	});
+});
+
+describe("heading body floor", () => {
+	it("uses the median body size as the page reference", () => {
+		expect(bodyReferenceFontSize([8, 9, 10, 12])).toBe(10);
+		expect(bodyReferenceFontSize([8, 10, 12])).toBe(12);
+		expect(bodyReferenceFontSize([])).toBeUndefined();
+	});
+
+	it("raises a short section title to body × 1.35", () => {
+		const body = 10;
+		const raised = applyHeadingBodyFloor(7.6, body);
+		expect(raised).toBeCloseTo(body * HEADING_TO_BODY_SIZE_RATIO, 5);
+		expect(applyHeadingBodyFloor(14, body)).toBe(14);
+		expect(applyHeadingBodyFloor(8, undefined)).toBe(8);
+	});
 });
 
 describe("expandLayoutTranslateBbox", () => {
@@ -299,6 +784,33 @@ describe("expandLayoutTranslateBbox", () => {
 	it("does not expand a long body paragraph into adjacent content", () => {
 		const body = { ...item("text"), source: "word ".repeat(100) };
 		expect(expandLayoutTranslateBbox(body)).toEqual(body.bbox);
+	});
+
+	it("grows a heading down to the source font size and stops at a blocker", () => {
+		const heading = item("header");
+		const fontSize = fontSizeForLayoutTranslateBox(
+			heading.bbox,
+			800,
+			1100,
+			heading.source,
+			heading.translated,
+			{ heading: true },
+		);
+		const expanded = expandLayoutTranslateBbox(
+			heading,
+			[
+				region({
+					id: "body",
+					kind: "text",
+					pageIndex: 0,
+					bbox: { x: 0.1, y: 0.2, w: 0.7, h: 0.2 },
+				}),
+			],
+			{ pageWidthPx: 800, pageHeightPx: 1100, fontSize },
+		);
+		expect(expanded.h).toBeGreaterThan(heading.bbox.h);
+		expect(expanded.y + expanded.h).toBeLessThanOrEqual(0.2 - 0.006 + 1e-9);
+		expect(expanded.h).toBeLessThanOrEqual(heading.bbox.h * 2.75 + 1e-9);
 	});
 });
 
@@ -347,6 +859,21 @@ describe("groupLayoutTranslateItemsByPage", () => {
 		expect(after.get(1)).not.toBe(before.get(1));
 		expect(after.get(1)?.map((it) => it.status)).toEqual(["done"]);
 	});
+
+	it("re-buckets a page when only sentence pairs change", () => {
+		const done = { ...translateItem("a", 0, "done"), translated: "甲" };
+		const before = groupLayoutTranslateItemsByPage([done]);
+		const after = groupLayoutTranslateItemsByPage(
+			[
+				{
+					...done,
+					sentences: [{ quote: "A.", source: "A.", translated: "甲" }],
+				},
+			],
+			before,
+		);
+		expect(after.get(0)).not.toBe(before.get(0));
+	});
 });
 
 describe("layout translate sidecar cache", () => {
@@ -372,7 +899,7 @@ describe("layout translate sidecar cache", () => {
 	it("applies cached translations only when key and source text match", () => {
 		const sidecar = parseLayoutTranslateSidecar(
 			{
-				schemaVersion: 1,
+				schemaVersion: 2,
 				source: {
 					mode: "pdf-layout-translate",
 					generatedAt: "2026-08-10T00:00:00.000Z",
@@ -421,7 +948,7 @@ describe("layout translate sidecar cache", () => {
 	it("rejects caches for a different target language", () => {
 		const sidecar = parseLayoutTranslateSidecar(
 			{
-				schemaVersion: 1,
+				schemaVersion: 2,
 				source: {
 					mode: "pdf-layout-translate",
 					generatedAt: "2026-08-10T00:00:00.000Z",
@@ -451,6 +978,228 @@ describe("layout translate sidecar cache", () => {
 				{ ...item("a"), translated: "甲", status: "done" },
 			]),
 		).toBe(false);
+	});
+
+	it("rejects a schema 1 file", () => {
+		expect(
+			parseLayoutTranslateSidecar(
+				{
+					schemaVersion: 1,
+					source: {
+						mode: "pdf-layout-translate",
+						generatedAt: "2026-08-10T00:00:00.000Z",
+						providerId: "googleapi",
+						sourceLang: "auto",
+						targetLang: "zh-CN",
+						serviceKey: "googleapi",
+					},
+					items: [
+						{
+							id: "a",
+							pageIndex: 0,
+							bbox: { x: 0.1, y: 0.1, w: 0.5, h: 0.05 },
+							kind: "text",
+							readingOrder: 0,
+							source: "source a",
+							translated: "甲",
+						},
+					],
+				},
+				key,
+			),
+		).toBeNull();
+	});
+
+	it("keeps valid sentence pairs and drops a malformed entry", () => {
+		const sidecar = parseLayoutTranslateSidecar(
+			{
+				schemaVersion: 2,
+				source: {
+					mode: "pdf-layout-translate",
+					generatedAt: "2026-08-10T00:00:00.000Z",
+					providerId: "googleapi",
+					sourceLang: "auto",
+					targetLang: "zh-CN",
+					serviceKey: "googleapi",
+				},
+				items: [
+					{
+						id: "a",
+						pageIndex: 0,
+						bbox: { x: 0.1, y: 0.1, w: 0.5, h: 0.05 },
+						kind: "text",
+						readingOrder: 0,
+						source: "source a",
+						translated: "甲",
+						sentences: [
+							{
+								quote: "Hello.",
+								source: "Hello.",
+								translated: "你好。",
+								display: "你好。",
+							},
+							{ quote: "", source: "x", translated: "y" },
+							{
+								quote: "Go.",
+								source: "Go.",
+								translated: "走。",
+								display: "走吧。",
+							},
+						],
+					},
+				],
+			},
+			key,
+		);
+		expect(sidecar?.items[0]?.sentences).toEqual([
+			{ quote: "Hello.", source: "Hello.", translated: "你好。" },
+			{
+				quote: "Go.",
+				source: "Go.",
+				translated: "走。",
+				display: "走吧。",
+			},
+		]);
+		const applied = applyLayoutTranslateSidecar([item("a")], sidecar);
+		expect(applied[0]?.sentences).toEqual(sidecar?.items[0]?.sentences);
+	});
+
+	it("writes schema 2 and omits display when it equals the sentence", async () => {
+		const vault = await import("@/lib/vault");
+		vi.mocked(vault.writeVaultFile).mockReset();
+		await writeLayoutTranslateSidecar("/paper", key, [
+			{
+				...item("a", "Hello. Go."),
+				status: "done",
+				translated: "你好。走吧。",
+				sentences: [
+					{ quote: "Hello.", source: "Hello.", translated: "你好。" },
+					{
+						quote: "Go.",
+						source: "Go.",
+						translated: "走。",
+						display: "走吧。",
+					},
+				],
+			},
+		]);
+		const body = vi.mocked(vault.writeVaultFile).mock.calls[0]?.[1] as string;
+		const parsed = JSON.parse(body) as {
+			schemaVersion: number;
+			items: { sentences: { display?: string; quote: string }[] }[];
+		};
+		expect(parsed.schemaVersion).toBe(2);
+		expect(parsed.items[0]?.sentences[0]?.display).toBeUndefined();
+		expect(parsed.items[0]?.sentences[1]?.display).toBe("走吧。");
+	});
+});
+
+describe("hydrateLayoutTranslateItems", () => {
+	const key: LayoutTranslateCacheKey = {
+		providerId: "googleapi",
+		sourceLang: "auto",
+		targetLang: "zh-CN",
+		serviceKey: "googleapi",
+	};
+
+	function item(
+		id: string,
+		pageIndex = 0,
+		status: LayoutTranslateItem["status"] = "pending",
+	): LayoutTranslateItem {
+		return {
+			id,
+			pageIndex,
+			bbox: { x: 0.1, y: 0.1, w: 0.5, h: 0.05 },
+			kind: "text",
+			readingOrder: pageIndex,
+			source: `source ${id}`,
+			status,
+		};
+	}
+
+	function sidecar(
+		entries: { id: string; pageIndex?: number; source: string }[],
+	) {
+		return parseLayoutTranslateSidecar(
+			{
+				schemaVersion: 2,
+				source: {
+					mode: "pdf-layout-translate",
+					generatedAt: "2026-08-10T00:00:00.000Z",
+					providerId: "googleapi",
+					sourceLang: "auto",
+					targetLang: "zh-CN",
+					serviceKey: "googleapi",
+				},
+				items: entries.map((entry) => ({
+					id: entry.id,
+					pageIndex: entry.pageIndex ?? 0,
+					bbox: { x: 0.1, y: 0.1, w: 0.5, h: 0.05 },
+					kind: "text",
+					readingOrder: 0,
+					source: entry.source,
+					translated: `译 ${entry.id}`,
+				})),
+			},
+			key,
+		);
+	}
+
+	it("renders every matching cached block and leaves the rest pending", () => {
+		const items = [item("a"), item("b"), item("c", 2)];
+		const hydration = hydrateLayoutTranslateItems(
+			items,
+			sidecar([
+				{ id: "a", source: "source a" },
+				{ id: "b", source: "stale source" },
+				{ id: "c", pageIndex: 2, source: "source c" },
+			]),
+		);
+		expect(hydration.fromCache).toBe(true);
+		expect(hydration.cachedCount).toBe(2);
+		expect(hydration.pendingRequired).toBe(1);
+		expect(hydration.items.map((it) => it.status)).toEqual([
+			"done",
+			"pending",
+			"done",
+		]);
+		expect(hydration.items[1]?.translated).toBeUndefined();
+		expect(countPendingLayoutTranslateItems(hydration.items)).toBe(1);
+		expect(layoutTranslatePendingPageRange(hydration.items)).toEqual({
+			start: 1,
+			end: 1,
+		});
+	});
+
+	it("reports no usable cache when the sidecar is missing", () => {
+		const hydration = hydrateLayoutTranslateItems(
+			[item("a"), item("b", 4)],
+			null,
+		);
+		expect(hydration).toMatchObject({
+			fromCache: false,
+			cachedCount: 0,
+			pendingRequired: 2,
+		});
+		expect(layoutTranslatePendingPageRange(hydration.items)).toEqual({
+			start: 1,
+			end: 5,
+		});
+	});
+
+	it("needs no pending completion when every block is cached", () => {
+		const hydration = hydrateLayoutTranslateItems(
+			[item("a"), item("b")],
+			sidecar([
+				{ id: "a", source: "source a" },
+				{ id: "b", source: "source b" },
+			]),
+		);
+		expect(hydration.fromCache).toBe(true);
+		expect(hydration.cachedCount).toBe(2);
+		expect(hydration.pendingRequired).toBe(0);
+		expect(hasPendingLayoutTranslateItems(hydration.items)).toBe(false);
 	});
 });
 
@@ -492,6 +1241,34 @@ describe("persistLayoutTranslateSidecarBestEffort debounce", () => {
 		expect(vault.writeVaultFile).toHaveBeenCalledTimes(1);
 	});
 
+	it("merges pending page and document progress when a finished run flushes", async () => {
+		const vault = await import("@/lib/vault");
+		vi.mocked(vault.writeVaultFile).mockReset();
+		vi.mocked(vault.readVaultFile).mockRejectedValue(new Error("missing"));
+		persistLayoutTranslateSidecarBestEffort(
+			"/vault/concurrent",
+			key,
+			[doneItem],
+			{ preserveExisting: true },
+		);
+		await flushLayoutTranslateSidecar(
+			"/vault/concurrent",
+			key,
+			[{ ...doneItem, id: "b", pageIndex: 1 }],
+			{ preserveExisting: true },
+		);
+		expect(vault.writeVaultFile).toHaveBeenCalledTimes(1);
+		const written = JSON.parse(
+			vi.mocked(vault.writeVaultFile).mock.calls[0][1],
+		);
+		expect(written.items.map((item: { id: string }) => item.id)).toEqual([
+			"a",
+			"b",
+		]);
+		await vi.runAllTimersAsync();
+		expect(vault.writeVaultFile).toHaveBeenCalledTimes(1);
+	});
+
 	it("keeps a separate debounce timer per paper", async () => {
 		const vault = await import("@/lib/vault");
 		vi.mocked(vault.writeVaultFile).mockReset();
@@ -504,6 +1281,26 @@ describe("persistLayoutTranslateSidecarBestEffort debounce", () => {
 });
 
 describe("translateServiceKey custom prompt fingerprint", () => {
+	it("invalidates OpenAI translation caches when request options change", () => {
+		const cfg = {
+			apiKey: "",
+			baseUrl: "https://example.test/v1",
+			region: "",
+			model: "qwen3",
+		};
+		const key = (options: { extraRequestBody?: string }) =>
+			translateServiceKey({
+				...DEFAULT_TRANSLATE_SETTINGS,
+				provider: "openaiCompatible",
+				providerConfigs: { openaiCompatible: { ...cfg, ...options } },
+			});
+		expect(key({})).toBe("openaiCompatible:https://example.test/v1::qwen3");
+		expect(key({ extraRequestBody: "" })).toBe(key({}));
+		expect(key({ extraRequestBody: "{}" })).not.toBe(key({}));
+		expect(key({ extraRequestBody: '{"temperature":0.7}' })).not.toBe(
+			key({ extraRequestBody: '{"temperature":0.2}' }),
+		);
+	});
 	const base = {
 		...DEFAULT_TRANSLATE_SETTINGS,
 		provider: "googleapi" as const,
@@ -540,5 +1337,30 @@ describe("translateServiceKey custom prompt fingerprint", () => {
 		expect(
 			translateServiceKey({ ...agentBase, customPrompt: "Be terse." }),
 		).not.toBe("agent:claude-1:default");
+	});
+
+	it("folds system and user templates into the same fingerprint", () => {
+		const legacy = translateServiceKey({
+			...base,
+			customPrompt: "Be terse.",
+			customSystem: "",
+			customUser: "",
+		});
+		expect(translateServiceKey({ ...base, customPrompt: "Be terse." })).toBe(
+			legacy,
+		);
+		expect(
+			translateServiceKey({
+				...base,
+				customPrompt: "",
+				customSystem: "Keep formulas.\nStay terse.",
+			}),
+		).not.toBe(legacy);
+		expect(
+			translateServiceKey({
+				...base,
+				customUser: "\n  \n",
+			}),
+		).toBe("googleapi");
 	});
 });

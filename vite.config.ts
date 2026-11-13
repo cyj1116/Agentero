@@ -14,6 +14,10 @@ const port = Number(process.env.TAURI_DEV_PORT) || 5173;
 export default defineConfig(async () => ({
 	plugins: [react(), tailwindcss()],
 
+	// Use a new URL prefix so WebViews with old immutable prebundles fetch a
+	// consistent dependency graph after upgrading the dev server.
+	cacheDir: "node_modules/.vite/agentero-dev",
+
 	resolve: {
 		alias: {
 			"@": path.resolve(__dirname, "./src"),
@@ -28,15 +32,24 @@ export default defineConfig(async () => ({
 		format: "es",
 	},
 	optimizeDeps: {
+		// Only scan the main desktop entrypoint for dependency pre-bundling.
+		entries: ["index.html"],
 		// PDFium + ONNX Runtime load wasm/workers; dep-optimize rewrites break them.
 		exclude: [
 			"@embedpdf/pdfium",
 			"@embedpdf/engines",
 			"onnxruntime-web",
 			"@embedpdf/ai",
-			// Patched in-repo. Prebundling freezes the published copy, so a
-			// patch fix in plugin-tiling never reaches `vite dev`.
-			"@embedpdf/plugin-tiling",
+			// Do NOT add `@platejs/toc` here even though it is patched in-repo.
+			// It imports the CommonJS-only `react-compiler-runtime`
+			// (`import { c } from "react-compiler-runtime"`), and only the
+			// prebundle step performs the CJS→ESM interop that resolves `c`.
+			// Excluding it fails in the webview with
+			// "Importing binding name 'c' is not found".
+			//
+			// The patch still reaches `vite dev` because pnpm resolves the
+			// package to its `patch_hash=…` store dir, and the prebundle cache
+			// key covers the lockfile — so a patch edit invalidates it.
 		],
 	},
 
@@ -61,6 +74,9 @@ export default defineConfig(async () => ({
 		// iOS Simulator reaches the Mac dev server through the local network
 		// bridge; binding only to loopback makes localhost:5173 unreachable.
 		host: host || "0.0.0.0",
+		// WebViews persist the HTTP cache across dev sessions on the same port.
+		// Do not let a cached dependency outlive a rebuilt prebundle.
+		headers: { "Cache-Control": "no-store" },
 		hmr: host
 			? {
 					protocol: "ws",
@@ -69,8 +85,10 @@ export default defineConfig(async () => ({
 				}
 			: undefined,
 		watch: {
-			// 3. tell Vite to ignore watching `src-tauri`
-			ignored: ["**/src-tauri/**"],
+			// 3. tell Vite to ignore the Rust host and its build artifacts.
+			//    `target/` holds thousands of generated files; watching it can
+			//    exhaust the system inotify limit (ENOSPC) during `tauri dev`.
+			ignored: ["**/src-tauri/**", "**/target/**"],
 		},
 	},
 }));

@@ -100,33 +100,39 @@ export function LayoutStep({
 				prompt: stored?.prompt ?? "",
 				language: stored?.language ?? DEFAULT_MINERU_LANGUAGE,
 				isOcr: stored?.isOcr ?? false,
+				selfHosted: stored?.selfHosted ?? false,
 			},
 			backend: provider.id,
 		});
 		patch({ layout: displayLayout });
 		setDraft({});
 		setProbe("probing");
-		const ok = await probeLayoutProvider(provider.id, apiKey);
-		setProbe(ok ? "ok" : "fail");
+		const result = await probeLayoutProvider(provider.id, apiKey);
+		setProbe(result.ok ? "ok" : "fail");
 	};
 
 	if (mode === "choose") {
 		return (
-			<div className="grid grid-cols-2 gap-3">
-				<ChoiceCard
-					icon={<KeyRound className="size-5 text-muted-foreground" />}
-					title={t("layout.configureOwn")}
-					description={t("layout.configureOwnDesc")}
-					recommended
-					recommendedLabel={t("recommended")}
-					onClick={() => setMode("configure")}
-				/>
-				<ChoiceCard
-					icon={<Sparkles className="size-5 text-muted-foreground" />}
-					title={t("layout.useDefault")}
-					description={t("layout.useDefaultDesc")}
-					onClick={useSystemDefault}
-				/>
+			<div className="space-y-2">
+				<div className="grid grid-cols-2 gap-3">
+					<ChoiceCard
+						icon={<KeyRound className="size-5 text-muted-foreground" />}
+						title={t("layout.configureOwn")}
+						description={t("layout.configureOwnDesc")}
+						recommended
+						recommendedLabel={t("recommended")}
+						onClick={() => setMode("configure")}
+					/>
+					<ChoiceCard
+						icon={<Sparkles className="size-5 text-muted-foreground" />}
+						title={t("layout.useDefault")}
+						description={t("layout.useDefaultDesc")}
+						onClick={useSystemDefault}
+					/>
+				</div>
+				<p className="text-muted-foreground text-xs">
+					{t("layout.selfHostedHint")}
+				</p>
 			</div>
 		);
 	}
@@ -191,6 +197,9 @@ export function LayoutStep({
 					<Button
 						type="button"
 						size="sm"
+						// Keep the button solid while probing; the disabled fade can
+						// flash a grey block behind the spinner in WebKit.
+						className={probe === "probing" ? "disabled:opacity-100" : undefined}
 						disabled={probe === "probing" || !displayKey.trim()}
 						onClick={() => void confirm()}
 					>

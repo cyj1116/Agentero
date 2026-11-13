@@ -1,4 +1,5 @@
 import { AnimatePresence } from "motion/react";
+import { memo, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { AskPopover } from "@/components/viewer/pdf/cards/ask-popover";
 import {
@@ -6,9 +7,11 @@ import {
 	PdfCitationPreview,
 } from "@/components/viewer/pdf/cards/citation-preview";
 import { PdfCrossrefPreview } from "@/components/viewer/pdf/cards/crossref-preview";
+import { PdfLinkUrlTip } from "@/components/viewer/pdf/cards/link-url-tip";
 import { SelectionMenu } from "@/components/viewer/pdf/cards/selection-menu";
 import { TranslateCard } from "@/components/viewer/pdf/cards/translate-card";
 import { VisualTraceCard } from "@/components/viewer/pdf/cards/visual-trace-card";
+import type { LinkUrlTipState } from "@/components/viewer/pdf/hooks/use-pdf-link-url-tip";
 import type {
 	CardScreenPoint,
 	CitationPreviewState,
@@ -19,6 +22,7 @@ import type { PdfVisualSessionTrace } from "@/lib/pdf/agent-trace";
 import type { PdfAskThread } from "@/lib/pdf/ask";
 import type { HighlightColor } from "@/lib/pdf/highlight/palette";
 import type { PdfTranslateRecord } from "@/lib/pdf/translate/types";
+import type { MenuContext } from "@/lib/shell/commands/menu-contributions";
 
 type PdfCardStackProps = {
 	selectionMenu: {
@@ -27,10 +31,14 @@ type PdfCardStackProps = {
 		onAsk: () => void;
 		onAddToChat: () => void;
 		onTranslate: () => void;
-		onCopy?: () => void;
+		onCopy?: () => Promise<boolean>;
+		onBookmark?: () => void;
+		onNote?: () => void;
 		/** Hide highlight / translate (no marks/ to persist into); keep Ask. */
 		showHighlight?: boolean;
 		showTranslate?: boolean;
+		/** Passed through to the PDF toolbar. Omitted by other SelectionMenu callers. */
+		contributionContext?: MenuContext;
 	};
 	citationPreview: {
 		state: CitationPreviewState | null;
@@ -40,6 +48,11 @@ type PdfCardStackProps = {
 	};
 	crossrefPreview: {
 		state: CrossrefPreviewState | null;
+		onHoverEnter: () => void;
+		onHoverLeave: () => void;
+	};
+	linkUrlTip: {
+		state: LinkUrlTipState | null;
 		onHoverEnter: () => void;
 		onHoverLeave: () => void;
 	};
@@ -67,8 +80,8 @@ type PdfCardStackProps = {
 		streaming: boolean;
 		error: string | null;
 		onOpenSettings: () => void;
+		onTogglePin?: () => void;
 		onHide: () => void;
-		onDelete: () => void;
 	};
 	visual: {
 		trace: PdfVisualSessionTrace | null;
@@ -77,14 +90,49 @@ type PdfCardStackProps = {
 	};
 };
 
+/** Stable across scroll re-place; changes when the selection itself changes. */
+function selectionMenuInstanceKey(state: SelectionMenuState): string {
+	const rect = state.anchor.rects[0];
+	if (!rect) return String(state.anchor.page);
+	return `${state.anchor.page}:${rect.x}:${rect.y}:${rect.w}:${rect.h}`;
+}
+
+/**
+ * Clip page-anchored cards to the reading area. The wrapper is window-sized
+ * (`inset-0`) so the card keeps its client coordinates, and `clip-path` makes
+ * it the containing block for the fixed card — without it the card would keep
+ * painting over the tab strip once its text scrolls above the viewport.
+ */
+function PageClip({
+	inset,
+	children,
+}: {
+	inset: CardScreenPoint["clipInset"];
+	children: ReactNode;
+}) {
+	if (!inset) return <>{children}</>;
+	return (
+		<div
+			className="pointer-events-none fixed inset-0 z-50 [&>*]:pointer-events-auto"
+			style={{
+				clipPath: `inset(${inset.top}px ${inset.right}px ${inset.bottom}px ${inset.left}px)`,
+			}}
+		>
+			{children}
+		</div>
+	);
+}
+
 /**
  * Floating cards of the viewer, portaled to `document.body` so page transforms
- * and the scroller's overflow never clip or scale them.
+ * and the scroller's overflow never clip them. Cards keep a fixed UI size and
+ * type scale at any PDF zoom; their screen anchors still follow the page.
  */
-export function PdfCardStack({
+export const PdfCardStack = memo(function PdfCardStack({
 	selectionMenu,
 	citationPreview,
 	crossrefPreview,
+	linkUrlTip,
 	cardScreen,
 	onCardHoverEnter,
 	onCardHoverLeave,
@@ -98,14 +146,18 @@ export function PdfCardStack({
 		<div>
 			{selectionMenu.state ? (
 				<SelectionMenu
+					key={selectionMenuInstanceKey(selectionMenu.state)}
 					screen={selectionMenu.state.screen}
 					onHighlight={selectionMenu.onHighlight}
 					onAsk={selectionMenu.onAsk}
 					onAddToChat={selectionMenu.onAddToChat}
 					onTranslate={selectionMenu.onTranslate}
 					onCopy={selectionMenu.onCopy}
+					onBookmark={selectionMenu.onBookmark}
+					onNote={selectionMenu.onNote}
 					showHighlight={selectionMenu.showHighlight}
 					showTranslate={selectionMenu.showTranslate}
+					contributionContext={selectionMenu.contributionContext}
 				/>
 			) : null}
 
@@ -125,8 +177,18 @@ export function PdfCardStack({
 					kind={crossrefPreview.state.kind}
 					page={crossrefPreview.state.page}
 					image={crossrefPreview.state.image}
+					targetSize={crossrefPreview.state.targetSize}
 					onPointerEnter={crossrefPreview.onHoverEnter}
 					onPointerLeave={crossrefPreview.onHoverLeave}
+				/>
+			) : null}
+
+			{linkUrlTip.state ? (
+				<PdfLinkUrlTip
+					url={linkUrlTip.state.url}
+					screen={linkUrlTip.state.screen}
+					onPointerEnter={linkUrlTip.onHoverEnter}
+					onPointerLeave={linkUrlTip.onHoverLeave}
 				/>
 			) : null}
 
@@ -152,8 +214,8 @@ export function PdfCardStack({
 				) : null}
 			</AnimatePresence>
 
-			<AnimatePresence>
-				{translate.record && cardScreen ? (
+			{translate.record && cardScreen ? (
+				<PageClip inset={cardScreen.clipInset}>
 					<TranslateCard
 						key={`translate-${translate.record.id}`}
 						screen={cardScreen}
@@ -161,14 +223,15 @@ export function PdfCardStack({
 						result={translate.record.result ?? ""}
 						streaming={translate.streaming}
 						error={translate.error ?? translate.record.error ?? null}
+						pinned={translate.record.pinned}
+						onTogglePin={translate.onTogglePin}
 						onOpenSettings={translate.onOpenSettings}
 						onHide={translate.onHide}
-						onDelete={translate.onDelete}
 						onPointerEnter={onCardHoverEnter}
 						onPointerLeave={onCardHoverLeave}
 					/>
-				) : null}
-			</AnimatePresence>
+				</PageClip>
+			) : null}
 
 			<AnimatePresence>
 				{visual.trace && cardScreen ? (
@@ -187,4 +250,4 @@ export function PdfCardStack({
 		</div>,
 		document.body,
 	);
-}
+});

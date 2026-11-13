@@ -1,5 +1,6 @@
 import { ChevronDown, ChevronUp, Search, X } from "lucide-react";
 import type { RefObject } from "react";
+import { memo } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import {
@@ -26,7 +27,7 @@ type PdfFindBarProps = {
 };
 
 /** ⌘F find bar: query input, match counter, prev / next / close. */
-export function PdfFindBar({
+export const PdfFindBar = memo(function PdfFindBar({
 	open,
 	inputRef,
 	query,
@@ -46,7 +47,7 @@ export function PdfFindBar({
 			<div
 				data-pdf-chrome
 				className={cn(
-					"absolute top-12 right-3 z-30 flex origin-top-right select-none items-center gap-1 rounded-lg p-1 shadow-md",
+					"absolute top-12 right-3 z-30 flex origin-top-right select-none items-center gap-1 rounded-lg p-1 shadow-overlay",
 					PDF_CHROME_CHIP,
 					"motion-safe:animate-in motion-safe:fade-in-0 motion-safe:zoom-in-95 motion-safe:duration-200 motion-reduce:animate-none",
 				)}
@@ -124,4 +125,4 @@ export function PdfFindBar({
 			</div>
 		</TooltipProvider>
 	);
-}
+});

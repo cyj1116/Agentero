@@ -1,6 +1,6 @@
 # 内置 Provider（翻译 / Embedding / 正文 OCR）
 
-`agentero` 是一个内置 provider id：凭证在**构建期**编入 Host，用户选中它之后不需要填任何 baseUrl / API Key / model，设置面板也不为它渲染凭证卡片。它是新装用户的默认选项（仅当本次构建注入了 key）。
+`agentero` 是一个内置 provider id：凭证在**构建期**编入 Host，使用它不需要填任何 baseUrl / API Key / model，设置面板也不为它渲染凭证卡片。注入 key 的构建中，新装 Host 默认使用内置翻译与 embedding；正文解析始终默认使用 `local`。
 
 三个消费方：
 
@@ -26,10 +26,10 @@
 
 - 五个变量全部经 `option_env!` 在 Rust 侧**编译期**解析（形态为 `option_env!(...).map(str::trim).filter(|v| !v.is_empty())`，空白串等同未设置）。TS 侧不读任何 `AGENTERO_BUILTIN_*`：`import.meta.env.VITE_*` 会把 key 内联进 JS bundle，等于把秘密发到 webview，因此明确不走那条路。
 - 用 `option_env!` 而非 `env!`：`env!` 在变量缺失时编译失败，会打断本地 dev / contributor / 无 secret 的 CI。仓库必须能在没有任何 secret 的情况下构建。
-- 没有注入 key 的构建里 `available()` 为 `false`，`builtin_provider_status` 返回 `available: false`，UI 隐藏或禁用内置选项，`default_translate_provider()` / `default_parser_backend()` 回落到 `tencenttransmart` / `local`，`embedding_config()` 穿透到已存值（仍为空则返回 `None`，照常触发 `recommend.no_embedding`）。
+- 没有注入 key 的构建里 `available()` 为 `false`，`builtin_provider_status` 返回 `available: false`，UI 隐藏或禁用内置选项，`default_translate_provider()` 回落到 `tencenttransmart`，`embedding_config()` 穿透到已存值（仍为空则返回 `None`，照常触发 `recommend.no_embedding`）。`default_parser_backend()` 无论是否注入 key 都为 `local`。
 - 既有先例：`posthog_key()`（`src-tauri/src/core/telemetry/mod.rs`）用的就是同一套 `option_env!` + trim + filter-empty，见 [telemetry.md](telemetry.md) §开关语义。
 
-**构建脚本转发**：`src-tauri/build.rs` 的 `forward_build_env()` 为全部六个变量（`AGENTERO_POSTHOG_KEY` 加五个 `AGENTERO_BUILTIN_*`）发 `cargo:rerun-if-env-changed`，并在环境变量缺失时回退读仓库根 `.env`（gitignored），经 `cargo:rustc-env=` 重新导出。因此
+**构建脚本转发**：`src-tauri/build.rs` 的 `forward_build_env()` 为 `BUILD_ENV_KEYS` 里的每个变量发 `cargo:rerun-if-env-changed`，并在环境变量缺失时回退读仓库根 `.env`（gitignored），经 `cargo:rustc-env=` 重新导出。列表含 `AGENTERO_POSTHOG_KEY`、五个 `AGENTERO_BUILTIN_*`，以及可选的四份反馈问卷 id（见 [telemetry.md](telemetry.md)）。因此
 
 - 本地既可以直接导出环境变量，也可以把 `AGENTERO_BUILTIN_API_KEY` 写进 `.env`；显式环境变量优先。
 - 改变量值会触发 `src-tauri` 重编。这一条是必需的而非便利：cargo 默认不追踪 `option_env!` 读到的变量，缺了 `rerun-if-env-changed` 时换 key 不会重编，发布包会静默带着旧值或空值出去且毫无征兆。
@@ -83,7 +83,7 @@
 3. 每段一个独立请求，`StreamExt::buffered(3)`——既有并发上限又保证结果顺序，省掉索引管线。并发数 3 对齐 `openai_vlm.rs` 的 `PAGE_CONCURRENCY`。
 4. 重组为 `"{marker} {text}"` 以 `"\n\n"` 连接，与前端 `buildNumberedPayload` 的输出字节一致。
 
-段数少于前端预期时，`parseNumberedTranslation` 返回 null 并**回退为逐段翻译**，段落不会错位。
+段数少于前端预期时，`parseNumberedTranslation` 返回 null 并**回退为逐句翻译**，句子不会错位。
 
 `⟦n⟧` 行内占位符（前端 `mask.ts` 用于保护引用 / URL / 行内公式）**原样透传**，不剥离。这是一个**未经真实 key 验证的假设**，见下方「限制与后续」。
 
@@ -99,7 +99,7 @@
 - `finish_reason` 为 `length` / `max_tokens` / `content_filter` 时报「translation incomplete…retry with a smaller chunk」。
 - `"agentero"` 刻意**不在** Rust 的 `FREE_PROVIDERS` 里（CLI `cli/src/commands/translate.rs` 用它门控 `--provider`，随后以 `api_key: None` 调用，会让 CLI 接受一个无法认证的 provider），也**不在** `COMMERCIAL_PROVIDERS` 里（那个列表驱动 WebView 凭证卡片，内置 provider 不该渲染任何卡片）。
 - **两份「免费 provider」清单刻意不一致**：前端 `FreeTranslateProviderId` / `FREE_MT_PROVIDER_IDS`（`src/lib/translate/types.ts`）**含** `agentero`——这样它复用无 key 引擎的管线、且因为不是 `CommercialTranslateProviderId`，`translate-pane.tsx` 不会为它渲染凭证卡片，`COMMERCIAL_MT_DEFAULT_BASE_URLS` / `COMMERCIAL_MT_DOCS_URLS` 这两个 total Record 也不需要新条目。Rust 的 `FREE_PROVIDERS` **不含**它（理由见上条）。改任何一份清单时都要意识到另一份是反的。
-- 探测：`probeFreeMtProviders` 显式把 `agentero` 过滤掉（探测它会真的发一次翻译请求），可用性只来自 `builtin_provider_status`。
+- 探测：`probeFreeMtProviders` 现已含 `agentero`（探测会真的发一次 "Hi" 翻译请求，顺带验证网关连通）；`translate-pane.tsx` 在 `builtin_provider_status` 报不可用时跳过它——那时探测只会确定性复现 no-key 错误。
 
 ### 支持语言（Hunyuan-MT，37）
 
@@ -161,7 +161,7 @@
 
 也就是说：已经填过自定义端点的老用户**不会被静默切走**；真正全新 / 全空的配置只在官方这类已注入 key 的构建里变成内置。
 
-`embedding_config()` 在解析出的 source 非 `"custom"` 且 `builtin::available()` 时返回网关三元组；否则穿透到已存值。这条链路只服务 arXiv 每日推荐（[../development/plaza.md](../development/plaza.md) §3.4），Host 命令 `recommend_arxiv` 透明继承，无需改动。
+`embedding_config()` 在解析出的 source 非 `"custom"` 且 `builtin::available()` 时返回网关三元组；否则穿透到已存值。这条链路只服务 arXiv 每日推荐（[api.md](api.md) §3.10.5），Host 命令 `recommend_arxiv` 透明继承，无需改动。
 
 向量缓存安全：`embed_cache` 的主键是 `(text_hash, model)`（`catalog/schema.rs` v6），所有读写都按 model 过滤，所以换 embedding 模型不会读到旧向量。
 
@@ -189,7 +189,7 @@
 
 ## 版面分析不走内置（layout / parser 不对称）
 
-**`"agentero"` 是 parser（正文）backend，不是 layout（版面分析）backend。** `LAYOUT_BACKENDS` 仍是 `["local", "paddle", "mineru"]`，`default_layout_backend()` **无条件**返回 `"local"`，而 `default_parser_backend()` 在有编译期 key 时优先返回内置。
+**`"agentero"` 是 parser（正文）backend，不是 layout（版面分析）backend。** `LAYOUT_BACKENDS` 仍是 `["local", "paddle", "mineru"]`，`default_layout_backend()` 与 `default_parser_backend()` 都**无条件**返回 `"local"`（#858）。Host 读取与保存设置时仍接受已显式配置的 `agentero`；设置页沿用 `1034143f` 的策略，不展示内置正文解析选项，并在打开该面板时把已有内置选择切回 `local`。新装默认本地不再依赖打开设置页。
 
 原因：版面分析跑在随包的 PP-DocLayoutV3 ONNX 模型上，首次使用下载到 XDG cache 目录，再经 `agentero-model://` scheme 喂给 webview 的 `onnxruntime-web`——已经免费且离线（见 [../frontend/pdf-layout-analysis.md](../frontend/pdf-layout-analysis.md) §模型落盘）。把版面分析默认切到云端网关会让每个 PDF 都产生费用，且没有任何质量收益。有测试 `layout_backend_never_becomes_builtin` 守住这一点。
 
@@ -199,12 +199,12 @@
 
 | 函数 | 有编译期 key | 无 key |
 |---|---|---|
-| `default_translate_provider()` | `agentero` | `tencenttransmart` |
-| `default_parser_backend()` | `agentero` | `local` |
+| `default_translate_provider()` | `tencenttransmart` | `tencenttransmart` |
+| `default_parser_backend()` | `local` | `local` |
 | `default_layout_backend()` | `local` | `local` |
 | `EmbeddingSettings::source`（推断） | `builtin`（仅当 BYOK 三项全空） | `custom`（空字段 → `embedding_config()` 为 `None`，功能禁用） |
 
-新装用户没有 `settings.json`，`read_file` 返回 `AppSettings::default()`，因此**由 Rust 的 `default_*()` 决定首次安装的取值**。前端 TS 的 defaults 只在浏览器 dev（无 Tauri、也就不可能有 key）里生效，所以刻意保持在非内置值上，两边不需要一致。
+新装用户没有 `settings.json`，`read_file` 返回 `AppSettings::default()`，因此**由 Rust 的 `default_*()` 决定首次安装的取值**。翻译默认固定为腾讯交互翻译，与前端 `DEFAULT_TRANSLATE_SETTINGS` 和引导的默认选项一致；旧文件缺少 provider 时也采用该值。Host 保留已显式保存的 `agentero` 等 provider，加载、保存和重启不会改写这一选择（#857）。
 
 ---
 
@@ -216,9 +216,9 @@
 2. **模板空格待 A/B**：arXiv Hunyuan-MT 技术报告渲染为 `…explanation. <source_text>`（**有**空格），实现用的是模型文档模板的无空格形式。值得一次真实对比再定。
 3. **`temperature = 0.2`** 沿用仓库惯例；技术报告没有规定解码参数。
 4. **多段翻译没有全局 deadline**：最坏墙钟时间是 `ceil(n/3) × timeout`（`timeout` 默认 30s，钳制 1–30s）。整篇 PDF 的一批最多十几段，实测前不设总闸。
-5. **`arxiv_rec_state` 不按 model 建键**：当日已排序结果在切换 embedding 来源后的首次运行会被复用，除非 `force`。既存行为，本次不改（详见 [../development/plaza.md](../development/plaza.md) §3.4）。
+5. ~~**`arxiv_rec_state` 不按 model 建键**~~ **已修**（schema v8 `discovery_runs`）：运行结果键含 model / top_n / 分类，切换 embedding 来源后当天首次运行即重算，不再复用旧结果（详见 [api.md](api.md) §3.10.5）。
 6. **目标语言只有 en / zh-CN**：扩到 Hunyuan-MT 的 37 语言需要同时改 `TR_TARGETS`、前端 `TranslateTargetLang` union 与目标语言选择器，并在 `hunyuan_target_name` 补映射。
 7. **内嵌 key → per-install activation token**：由网关签发、可吊销、可做 per-user 配额；客户端 provider 形状不变。这是内嵌 key 可提取问题的真正解法。
-8. **新手引导没有「Agentero 内置」这一档**：`translate` / `layout` 两个引导步只有「填自己的 Key」与「用免费引擎 / 本地模型」二选一。`translate-step.tsx` 的「用系统默认」原先写入静态前端默认值、会覆盖 Host 解析出的内置默认，现已改为按可用性解析（与 `default_translate_provider()` 一致），因此一路点过引导不再丢失内置默认；但引导界面本身仍未把内置作为显式选项呈现。见 [../frontend/onboarding.md](../frontend/onboarding.md)。
+8. **引导默认值已对齐**（#857）：`translate-step.tsx` 的默认选项写入 `tencenttransmart`，与 Host 一致，不依赖内置 key。引导文案和交互的后续调整见 #856；当前设置页已隐藏内置 provider，Host 通道仍保留。见 [../frontend/onboarding.md](../frontend/onboarding.md)。
 
 前端 provider / 面板 / i18n 落点见 [../frontend/settings.md](../frontend/settings.md)、[../frontend/translate.md](../frontend/translate.md)。

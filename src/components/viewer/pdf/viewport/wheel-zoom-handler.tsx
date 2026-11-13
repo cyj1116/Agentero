@@ -5,10 +5,14 @@ import {
 import { useZoom } from "@embedpdf/plugin-zoom/react";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { EMBED_PAGE_ATTR } from "@/components/viewer/pdf/coords";
+import { cancelPendingViewportScroll } from "@/lib/pdf/scroll-sync";
 import { bindZoomGesture, type ZoomGesturePoint } from "@/lib/pdf/wheel-zoom";
 import {
 	clampZoomPreviewScale,
+	zoomCommitPreviewTransform,
+	zoomGestureCenteringMargin,
 	zoomPreviewTranslateForViewport,
+	zoomReadingWidth,
 } from "@/lib/pdf/zoom";
 
 /** Safety net for a dropped `gestureend`: commit the pending preview. */
@@ -18,7 +22,7 @@ const ZOOM_GESTURE_WATCHDOG_MS = 1200;
 const ZOOM_COMMIT_EPSILON = 1e-3;
 
 /** Let the virtual scroller publish its new page dimensions before giving up. */
-const ZOOM_LAYOUT_SETTLE_FRAMES = 8;
+const ZOOM_LAYOUT_SETTLE_FRAMES = 30;
 
 type PageAnchor = {
 	pageIndex: number;
@@ -47,6 +51,15 @@ type PageAnchor = {
  * viewport, then hands the horizontal anchor smoothly to the gesture point as
  * the page overflows.
  */
+function readingWidthOf(container: HTMLElement): number {
+	const style = getComputedStyle(container);
+	return zoomReadingWidth(
+		container.clientWidth,
+		parseFloat(style.paddingLeft) || 0,
+		parseFloat(style.paddingRight) || 0,
+	);
+}
+
 export function WheelZoomHandler({ docId }: { docId: string }) {
 	const viewportRef = useViewportElement();
 	const { provides: viewportCapability } = useViewportCapability();
@@ -99,6 +112,7 @@ export function WheelZoomHandler({ docId }: { docId: string }) {
 		let previewElementWidth = 0;
 		let previewViewportWidth = 0;
 		let pointer: ZoomGesturePoint = { x: 0, y: 0 };
+		let commitTarget: ZoomGesturePoint = { x: 0, y: 0 };
 		/** Gesture point in the transformed element's own coordinates. */
 		let local = { x: 0, y: 0 };
 		let watchdog: ReturnType<typeof setTimeout> | null = null;
@@ -124,6 +138,7 @@ export function WheelZoomHandler({ docId }: { docId: string }) {
 			pendingScrollRef.current = null;
 			pendingAnchorRef.current = null;
 			resetPreview();
+			container.dispatchEvent(new Event("pdf-zoom-settled"));
 		};
 
 		const scheduleSettle = () => {
@@ -148,6 +163,7 @@ export function WheelZoomHandler({ docId }: { docId: string }) {
 			// layout, then restore the preview if the virtual page sizes are still old.
 			const previewTransform = element.style.transform;
 			element.style.transform = "";
+			const elementRect = element.getBoundingClientRect();
 			const page = anchor
 				? container.querySelector<HTMLElement>(
 						`[${EMBED_PAGE_ATTR}="${anchor.pageIndex}"]`,
@@ -162,11 +178,30 @@ export function WheelZoomHandler({ docId }: { docId: string }) {
 					Math.abs((pageRect?.height ?? Infinity) - expectedHeight) <= 2);
 
 			if (!layoutReady && settleFrames < ZOOM_LAYOUT_SETTLE_FRAMES) {
-				element.style.transform = previewTransform;
+				if (anchor && page && pageRect && pageRect.width > 0) {
+					const offset = zoomCommitPreviewTransform(
+						pageRect,
+						elementRect,
+						anchor,
+						commitTarget,
+						expectedWidth,
+					);
+					element.style.transform = `translate(${offset.x}px, ${offset.y}px) scale(${offset.scale})`;
+				} else {
+					element.style.transform = previewTransform;
+				}
 				settleFrames += 1;
 				scheduleSettle();
 				return;
 			}
+
+			// The wrapper's ResizeObserver may center the new layout after this
+			// frame. Apply that margin before measuring the final anchor.
+			const readingWidth = readingWidthOf(container);
+			element.style.marginLeft = `${zoomGestureCenteringMargin(
+				element.offsetWidth,
+				readingWidth,
+			)}px`;
 
 			if (Number.isFinite(scroll.left)) container.scrollLeft = scroll.left;
 			if (Number.isFinite(scroll.top)) container.scrollTop = scroll.top;
@@ -174,9 +209,12 @@ export function WheelZoomHandler({ docId }: { docId: string }) {
 				const current = page.getBoundingClientRect();
 				const anchoredX = current.left + current.width * anchor.x;
 				const anchoredY = current.top + current.height * anchor.y;
-				container.scrollLeft += anchoredX - pointer.x;
-				container.scrollTop += anchoredY - pointer.y;
+				container.scrollLeft += anchoredX - commitTarget.x;
+				container.scrollTop += anchoredY - commitTarget.y;
 			}
+			// The zoom plugin also queues a viewport scroll for the next frame.
+			// Once the real page is anchored, that older request must not undo it.
+			cancelPendingViewportScroll(docId);
 			completeCommit();
 		};
 		settleCommitRef.current = settleCommit;
@@ -186,14 +224,30 @@ export function WheelZoomHandler({ docId }: { docId: string }) {
 			running = false;
 			clearWatchdog();
 			const containerRect = container.getBoundingClientRect();
-			// The focus keeps the gesture point in place once the real layout lands.
-			const focus = {
-				vx: pointer.x - containerRect.left,
-				vy: pointer.y - containerRect.top,
-			};
+			// Ask EmbedPDF to keep the PDF point where the preview currently shows
+			// it. A centered narrow-page preview may have moved it off the pointer.
 			const target = previewZoom * previewScale;
+			const anchor = pendingAnchorRef.current;
+			const previewPage = anchor
+				? container.querySelector<HTMLElement>(
+						`[${EMBED_PAGE_ATTR}="${anchor.pageIndex}"]`,
+					)
+				: null;
+			const previewRect = previewPage?.getBoundingClientRect();
+			commitTarget =
+				anchor && previewRect
+					? {
+							x: previewRect.left + previewRect.width * anchor.x,
+							y: previewRect.top + previewRect.height * anchor.y,
+						}
+					: pointer;
+			const focus = {
+				vx: commitTarget.x - containerRect.left,
+				vy: commitTarget.y - containerRect.top,
+			};
 			if (Math.abs(target - zoomLevelRef.current) < ZOOM_COMMIT_EPSILON) {
 				resetPreview();
+				container.dispatchEvent(new Event("pdf-zoom-settled"));
 				return;
 			}
 			pendingCommitRef.current = true;
@@ -229,6 +283,7 @@ export function WheelZoomHandler({ docId }: { docId: string }) {
 				pendingScrollRef.current = null;
 				pendingAnchorRef.current = null;
 				resetPreview();
+				container.dispatchEvent(new Event("pdf-zoom-start"));
 				const containerRect = container.getBoundingClientRect();
 				// WebKit's GestureEvent does not always carry coordinates.
 				pointer = {
@@ -256,9 +311,7 @@ export function WheelZoomHandler({ docId }: { docId: string }) {
 				previewZoom = zoomLevelRef.current || 1;
 				previewScale = 1;
 				previewElementWidth = previewElementRef.current?.offsetWidth ?? 0;
-				previewViewportWidth =
-					viewportCapabilityRef.current?.forDocument(docId).getMetrics()
-						.clientWidth ?? container.clientWidth;
+				previewViewportWidth = readingWidthOf(container);
 				running = true;
 				const element = previewElementRef.current;
 				if (element) {

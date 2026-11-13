@@ -6,16 +6,19 @@ import {
 	FileType2,
 	Highlighter,
 	ImageIcon,
+	LocateFixed,
 	ScanSearch,
 	TextQuote,
 } from "lucide-react";
 import { PlateElement, type PlateElementProps } from "platejs/react";
 import {
+	type CSSProperties,
 	lazy,
 	Suspense,
 	useCallback,
 	useEffect,
 	useMemo,
+	useRef,
 	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
@@ -28,10 +31,13 @@ import { EmbedStatus } from "@/components/editor/embeds/embed-status";
 import { useWikiEmbedProjection } from "@/components/editor/embeds/projection-context";
 import { WikiAnnotationEmbed } from "@/components/editor/embeds/wiki-annotation-embed";
 import { useMarkdownExportMode } from "@/components/editor/markdown-export-mode-context";
+import { useSettings } from "@/hooks/use-app-stores";
+import { useInView } from "@/hooks/use-in-view";
 import { errorText } from "@/lib/core/error";
 import { createKeyedCache } from "@/lib/core/keyed-cache";
 import { cn } from "@/lib/core/utils";
 import type { AnnotationRefKind } from "@/lib/pdf/annotation-ref";
+import { useUiScale } from "@/lib/settings";
 import { joinVaultPath } from "@/lib/vault";
 import {
 	navFromResolvedLink,
@@ -55,6 +61,9 @@ const WikiAttachmentEmbed = lazy(async () => {
 	);
 	return { default: module.WikiAttachmentEmbed };
 });
+
+const EMBED_HEADER_ACTION_CLASS =
+	"inline-flex shrink-0 items-center gap-1 rounded-sm px-1.5 py-0.5 text-muted-foreground text-xs hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
 
 type EmbedLoadState =
 	| { kind: "loading" }
@@ -253,6 +262,8 @@ export function WikiEmbedElement({
 	...props
 }: PlateElementProps & { editing: boolean }) {
 	const { t } = useTranslation("editor");
+	const wikiEmbedFontSize = useSettings((s) => s.wikiEmbedFontSize);
+	const uiScale = useUiScale();
 	const element = props.element as unknown as WikiSlateNode;
 	const wikiNav = useWikiNav();
 	const markdownDoc = useMarkdownDoc();
@@ -261,6 +272,10 @@ export function WikiEmbedElement({
 	const EmbeddedMarkdownProjection = useWikiEmbedProjection();
 	const expandEmbeds = exportMode?.expandEmbeds === true;
 	const hideChromeActions = exportMode?.hideChromeActions === true;
+	// Embed bodies deserialize another whole document; only do that once the
+	// embed is near the viewport (export always renders every embed).
+	const bodyRef = useRef<HTMLSpanElement | null>(null);
+	const bodyInView = useInView(bodyRef, { enabled: !exportMode });
 
 	const target = element.value ?? "";
 	const targetWithFragment = element.heading
@@ -273,6 +288,7 @@ export function WikiEmbedElement({
 				: `#${element.heading}`
 		: target;
 	const [targetRevision, setTargetRevision] = useState(0);
+	const [pdfLocateRequest, setPdfLocateRequest] = useState(0);
 	/**
 	 * highlight vs agent-trace for the header icon. Keyed by embed token so a
 	 * subtype from a previous link never sticks after the token changes
@@ -316,6 +332,7 @@ export function WikiEmbedElement({
 				: { kind: "error" as const };
 
 	useEffect(() => {
+		if (!bodyInView) return;
 		const vaultPath = wikiNav?.vaultPath;
 		const sourcePath = markdownDoc.filePath;
 		if (!vaultPath || !sourcePath || !requestKey) {
@@ -378,6 +395,7 @@ export function WikiEmbedElement({
 			cancelled = true;
 		};
 	}, [
+		bodyInView,
 		markdownDoc.filePath,
 		requestKey,
 		targetWithFragment,
@@ -435,8 +453,11 @@ export function WikiEmbedElement({
 			{...props}
 			as="span"
 			className={cn(
-				"relative max-w-full align-top",
-				editing ? "inline text-foreground" : "my-2 block w-full",
+				// Layout (inline vs full-width block, and the blank line Slate's
+				// placeholder leaves would otherwise open) lives in index.css
+				// under `.agentero-wiki-embed`.
+				"agentero-wiki-embed relative max-w-full align-top",
+				editing && "inline text-foreground",
 			)}
 			attributes={{
 				...props.attributes,
@@ -445,15 +466,21 @@ export function WikiEmbedElement({
 			}}
 		>
 			<span
+				ref={bodyRef}
 				contentEditable={false}
 				className={cn(
-					"group/embed block rounded-md border border-border bg-muted/20 shadow-sm",
+					"group/embed block rounded-md border border-border bg-muted/20 shadow-raised",
 					expandEmbeds
 						? "max-h-none overflow-visible"
 						: "max-h-96 overflow-auto",
 					presentation.kind !== "ready" && "border-dashed",
 					editing && "hidden",
 				)}
+				style={
+					{
+						"--wiki-embed-font-size": `${wikiEmbedFontSize * uiScale}px`,
+					} as CSSProperties
+				}
 			>
 				{/* Shared chrome: type icon + title · open source on the right */}
 				<span
@@ -466,10 +493,28 @@ export function WikiEmbedElement({
 					<span className="min-w-0 flex-1 truncate font-medium text-foreground/90 text-xs">
 						{sourceLabel || t("embed.untitled")}
 					</span>
+					{!hideChromeActions &&
+					presentation.kind === "ready" &&
+					presentation.response.contentKind === "pdf" &&
+					presentation.response.link.occurrence.fragment?.kind === "heading" ? (
+						<button
+							type="button"
+							className={EMBED_HEADER_ACTION_CLASS}
+							aria-label={t("embed.locateTarget")}
+							title={t("embed.locateTarget")}
+							onClick={(event) => {
+								event.preventDefault();
+								event.stopPropagation();
+								setPdfLocateRequest((request) => request + 1);
+							}}
+						>
+							<LocateFixed className="size-3.5" aria-hidden />
+						</button>
+					) : null}
 					{!hideChromeActions && resolvedLink?.status === "resolved" ? (
 						<button
 							type="button"
-							className="inline-flex shrink-0 items-center gap-1 rounded-sm px-1.5 py-0.5 text-muted-foreground text-xs hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+							className={EMBED_HEADER_ACTION_CLASS}
 							aria-label={t("embed.openSource", { target: sourceLabel })}
 							title={t("embed.openSource", { target: sourceLabel })}
 							onClick={(event) => {
@@ -486,44 +531,53 @@ export function WikiEmbedElement({
 				{presentation.kind === "loading" ? (
 					<EmbedStatus message={t("embed.loading")} />
 				) : presentation.kind === "ready" ? (
-					<Suspense fallback={<EmbedStatus message={t("embed.loading")} />}>
-						{presentation.response.contentKind === "markdown" &&
-						EmbeddedMarkdownProjection ? (
-							<WikiEmbedAncestryProvider
-								ancestry={[...ancestry, presentation.key]}
-							>
-								<EmbeddedMarkdownProjection
-									key={`${presentation.key}:${targetRevision}`}
-									markdown={presentation.response.content ?? ""}
-									filePath={absoluteTarget}
+					bodyInView ? (
+						<Suspense fallback={<EmbedStatus message={t("embed.loading")} />}>
+							{presentation.response.contentKind === "markdown" &&
+							EmbeddedMarkdownProjection ? (
+								<WikiEmbedAncestryProvider
+									ancestry={[...ancestry, presentation.key]}
+								>
+									<EmbeddedMarkdownProjection
+										key={`${presentation.key}:${targetRevision}`}
+										markdown={presentation.response.content ?? ""}
+										filePath={absoluteTarget}
+									/>
+								</WikiEmbedAncestryProvider>
+							) : presentation.response.contentKind === "image" ||
+								presentation.response.contentKind === "pdf" ? (
+								<WikiAttachmentEmbed
+									kind={presentation.response.contentKind}
+									absoluteTarget={absoluteTarget}
+									targetPath={presentation.response.link.targetPath ?? target}
+									revision={targetRevision}
+									imageSize={element.alias}
+									vaultPath={wikiNav?.vaultPath}
+									fragment={presentation.response.link.occurrence.fragment}
+									locateRequest={pdfLocateRequest}
 								/>
-							</WikiEmbedAncestryProvider>
-						) : presentation.response.contentKind === "image" ||
-							presentation.response.contentKind === "pdf" ? (
-							<WikiAttachmentEmbed
-								kind={presentation.response.contentKind}
-								absoluteTarget={absoluteTarget}
-								targetPath={presentation.response.link.targetPath ?? target}
-								revision={targetRevision}
-								imageSize={element.alias}
-							/>
-						) : presentation.response.contentKind === "annotation" &&
-							wikiNav?.vaultPath &&
-							presentation.response.link.targetPath &&
-							presentation.response.link.occurrence.fragment?.kind ===
-								"annotation" ? (
-							// Body-only: title/icon + jump live in the shared header above
-							// (body is not click-to-open, same as markdown embeds).
-							<WikiAnnotationEmbed
-								vaultPath={wikiNav.vaultPath}
-								targetPath={presentation.response.link.targetPath}
-								annotationId={presentation.response.link.occurrence.fragment.id}
-								onResolvedKind={onAnnotationKind}
-							/>
-						) : (
-							<EmbedStatus message={t("embed.unsupported")} />
-						)}
-					</Suspense>
+							) : presentation.response.contentKind === "annotation" &&
+								wikiNav?.vaultPath &&
+								presentation.response.link.targetPath &&
+								presentation.response.link.occurrence.fragment?.kind ===
+									"annotation" ? (
+								// Body-only: title/icon + jump live in the shared header above
+								// (body is not click-to-open, same as markdown embeds).
+								<WikiAnnotationEmbed
+									vaultPath={wikiNav.vaultPath}
+									targetPath={presentation.response.link.targetPath}
+									annotationId={
+										presentation.response.link.occurrence.fragment.id
+									}
+									onResolvedKind={onAnnotationKind}
+								/>
+							) : (
+								<EmbedStatus message={t("embed.unsupported")} />
+							)}
+						</Suspense>
+					) : (
+						<EmbedStatus message={t("embed.loading")} />
+					)
 				) : (
 					<EmbedStatus
 						message={t(

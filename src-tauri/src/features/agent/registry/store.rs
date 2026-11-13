@@ -1,17 +1,17 @@
 use crate::core::error::AppError;
 use crate::features::agent::acp::client::{
-    build_child_env, effective_local_agent_env, resolve_command_in_agent_env,
+    build_child_env, effective_local_agent_env, resolve_acp_entry, resolve_command_in_agent_env,
 };
 use crate::features::agent::models::{
-    default_agent_proxy_url, AgentDescriptor, AgentRegistryState, AgentTelemetrySummary,
-    AgentTemplate, CatalogAcpStatus, CatalogEntry, CatalogScanResponse, ProbeResult,
-    UpsertAgentRequest,
+    default_agent_proxy_url, is_builtin_template, merge_no_proxy, AgentDescriptor,
+    AgentRegistryState, AgentTelemetrySummary, AgentTemplate, CatalogAcpStatus, CatalogEntry,
+    CatalogScanResponse, ProbeResult, UpsertAgentRequest, ZHIHU_AGENT_ID,
 };
 use crate::features::agent::registry::bundled;
 use crate::features::agent::registry::discovery::probe_command;
 use crate::features::agent::registry::lifecycle;
 use crate::features::agent::registry::templates::{
-    catalog_templates, template_from_id, template_info,
+    catalog_templates, interactive_cli, template_from_id, template_info, zcode_host_path,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -31,9 +31,17 @@ impl AgentRegistry {
             read_state(&path).unwrap_or_else(|_| (AgentRegistryState::default(), false));
         let migrated_codex = migrate_legacy_codex_agents(&mut state);
         let migrated_grok = migrate_legacy_grok_agents(&mut state);
+        let migrated_zcode = migrate_legacy_zcode_agents(&mut state);
         let migrated_env = migrate_catalog_env_defaults(&mut state);
+        let added_builtin = ensure_builtin_agents(&mut state);
         state.enabled = true;
-        if migrated_codex || migrated_grok || removed_templates || migrated_env {
+        if migrated_codex
+            || migrated_grok
+            || migrated_zcode
+            || removed_templates
+            || migrated_env
+            || added_builtin
+        {
             if let Err(error) = persist(&path, &state) {
                 log::error!(
                     target: "agentero::agent",
@@ -57,16 +65,6 @@ impl AgentRegistry {
         apply_proxy_settings(&mut state);
         apply_user_agent_settings(&mut state);
         Ok(state)
-    }
-
-    pub fn set_enabled(&self, enabled: bool) -> Result<AgentRegistryState, AppError> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| AppError::message("agent registry lock poisoned"))?;
-        guard.enabled = enabled;
-        persist(&self.path, &guard)?;
-        Ok(guard.clone())
     }
 
     pub fn set_proxy(
@@ -327,31 +325,6 @@ impl AgentRegistry {
         Ok(true)
     }
 
-    pub fn discover(&self, id: Option<&str>) -> Result<Vec<AgentDescriptor>, AppError> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| AppError::message("agent registry lock poisoned"))?;
-
-        for agent in guard.agents.iter_mut() {
-            if id.is_some_and(|want| want != agent.id) {
-                continue;
-            }
-            probe_or_bundled(agent);
-        }
-        persist(&self.path, &guard)?;
-        Ok(if let Some(want) = id {
-            guard
-                .agents
-                .iter()
-                .filter(|a| a.id == want)
-                .cloned()
-                .collect()
-        } else {
-            guard.agents.clone()
-        })
-    }
-
     pub fn get(&self, id: &str) -> Result<AgentDescriptor, AppError> {
         let state = self.snapshot()?;
         state
@@ -402,9 +375,7 @@ impl AgentRegistry {
                     a.template.as_str() == info.id
                         || (a.command == info.command && a.args == info.args)
                 });
-                // Antigravity switches between a PATH command and the
-                // Agentero-managed absolute path as its managed copy appears
-                // or disappears. Refresh stale descriptors before probing.
+                // Antigravity migrated to native `agy acp`. Refresh stale descriptors before probing.
                 if info.id == "antigravity-acp"
                     && registered.is_some_and(|agent| {
                         agent.command != info.command || agent.args != info.args
@@ -419,20 +390,21 @@ impl AgentRegistry {
                     .unwrap_or_else(|| catalog_env(&info));
                 let environment = build_child_env(
                     std::env::vars(),
-                    crate::features::agent::registry::discovery::login_shell_env(),
+                    crate::features::agent::registry::discovery::login_shell_env().as_deref(),
                     &descriptor_env,
                 );
-                let detect = info
-                    .detect_command
-                    .as_deref()
-                    .unwrap_or(info.command.as_str());
-                let path_acp_available =
-                    resolve_command_in_agent_env(&info.command, &environment).is_some();
+                let path_acp_available = resolve_acp_entry(&info.command, &environment).is_some();
                 let bundled = bundled::bundled_adapter(&info.id);
-                let detect_path = if !path_acp_available && bundled.is_some() {
+                let detect_path = if info.id == AgentTemplate::Zcode.as_str() {
+                    zcode_host_path(&environment)
+                } else if !path_acp_available && bundled.is_some() {
                     bundled::host_path(&info.id, &environment)
                 } else {
-                    resolve_command_in_agent_env(detect, &environment)
+                    let detect = info
+                        .detect_command
+                        .as_deref()
+                        .unwrap_or(info.command.as_str());
+                    resolve_acp_entry(detect, &environment)
                 };
                 let binary_available = detect_path.is_some();
                 let availability =
@@ -483,11 +455,19 @@ impl AgentRegistry {
                     .is_some_and(|(a, d)| a == d);
 
                 // Two install layers: Agent (detect binary) vs ACP entrypoint.
-                let adapter_distinct = info
-                    .detect_command
-                    .as_ref()
-                    .is_some_and(|d| d != &info.command);
+                let adapter_distinct = info.id == AgentTemplate::Zcode.as_str()
+                    || info
+                        .detect_command
+                        .as_ref()
+                        .is_some_and(|d| d != &info.command);
                 let can_install = lifecycle::supports_lifecycle(&info.id);
+                // Resolve the interactive CLI's leading binary so the row only
+                // offers the terminal action when it is actually available
+                // (e.g. Antigravity's separate `agy`), keeping any launch args.
+                let cli_command = interactive_cli(&info).and_then(|command| {
+                    let binary = command.split_whitespace().next()?.to_string();
+                    resolve_command_in_agent_env(&binary, &environment).map(|_| command)
+                });
                 // Offer ACP install when host is present but ACP entry is missing.
                 let offer_install = binary_available
                     && !acp_command_available
@@ -506,6 +486,7 @@ impl AgentRegistry {
                     install_hint: info.install_hint,
                     install_command: info.install_command,
                     login_command: info.login_command,
+                    cli_command,
                     offer_install,
                     can_install,
                     adapter_distinct,
@@ -559,7 +540,11 @@ impl AgentRegistry {
         let mut templates: Vec<String> = guard
             .agents
             .iter()
-            .filter(|a| !matches!(a.template, AgentTemplate::Custom))
+            // Built-in agents are not user-registered backends; keep telemetry
+            // limited to real ACP templates + a custom count.
+            .filter(|a| {
+                !matches!(a.template, AgentTemplate::Custom) && !is_builtin_template(&a.template)
+            })
             .map(|a| a.template.as_str().to_string())
             .collect();
         templates.sort();
@@ -577,11 +562,6 @@ impl AgentRegistry {
 
     pub fn resolve_default(&self, preferred: Option<&str>) -> Result<AgentDescriptor, AppError> {
         let state = self.snapshot()?;
-        if !state.enabled {
-            return Err(AppError::message(
-                "Agent is disabled. Enable it in Settings → Agent.",
-            ));
-        }
         let id = preferred
             .map(str::to_string)
             .or(state.default_id.clone())
@@ -642,6 +622,47 @@ fn migrate_catalog_env_defaults(state: &mut AgentRegistryState) -> bool {
     changed
 }
 
+/// 内置「知乎」Agent 的 descriptor：Host 内建，无外部命令，始终可用。
+fn builtin_agent_descriptor() -> AgentDescriptor {
+    AgentDescriptor {
+        id: ZHIHU_AGENT_ID.to_string(),
+        name: "知乎".to_string(),
+        template: AgentTemplate::Zhihu,
+        command: String::new(),
+        args: Vec::new(),
+        env: HashMap::new(),
+        available: true,
+        last_error: None,
+        last_probe_ok: Some(true),
+        last_probe_agent_name: Some("知乎".to_string()),
+        last_probe_error: None,
+        last_probed_at: None,
+    }
+}
+
+/// 确保内置 Agent 已注册，使其无需安装/探测即可出现在切换器。返回是否有变更。
+fn ensure_builtin_agents(state: &mut AgentRegistryState) -> bool {
+    match state.agents.iter_mut().find(|a| a.id == ZHIHU_AGENT_ID) {
+        Some(existing) => {
+            let mut changed = false;
+            if existing.template != AgentTemplate::Zhihu {
+                existing.template = AgentTemplate::Zhihu;
+                changed = true;
+            }
+            if !existing.available {
+                existing.available = true;
+                existing.last_error = None;
+                changed = true;
+            }
+            changed
+        }
+        None => {
+            state.agents.push(builtin_agent_descriptor());
+            true
+        }
+    }
+}
+
 /// Grok Build used to launch as `npx @xai-official/grok@<pinned> agent stdio`,
 /// which downloaded the agent on first spawn. Repoint stale rows at the real CLI.
 fn migrate_legacy_grok_agents(state: &mut AgentRegistryState) -> bool {
@@ -678,6 +699,28 @@ fn migrate_legacy_codex_agents(state: &mut AgentRegistryState) -> bool {
             agent.last_probed_at = None;
             migrated = true;
         }
+    }
+    migrated
+}
+
+/// zcode-acp-server 0.47 changed its bare invocation from the stdio ACP bridge
+/// to an interactive TUI. Catalog registrations created by older releases need
+/// the explicit `server` subcommand before their next initialize.
+fn migrate_legacy_zcode_agents(state: &mut AgentRegistryState) -> bool {
+    let mut migrated = false;
+    for agent in &mut state.agents {
+        if agent.template != AgentTemplate::Zcode
+            || agent.command != "zcode-acp-server"
+            || !agent.args.is_empty()
+        {
+            continue;
+        }
+        agent.args = vec!["server".to_string()];
+        agent.last_probe_ok = None;
+        agent.last_probe_agent_name = None;
+        agent.last_probe_error = None;
+        agent.last_probed_at = None;
+        migrated = true;
     }
     migrated
 }
@@ -799,6 +842,8 @@ fn apply_proxy_settings(state: &mut AgentRegistryState) {
     }
 }
 
+/// Loopback bypass for the injected proxy env lives in `models::merge_no_proxy`
+/// (shared with the remote and lifecycle injection sites).
 fn apply_proxy_to_agent(agent: &mut AgentDescriptor, proxy_enabled: bool, proxy_url: &str) {
     for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
         agent.env.remove(key);
@@ -809,6 +854,10 @@ fn apply_proxy_to_agent(agent: &mut AgentDescriptor, proxy_enabled: bool, proxy_
             for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
                 agent.env.insert(key.to_string(), proxy_url.to_string());
             }
+            agent.env.insert(
+                "NO_PROXY".to_string(),
+                merge_no_proxy(agent.env.get("NO_PROXY")),
+            );
         }
     }
 }
@@ -854,14 +903,18 @@ fn apply_user_agent_to_agent(agent: &mut AgentDescriptor, user_agent: &str, prov
         AgentTemplate::Opencode
         | AgentTemplate::AntigravityAcp
         | AgentTemplate::QoderCli
+        | AgentTemplate::QoderCn
         | AgentTemplate::GrokBuild
-        | AgentTemplate::OpenClaw
         | AgentTemplate::Pi
         | AgentTemplate::Hermes
+        | AgentTemplate::CursorAgent
         | AgentTemplate::Dsh
         | AgentTemplate::KimiCode
         | AgentTemplate::Zcode
-        | AgentTemplate::MinimaxCode => {}
+        | AgentTemplate::MinimaxCode
+        | AgentTemplate::MimoCode
+        | AgentTemplate::Codebuddy
+        | AgentTemplate::Zhihu => {}
     }
 }
 
@@ -979,23 +1032,29 @@ fn local_command_availability(
     environment: &HashMap<String, String>,
     bundled_spawnable: impl FnOnce() -> bool,
 ) -> Result<(), String> {
-    if resolve_command_in_agent_env(command, environment).is_some() {
+    // ZCode's ACP executable is only a bridge. Treat it as unavailable until
+    // the desktop-app CLI (normally a `zcode.cjs`, not a PATH executable) is
+    // present; otherwise an adapter-only registration reaches `initialize`
+    // and fails with the opaque "incoming transport closed" error.
+    if template_id == AgentTemplate::Zcode.as_str() && zcode_host_path(environment).is_none() {
+        return Err("ZCode desktop CLI not found (install ZCode or set ZCODE_BIN)".to_string());
+    }
+    if resolve_acp_entry(command, environment).is_some() {
         return Ok(());
     }
-    if bundled_spawnable() {
-        if bundled::host_path(template_id, environment).is_some() {
-            return Ok(());
-        }
-        if let Some((host, key)) = bundled::host_requirement(template_id) {
-            return Err(format!(
-                "host command `{host}` not found (check its installation or `{key}`)"
-            ));
-        }
+    if bundled_spawnable() && bundled::host_requirement(template_id).is_some() {
+        return bundled::host_env_injection(template_id, environment).map(|_| ());
     }
     Err(format!("ACP command `{command}` not found"))
 }
 
 fn probe_or_bundled(agent: &mut AgentDescriptor) {
+    // Built-in agents have no binary to probe — they are always available.
+    if is_builtin_template(&agent.template) {
+        agent.available = true;
+        agent.last_error = None;
+        return;
+    }
     let environment = effective_local_agent_env(agent);
     let availability = local_command_availability(
         &agent.command,
@@ -1010,12 +1069,35 @@ fn probe_or_bundled(agent: &mut AgentDescriptor) {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_user_agent_to_agent, merge_anthropic_custom_headers_user_agent,
-        merge_codex_config_user_agent, migrate_legacy_codex_agents, migrate_legacy_grok_agents,
+        apply_proxy_to_agent, apply_user_agent_to_agent, ensure_builtin_agents,
+        merge_anthropic_custom_headers_user_agent, merge_codex_config_user_agent,
+        migrate_legacy_codex_agents, migrate_legacy_grok_agents, migrate_legacy_zcode_agents,
         strip_removed_templates, AGENTERO_USER_AGENT_ENV, ANTHROPIC_CUSTOM_HEADERS_ENV,
     };
-    use crate::features::agent::models::{AgentDescriptor, AgentRegistryState, AgentTemplate};
+    use crate::features::agent::models::{
+        merge_no_proxy, AgentDescriptor, AgentRegistryState, AgentTemplate, ZHIHU_AGENT_ID,
+    };
     use std::collections::HashMap;
+
+    #[test]
+    fn ensure_builtin_agents_injects_and_repairs_idempotently() {
+        let mut state = AgentRegistryState::default();
+        assert!(ensure_builtin_agents(&mut state));
+        assert_eq!(state.agents.len(), 1);
+        assert_eq!(state.agents[0].id, ZHIHU_AGENT_ID);
+        assert_eq!(state.agents[0].template, AgentTemplate::Zhihu);
+        assert!(state.agents[0].available);
+        // Already present and correct → no change.
+        assert!(!ensure_builtin_agents(&mut state));
+        // Drifted row is repaired in place.
+        state.agents[0].template = AgentTemplate::Custom;
+        state.agents[0].available = false;
+        state.agents[0].last_error = Some("stale".to_string());
+        assert!(ensure_builtin_agents(&mut state));
+        assert_eq!(state.agents[0].template, AgentTemplate::Zhihu);
+        assert!(state.agents[0].available);
+        assert!(state.agents[0].last_error.is_none());
+    }
 
     fn legacy_codex_app_server() -> AgentDescriptor {
         let mut env = HashMap::new();
@@ -1084,6 +1166,34 @@ mod tests {
 
         // Already native: nothing left to migrate.
         assert!(!migrate_legacy_grok_agents(&mut state));
+    }
+
+    #[test]
+    fn migrates_legacy_zcode_bare_launcher_to_acp_server() {
+        let mut state = AgentRegistryState {
+            agents: vec![AgentDescriptor {
+                id: "catalog-zcode".to_string(),
+                name: "ZCode".to_string(),
+                template: AgentTemplate::Zcode,
+                command: "zcode-acp-server".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                available: true,
+                last_error: None,
+                last_probe_ok: Some(true),
+                last_probe_agent_name: Some("zcode".to_string()),
+                last_probe_error: None,
+                last_probed_at: Some("1".to_string()),
+            }],
+            ..AgentRegistryState::default()
+        };
+
+        assert!(migrate_legacy_zcode_agents(&mut state));
+        let agent = &state.agents[0];
+        assert_eq!(agent.args, vec!["server".to_string()]);
+        assert_eq!(agent.last_probe_ok, None);
+        assert_eq!(agent.last_probed_at, None);
+        assert!(!migrate_legacy_zcode_agents(&mut state));
     }
 
     #[test]
@@ -1215,6 +1325,72 @@ mod tests {
     }
 
     #[test]
+    fn proxy_injection_adds_loopback_no_proxy() {
+        let mut agent = AgentDescriptor {
+            id: "oc".into(),
+            name: "OpenCode".into(),
+            template: AgentTemplate::Opencode,
+            command: "opencode".into(),
+            args: vec!["acp".into()],
+            env: HashMap::new(),
+            available: true,
+            last_error: None,
+            last_probe_ok: None,
+            last_probe_agent_name: None,
+            last_probe_error: None,
+            last_probed_at: None,
+        };
+        apply_proxy_to_agent(&mut agent, true, "http://127.0.0.1:7890");
+        assert_eq!(
+            agent.env.get("HTTP_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:7890")
+        );
+        // OpenCode's ACP CLI talks to its own serve child over 127.0.0.1;
+        // without the bypass the local proxy 502s that loopback traffic and
+        // session/new fails with ClientError (empty model list).
+        assert_eq!(
+            agent.env.get("NO_PROXY").map(String::as_str),
+            Some("127.0.0.1,localhost,::1")
+        );
+    }
+
+    #[test]
+    fn proxy_no_proxy_merge_keeps_user_entries() {
+        assert_eq!(merge_no_proxy(None), "127.0.0.1,localhost,::1");
+        // User entries stay first; loopback hosts are deduped case-insensitively.
+        assert_eq!(
+            merge_no_proxy(Some(&"internal.corp,LOCALHOST,127.0.0.1".to_string())),
+            "internal.corp,LOCALHOST,127.0.0.1,::1"
+        );
+    }
+
+    #[test]
+    fn proxy_disabled_clears_injected_vars_but_keeps_user_no_proxy() {
+        let mut agent = AgentDescriptor {
+            id: "oc2".into(),
+            name: "OpenCode".into(),
+            template: AgentTemplate::Opencode,
+            command: "opencode".into(),
+            args: vec!["acp".into()],
+            env: HashMap::from([("NO_PROXY".to_string(), "internal.corp".to_string())]),
+            available: true,
+            last_error: None,
+            last_probe_ok: None,
+            last_probe_agent_name: None,
+            last_probe_error: None,
+            last_probed_at: None,
+        };
+        apply_proxy_to_agent(&mut agent, false, "http://127.0.0.1:7890");
+        assert!(!agent.env.contains_key("HTTP_PROXY"));
+        assert!(!agent.env.contains_key("HTTPS_PROXY"));
+        assert!(!agent.env.contains_key("ALL_PROXY"));
+        assert_eq!(
+            agent.env.get("NO_PROXY").map(String::as_str),
+            Some("internal.corp")
+        );
+    }
+
+    #[test]
     fn merge_anthropic_headers_upserts_user_agent_line() {
         let mut env = HashMap::new();
         env.insert(
@@ -1261,7 +1437,14 @@ mod tests {
             })
             .is_ok());
 
-            environment.insert(key.to_string(), executable.display().to_string());
+            let host_entry = if cfg!(windows) && id == "claude-acp" {
+                let script = tmp.path().join("cli.js");
+                std::fs::write(&script, "").unwrap();
+                script
+            } else {
+                executable
+            };
+            environment.insert(key.to_string(), host_entry.display().to_string());
             assert!(
                 local_command_availability("missing-adapter", id, &environment, || true).is_ok()
             );

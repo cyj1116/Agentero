@@ -1,9 +1,9 @@
 import {
 	Copy,
 	LoaderCircle,
-	MonitorSmartphone,
 	Power,
 	ShieldCheck,
+	Smartphone,
 	Trash2,
 } from "lucide-react";
 import QRCode from "qrcode";
@@ -34,6 +34,7 @@ import { copyTextToClipboard } from "@/lib/core/clipboard";
 import { errorText } from "@/lib/core/error";
 import { notifyError } from "@/lib/core/notify";
 import { isTauri } from "@/lib/core/tauri";
+import { toSafeDisposer } from "@/lib/core/tauri-events";
 import {
 	isRemoteVaultHandle,
 	remoteCacheClear,
@@ -81,18 +82,22 @@ export function RemoteAccessPane({ vaultPath }: { vaultPath: string | null }) {
 	useEffect(() => {
 		if (!isTauri()) return;
 		void refresh().catch((error) => notifyError(errorText(error)));
-		const unlisten: Array<() => void> = [];
-		void listenPairingRequest((request) => {
-			setPending((current) => [
-				...current.filter((item) => item.requestId !== request.requestId),
-				request,
-			]);
-		}).then((off) => unlisten.push(off));
-		void listenHostStatus(() => {
-			void refresh().catch(() => undefined);
-		}).then((off) => unlisten.push(off));
+		const disposePairing = toSafeDisposer(
+			listenPairingRequest((request) => {
+				setPending((current) => [
+					...current.filter((item) => item.requestId !== request.requestId),
+					request,
+				]);
+			}),
+		);
+		const disposeStatus = toSafeDisposer(
+			listenHostStatus(() => {
+				void refresh().catch(() => undefined);
+			}),
+		);
 		return () => {
-			for (const off of unlisten) off();
+			disposePairing();
+			disposeStatus();
 		};
 	}, [refresh]);
 
@@ -211,7 +216,7 @@ export function RemoteAccessPane({ vaultPath }: { vaultPath: string | null }) {
 									/>
 								) : (
 									<div className="grid size-32 place-items-center border">
-										<MonitorSmartphone className="size-5 text-muted-foreground" />
+										<Smartphone className="size-5 text-muted-foreground" />
 									</div>
 								)}
 								<div className="min-w-0 space-y-3">

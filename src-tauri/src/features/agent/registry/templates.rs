@@ -1,35 +1,4 @@
 use crate::features::agent::models::{AgentTemplate, AgentTemplateInfo};
-use std::path::PathBuf;
-
-/// Directory owned by Agentero for the official Antigravity ACP package.
-pub fn antigravity_install_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Agentero")
-        .join("agents")
-        .join("antigravity-acp")
-}
-
-/// File name of the ACP server inside the managed directory (the Windows
-/// archive ships an `.exe`, the other platforms a `.par`).
-pub fn antigravity_server_name() -> &'static str {
-    if cfg!(windows) {
-        "agy_acp_server.exe"
-    } else {
-        "agy_acp_server.par"
-    }
-}
-
-pub fn antigravity_command() -> String {
-    let name = antigravity_server_name();
-    let managed = antigravity_install_dir().join(name);
-    if managed.is_file() {
-        managed.display().to_string()
-    } else {
-        name.to_string()
-    }
-}
 
 /// Preset command templates only — host binaries are never bundled with
 /// Agentero. The Claude/Codex ACP adapters are the one exception to "nothing
@@ -61,6 +30,17 @@ pub const CODEX_ACP_INSTALL_COMMAND: &str = if cfg!(windows) {
     "npm i -g @agentclientprotocol/codex-acp@latest --prefix \"$HOME/.local\""
 };
 
+/// Codex host CLI (`@openai/codex`). Codex also ships a standalone installer,
+/// but Agentero's Codex entry needs the npm-only `codex-acp` adapter, so the
+/// lifecycle keeps both layers on npm instead of mixing an officially installed
+/// Codex with the adapter's own dependency. The user prefix avoids the
+/// root-owned `/usr/local` default on macOS pkg-installed Node (#791).
+pub const CODEX_HOST_INSTALL_COMMAND: &str = if cfg!(windows) {
+    "npm i -g @openai/codex@latest"
+} else {
+    "npm i -g @openai/codex@latest --prefix \"$HOME/.local\""
+};
+
 /// Community `pi-acp` adapter — pi itself has no native ACP mode, the adapter
 /// spawns `pi --mode rpc`. Same prefix reasoning as the Claude adapter above.
 pub const PI_ACP_INSTALL_COMMAND: &str = if cfg!(windows) {
@@ -71,7 +51,12 @@ pub const PI_ACP_INSTALL_COMMAND: &str = if cfg!(windows) {
 
 /// Host pi CLI. The official `pi.dev/install.sh` is an interactive TUI installer,
 /// so the silent lifecycle uses npm (what that script ultimately runs) everywhere.
-pub const PI_HOST_INSTALL_COMMAND: &str = "npm i -g @earendil-works/pi-coding-agent@latest";
+/// Unix needs the user prefix for the same reason as the adapters (#791).
+pub const PI_HOST_INSTALL_COMMAND: &str = if cfg!(windows) {
+    "npm i -g @earendil-works/pi-coding-agent@latest"
+} else {
+    "npm i -g @earendil-works/pi-coding-agent@latest --prefix \"$HOME/.local\""
+};
 
 /// Host dsh CLI (DeepSeek Harness). ACP ships as a built-in profile
 /// (`dsh --profile acp`, 0.1.2+); the standalone `@deepseek-ai/dsh-acp-demo`
@@ -85,7 +70,12 @@ pub const DSH_INSTALL_COMMAND: &str = if cfg!(windows) {
 
 /// MiniMax Code native ACP CLI (`mcode acp`). The package ships native SQLite
 /// dependencies, so npm must run install scripts and include optional deps.
-pub const MINIMAX_CODE_INSTALL_COMMAND: &str = "npm install --global @minimax-ai/code@latest --ignore-scripts=false --include=optional --allow-scripts=@minimax-ai/code,better-sqlite3 --registry https://registry.npmjs.org/ --foreground-scripts";
+/// Unix uses the user prefix so it does not need a writable `/usr/local` (#791).
+pub const MINIMAX_CODE_INSTALL_COMMAND: &str = if cfg!(windows) {
+    "npm install --global @minimax-ai/code@latest --ignore-scripts=false --include=optional --allow-scripts=@minimax-ai/code,better-sqlite3 --registry https://registry.npmjs.org/ --foreground-scripts"
+} else {
+    "npm install --global @minimax-ai/code@latest --prefix \"$HOME/.local\" --ignore-scripts=false --include=optional --allow-scripts=@minimax-ai/code,better-sqlite3 --registry https://registry.npmjs.org/ --foreground-scripts"
+};
 
 /// Default install directory of the official Kimi Code installer (single
 /// binary, written into the shell rc). Used for uninstall cleanup.
@@ -110,9 +100,29 @@ pub fn kimi_launcher_dir() -> std::path::PathBuf {
 /// app-server --stdio` and reuses the ZCode desktop app login. Same prefix
 /// reasoning as the Claude adapter above.
 pub const ZCODE_ACP_INSTALL_COMMAND: &str = if cfg!(windows) {
-    "npm i -g zcode-acp-server@latest"
+    // The package's postinstall is only a hub-upgrade notification, but its
+    // POSIX shell syntax fails when npm runs it through Windows cmd.exe.
+    "npm i -g zcode-acp-server@latest --ignore-scripts"
 } else {
     "npm i -g zcode-acp-server@latest --prefix \"$HOME/.local\""
+};
+
+/// Xiaomi MiMo Code CLI (npm package `mimocode`, bin `mimo`) with native ACP.
+/// Same prefix reasoning as the ZCode adapter above.
+pub const MIMO_CODE_INSTALL_COMMAND: &str = if cfg!(windows) {
+    "npm i -g mimocode"
+} else {
+    "npm i -g mimocode --prefix \"$HOME/.local\""
+};
+
+/// Tencent CodeBuddy Code CLI. The official installer (native binary, no Node
+/// needed) seeds `~/.local/bin/codebuddy` on Unix and
+/// `%USERPROFILE%\AppData\Local\codebuddy\bin` on Windows; npm is the fallback
+/// and keeps the same Unix user prefix as the other agents (#791).
+pub const CODEBUDDY_NPM_INSTALL_COMMAND: &str = if cfg!(windows) {
+    "npm i -g @tencent-ai/codebuddy-code@latest"
+} else {
+    "npm i -g @tencent-ai/codebuddy-code@latest --prefix \"$HOME/.local\""
 };
 
 /// Newest `zcode.cjs` under the given dir, deepest-glob `*/*/glm/*/[arch]`.
@@ -151,6 +161,107 @@ fn zcode_cached_cli_candidates(releases_root: std::path::PathBuf) -> Vec<std::pa
     });
     candidates.reverse();
     candidates
+}
+
+/// Candidate desktop CLIs from custom first-level folders on a system drive.
+/// This intentionally checks only the fixed suffix rather than walking all
+/// descendant directories during catalog scans.
+fn zcode_system_drive_cli_candidates(root: std::path::PathBuf) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| {
+            entry
+                .path()
+                .join("ZCode")
+                .join("resources")
+                .join("glm")
+                .join("zcode.cjs")
+        })
+        .collect()
+}
+
+/// Locate the CLI bundled in a ZCode desktop installation. The desktop CLI is
+/// a JavaScript entrypoint, so normal executable/PATH probing cannot see it.
+/// Keep this separate from `zcode_runtime_env`: catalog discovery needs to
+/// distinguish an installed desktop app from the ACP bridge npm package.
+fn zcode_desktop_cli_candidates() -> Vec<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    let mut candidates = Vec::new();
+
+    if cfg!(target_os = "macos") {
+        if let Some(home) = &home {
+            candidates.extend(zcode_cached_cli_candidates(
+                home.join("Library/Application Support/ZCode/remote-assets-cache/releases"),
+            ));
+            candidates.push(home.join("Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"));
+        }
+        candidates.push(std::path::PathBuf::from(
+            "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+        ));
+    }
+    if cfg!(target_os = "linux") {
+        if let Some(home) = &home {
+            candidates.extend(zcode_cached_cli_candidates(
+                home.join(".config/ZCode/remote-assets-cache/releases"),
+            ));
+        }
+        candidates.push(std::path::PathBuf::from(
+            "/opt/ZCode/resources/glm/zcode.cjs",
+        ));
+        candidates.push(std::path::PathBuf::from(
+            "/usr/share/zcode/resources/glm/zcode.cjs",
+        ));
+    }
+    if cfg!(target_os = "windows") {
+        if let Some(home) = &home {
+            candidates.extend(zcode_cached_cli_candidates(
+                home.join("AppData/Roaming/ZCode/remote-assets-cache/releases"),
+            ));
+        }
+        if let Some(app_dir) = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) {
+            candidates.push(app_dir.join("Programs/ZCode/resources/glm/zcode.cjs"));
+        }
+        if let Some(app_dir) = std::env::var_os("APPDATA").map(std::path::PathBuf::from) {
+            candidates.push(app_dir.join("ZCode/resources/glm/zcode.cjs"));
+        }
+        candidates.push(std::path::PathBuf::from(
+            r"C:\Program Files\ZCode\resources\glm\zcode.cjs",
+        ));
+        // Users often choose a custom first-level folder on the system drive.
+        if let Some(system_drive) = std::env::var_os("SystemDrive") {
+            let root = std::path::PathBuf::from(format!("{}\\", system_drive.to_string_lossy()));
+            candidates.extend(zcode_system_drive_cli_candidates(root));
+        }
+    }
+    candidates
+}
+
+/// Resolve a ZCode host either from PATH or from the desktop app bundle.
+/// `zcode-acp-server` is deliberately not considered a host: the adapter can
+/// be installed while its required desktop backend is absent.
+pub fn zcode_host_path(
+    environment: &std::collections::HashMap<String, String>,
+) -> Option<std::path::PathBuf> {
+    if let Some(configured) = environment
+        .get("ZCODE_BIN")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(configured);
+    }
+    let paths = environment
+        .get("PATH")
+        .map(|path| std::env::split_paths(path).collect::<Vec<_>>())
+        .unwrap_or_else(crate::core::process::discover::path_entries);
+    crate::core::process::discover::resolve_command_in_paths("zcode", &paths).or_else(|| {
+        zcode_desktop_cli_candidates()
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 /// Env the ZCode adapter needs to drive the desktop app's embedded CLI.
@@ -220,42 +331,13 @@ pub fn zcode_runtime_env() -> Vec<(String, String)> {
         }
     }
 
-    // Newest CLI bundle whose backend still supports the registry push.
-    let mut candidates = Vec::new();
-    if cfg!(target_os = "macos") {
-        candidates.extend(zcode_cached_cli_candidates(
-            home.join("Library/Application Support/ZCode/remote-assets-cache/releases"),
-        ));
-        // Machine-wide and per-user install locations (adapter discovers both).
-        candidates.push(std::path::PathBuf::from(
-            "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
-        ));
-        candidates.push(home.join("Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"));
-    }
-    if cfg!(target_os = "linux") {
-        candidates.extend(zcode_cached_cli_candidates(
-            home.join(".config/ZCode/remote-assets-cache/releases"),
-        ));
-        candidates.push(std::path::PathBuf::from(
-            "/opt/ZCode/resources/glm/zcode.cjs",
-        ));
-        candidates.push(std::path::PathBuf::from(
-            "/usr/share/zcode/resources/glm/zcode.cjs",
-        ));
-    }
-    if cfg!(target_os = "windows") {
-        candidates.extend(zcode_cached_cli_candidates(
-            home.join("AppData/Roaming/ZCode/remote-assets-cache/releases"),
-        ));
-        if let Some(app_dir) = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) {
-            candidates.push(app_dir.join("Programs/ZCode/resources/glm/zcode.cjs"));
-        }
-    }
-    if let Some(cli) = candidates.into_iter().find(|cjs| {
-        std::fs::read_to_string(cjs)
-            .map(|src| src.contains("workspace/updateProviderRegistry"))
-            .unwrap_or(false)
-    }) {
+    // Do not gate this on a legacy RPC name. Recent ZCode app-server builds
+    // removed `workspace/updateProviderRegistry`; rejecting them left the ACP
+    // adapter to start without its backend and close the initialize transport.
+    if let Some(cli) = zcode_desktop_cli_candidates()
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+    {
         env.push(("ZCODE_BIN".to_string(), cli.display().to_string()));
         // The adapter's Node resolution relies on Unix `which` and falls back
         // to executing the `.cjs` directly — not a valid Windows entrypoint.
@@ -305,18 +387,6 @@ pub fn builtin_templates() -> Vec<AgentTemplateInfo> {
             login_command: None,
         },
         AgentTemplateInfo {
-            id: AgentTemplate::OpenClaw.as_str().to_string(),
-            name: "OpenClaw".to_string(),
-            description: "OpenClaw with native ACP (`openclaw acp`).".to_string(),
-            command: "openclaw".to_string(),
-            args: vec!["acp".to_string()],
-            detect_command: Some("openclaw".to_string()),
-            install_hint: "npm i -g openclaw@latest  ·  https://docs.openclaw.ai/cli/acp"
-                .to_string(),
-            install_command: None,
-            login_command: None,
-        },
-        AgentTemplateInfo {
             id: AgentTemplate::ClaudeAcp.as_str().to_string(),
             name: "Claude".to_string(),
             description: "Claude Code via official ACP adapter (`claude-agent-acp`).".to_string(),
@@ -343,28 +413,36 @@ pub fn builtin_templates() -> Vec<AgentTemplateInfo> {
             install_command: Some(CODEX_ACP_INSTALL_COMMAND.to_string()),
             login_command: Some("codex login".to_string()),
         },
-        // The official registry has no macOS Intel build.
-        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+        AgentTemplateInfo {
+            id: AgentTemplate::CursorAgent.as_str().to_string(),
+            name: "Cursor".to_string(),
+            description:
+                "Cursor Agent CLI with native ACP (`cursor-agent acp`). Reuses the local Cursor login."
+                    .to_string(),
+            command: "cursor-agent".to_string(),
+            args: vec!["acp".to_string()],
+            detect_command: Some("cursor-agent".to_string()),
+            install_hint: if cfg!(windows) {
+                "irm 'https://cursor.com/install?win32=true' | iex  ·  then `cursor-agent login`  ·  https://cursor.com/docs/cli"
+            } else {
+                "curl https://cursor.com/install -fsS | bash  ·  then `cursor-agent login`  ·  https://cursor.com/docs/cli"
+            }
+            .to_string(),
+            install_command: None,
+            login_command: Some("cursor-agent login".to_string()),
+        },
         AgentTemplateInfo {
             id: AgentTemplate::AntigravityAcp.as_str().to_string(),
             name: "Antigravity".to_string(),
-            description: "Google Antigravity via its official ACP server.".to_string(),
-            command: antigravity_command(),
-            // Match the launch arguments published in the official ACP registry.
-            args: if cfg!(target_os = "linux") {
-                vec!["--uid=".to_string()]
-            } else {
-                vec![]
-            },
-            detect_command: None,
-            install_hint: "Download the official ACP server into Agentero's managed directory; \
-                localharness_external is kept beside it. \
-                https://antigravity.google/docs/ide/extensions/zed"
-                .to_string(),
-            // Antigravity is installed by the local Registry-aware lifecycle
-            // path. There is no equivalent shell command for remote hosts.
+            description: "Google Antigravity with native ACP (`agy acp`).".to_string(),
+            command: "agy".to_string(),
+            args: vec!["acp".to_string()],
+            detect_command: Some("agy".to_string()),
+            install_hint:
+                "Install the Antigravity CLI (`agy`), then log in with `agy acp --login`  ·  https://antigravity.google"
+                    .to_string(),
             install_command: None,
-            login_command: None,
+            login_command: Some("agy acp --login".to_string()),
         },
         AgentTemplateInfo {
             id: AgentTemplate::Hermes.as_str().to_string(),
@@ -387,10 +465,27 @@ pub fn builtin_templates() -> Vec<AgentTemplateInfo> {
             args: vec!["--acp".to_string()],
             detect_command: Some("qodercli".to_string()),
             install_hint:
-                "Install Qoder CLI, then `qodercli login`  ·  https://docs.qoder.com/en/cli/acp"
+                "Official installer (https://qoder.com/install) or npm: \
+                 `npm i -g @qoder-ai/qodercli`  ·  then `qodercli login`  ·  \
+                 https://docs.qoder.com/cli/installation"
                     .to_string(),
             install_command: None,
             login_command: None,
+        },
+        AgentTemplateInfo {
+            id: AgentTemplate::QoderCn.as_str().to_string(),
+            name: "Qoder CN".to_string(),
+            description: "Qoder CN CLI with native ACP (`qodercn --acp`).".to_string(),
+            command: "qodercn".to_string(),
+            args: vec!["--acp".to_string()],
+            detect_command: Some("qodercn".to_string()),
+            install_hint:
+                "Official installer (https://static.qoder.com.cn/qoder-cli-cn/install.sh) or npm: \
+                 `npm i -g @qodercn-ai/qoderclicn`  ·  then `qodercn login`  ·  \
+                 https://docs.qoder.cn/cli/installation"
+                    .to_string(),
+            install_command: None,
+            login_command: Some("qodercn login".to_string()),
         },
         AgentTemplateInfo {
             id: AgentTemplate::GrokBuild.as_str().to_string(),
@@ -422,7 +517,7 @@ pub fn builtin_templates() -> Vec<AgentTemplateInfo> {
             args: vec!["--profile".to_string(), "acp".to_string()],
             detect_command: Some("dsh".to_string()),
             install_hint: format!(
-                "{DSH_INSTALL_COMMAND}  ·  needs Node 22.19+ and DEEPSEEK_API_KEY in ~/.dsh/.env \
+                "{DSH_INSTALL_COMMAND}  ·  needs Node 22.19+ / 24.2+ and DEEPSEEK_API_KEY in ~/.dsh/.env \
                  (or the launch environment)  ·  https://github.com/deepseek-ai/deepseek-harness"
             ),
             install_command: Some(DSH_INSTALL_COMMAND.to_string()),
@@ -453,10 +548,12 @@ pub fn builtin_templates() -> Vec<AgentTemplateInfo> {
                  Reuses the ZCode desktop app login in ~/.zcode; the adapter auto-discovers the \
                  app-bundled CLI (or set ZCODE_BIN)."
                     .to_string(),
-            // ACP entrypoint is the adapter; it discovers the desktop app's
-            // zcode.cjs itself, so the "installed" badge tracks the adapter.
+            // ACP entrypoint is the adapter. Catalog discovery separately
+            // checks the desktop app's bundled `zcode.cjs` as its host layer.
+            // zcode-acp-server 0.47+ opens its interactive TUI when invoked
+            // without a subcommand. ACP uses the explicit stdio bridge.
             command: "zcode-acp-server".to_string(),
-            args: vec![],
+            args: vec!["server".to_string()],
             detect_command: Some("zcode-acp-server".to_string()),
             install_hint: format!(
                 "{ZCODE_ACP_INSTALL_COMMAND}  (needs Node 22+ and a logged-in ZCode App)  ·  \
@@ -480,6 +577,40 @@ pub fn builtin_templates() -> Vec<AgentTemplateInfo> {
             ),
             install_command: Some(MINIMAX_CODE_INSTALL_COMMAND.to_string()),
             login_command: Some("mcode login".to_string()),
+        },
+        AgentTemplateInfo {
+            id: AgentTemplate::MimoCode.as_str().to_string(),
+            name: "MiMo Code".to_string(),
+            description:
+                "Xiaomi MiMo Code CLI (an OpenCode fork) with native ACP (`mimo acp`). \
+                 Log in once via `mimo providers` (opencode auth login flow)."
+                    .to_string(),
+            command: "mimo".to_string(),
+            args: vec!["acp".to_string()],
+            detect_command: Some("mimo".to_string()),
+            install_hint: format!(
+                "{MIMO_CODE_INSTALL_COMMAND}  (needs Node 22+)  ·  https://mimo.xiaomi.com"
+            ),
+            install_command: Some(MIMO_CODE_INSTALL_COMMAND.to_string()),
+            login_command: None,
+        },
+        AgentTemplateInfo {
+            id: AgentTemplate::Codebuddy.as_str().to_string(),
+            name: "CodeBuddy".to_string(),
+            description:
+                "Tencent CodeBuddy Code CLI with native ACP (`codebuddy --acp`). \
+                 First launch picks the Chinese / international / enterprise login site."
+                    .to_string(),
+            command: "codebuddy".to_string(),
+            args: vec!["--acp".to_string()],
+            detect_command: Some("codebuddy".to_string()),
+            install_hint:
+                "Official installer (https://copilot.tencent.com/cli/install.sh) or npm: \
+                 `npm i -g @tencent-ai/codebuddy-code`  ·  then run `codebuddy` to log in  ·  \
+                 https://www.codebuddy.ai/docs/cli/acp"
+                    .to_string(),
+            install_command: None,
+            login_command: None,
         },
         AgentTemplateInfo {
             id: AgentTemplate::Custom.as_str().to_string(),
@@ -506,22 +637,71 @@ pub fn catalog_templates() -> Vec<AgentTemplateInfo> {
 pub fn template_from_id(id: &str) -> AgentTemplate {
     match id {
         "opencode" => AgentTemplate::Opencode,
-        "openclaw" => AgentTemplate::OpenClaw,
+        "openclaw" => AgentTemplate::Custom,
         "hermes" => AgentTemplate::Hermes,
         "claude-acp" => AgentTemplate::ClaudeAcp,
         "codex-acp" => AgentTemplate::CodexAcp,
+        "cursor-agent" => AgentTemplate::CursorAgent,
         "antigravity-acp" => AgentTemplate::AntigravityAcp,
         "qodercli" => AgentTemplate::QoderCli,
+        "qoder-cn" => AgentTemplate::QoderCn,
         "grok-build" => AgentTemplate::GrokBuild,
         "pi" => AgentTemplate::Pi,
         "dsh" => AgentTemplate::Dsh,
         "kimi-code" => AgentTemplate::KimiCode,
         "zcode" => AgentTemplate::Zcode,
         "minimax-code" => AgentTemplate::MinimaxCode,
+        "mimo-code" => AgentTemplate::MimoCode,
+        "codebuddy" => AgentTemplate::Codebuddy,
         _ => AgentTemplate::Custom,
     }
 }
 
 pub fn template_info(id: &str) -> Option<AgentTemplateInfo> {
     builtin_templates().into_iter().find(|t| t.id == id)
+}
+
+/// Interactive host CLI for a template, when the Agent ships one.
+///
+/// Usually the same binary as `detect_command`, but some agents differ
+/// (Antigravity's `agy`) or need launch arguments (Dsh's `--profile tui`), and
+/// some have no user-facing CLI at all (ZCode's only entrypoint is the ACP
+/// adapter). `None` hides the Settings "open in terminal" action for that row.
+pub fn interactive_cli(info: &AgentTemplateInfo) -> Option<String> {
+    if info.id == AgentTemplate::Zcode.as_str() {
+        return None;
+    }
+    if info.id == AgentTemplate::Dsh.as_str() {
+        // `dsh` requires an explicit profile; `tui` is the shipped interactive
+        // one (`acp` is the stdio server Agentero itself boots).
+        return Some("dsh --profile tui".to_string());
+    }
+    info.detect_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{zcode_host_path, zcode_system_drive_cli_candidates};
+    use std::collections::HashMap;
+
+    #[test]
+    fn zcode_host_uses_explicit_zcode_bin() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let environment =
+            HashMap::from([("ZCODE_BIN".to_string(), temp.path().display().to_string())]);
+        assert_eq!(zcode_host_path(&environment).as_deref(), Some(temp.path()));
+    }
+
+    #[test]
+    fn zcode_custom_system_drive_candidate_uses_fixed_suffix() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = temp.path().join("Sofware/ZCode/resources/glm/zcode.cjs");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, "").unwrap();
+        assert!(zcode_system_drive_cli_candidates(temp.path().to_path_buf()).contains(&cli));
+    }
 }

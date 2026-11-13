@@ -6,7 +6,7 @@ import {
 	Message,
 	MessageContent,
 	MessageResponse,
-} from "@/components/ai-elements/message";
+} from "@/components/agent/message";
 import { SelectionCard } from "@/components/viewer/pdf/cards/selection-card";
 import type { ScreenPoint } from "@/components/viewer/pdf/types";
 import { cn } from "@/lib/core/utils";
@@ -50,7 +50,7 @@ export function VisualTraceCard({
 			lockHeight
 			preferRight={preferRight}
 			title={title}
-			icon={MessagesSquare}
+			icon={<MessagesSquare />}
 			ariaLabel={t("pdfExplain.traceCardTitle")}
 			onPointerEnter={onPointerEnter}
 			onPointerLeave={onPointerLeave}
@@ -103,7 +103,9 @@ export function VisualTraceCard({
 									>
 										{bodyText ? (
 											from === "assistant" ? (
-												<MessageResponse>{bodyText}</MessageResponse>
+												<MessageResponse enableOpenUiBlocks>
+													{bodyText}
+												</MessageResponse>
 											) : (
 												<span className="whitespace-pre-wrap break-words">
 													{bodyText}

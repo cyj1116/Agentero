@@ -154,18 +154,22 @@ PDF 拖到窗口任意区域都会导入当前 Papers 目标目录；Library 表
 
 迁移不会把 Zotero 数据库当作 Agentero 运行时库；文件写入当前 Vault，元数据写入当前 catalog。
 
+若一篇论文属于多个 Zotero 分类，Agentero 仍只保存一个真实论文目录：优先放入层级最深的分类，层级相同则按完整路径字母顺序确定。它的其他原始归属会直接在对应分类文件夹中显示为带链接标识的论文条目；它们都指向同一真实目录，不会复制文件。所有空分类仍会作为真实文件夹保留。
+
+没有挂在论文下的独立笔记会写成 `notes/` 里的 Markdown。未归类的放在 `notes/` 根目录；开启按分类建文件夹时，放进 `notes/` 下对应的分类路径。再次迁移不会覆盖已经写入的笔记。挂在论文下的笔记仍追加到该论文的 `NOTES.md`。
+
 ## 管理论文
 
 ### Library 与文件夹作用域
 
 - 左侧虚拟节点 **Library** 打开全库表格。
 - 单击 `papers/` 下的组织文件夹（如 `papers/nlp`）：同一 Library 表按路径前缀筛选（不新开 tab、不重新拉全库）。
-- 单击 `notes/`、`.agents/`、`plans/` 等非 papers 目录：不进入文件夹作用域，Library 仍显示全库。
+- 单击 `notes/`、`.agents/`、`plans/` 等非 papers 目录：只展开/折叠并选中文件树行，不切换当前视图，也不进入文件夹作用域。
 - 表头可排序；表头右键可选列与顺序（持久化到设置）。
 
 ### 标签
 
-在 Paper Info 中增删标签并可选 Apple 风格 8 色。Library 的 tags 列显示染色 chip；搜索框可匹配标签子串。
+在 Paper Info 中增删标签并可选 Apple 风格 8 色。Library 的 Tags 列只显示用户标签；「发表 / 投稿」列显示 publication、模板推断的投稿目标和 EasyScholar 指标。搜索框可匹配标签、publication 等文本。
 
 ### 补下载资源
 

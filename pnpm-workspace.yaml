@@ -1,4 +1,8 @@
 allowBuilds:
+  # postinstall is installation telemetry only; the parser itself has no build
+  # step. Runtime telemetry is opt-in via OPENUI_RUNTIME_TELEMETRY_ENABLED and
+  # the browser bundle never sends it.
+  '@openuidev/lang-core': false
   core-js: false
   esbuild: false
   protobufjs: false
@@ -6,28 +10,63 @@ minimumReleaseAgeExclude:
   - '@ai-sdk/gateway@4.0.19'
   - '@ai-sdk/provider-utils@5.0.9'
   - ai@7.0.26
-  - '@hono/node-server@1.19.17'
+  - '@embedpdf/plugin-ai-manager@0.0.1'
 overrides:
-  brace-expansion@<5.0.9: '>=5.0.9'
+  '@better-fetch/fetch': 1.3.3
+  brace-expansion@<5.0.12: '>=5.0.12 <6'
+  # Vite dev-server and launch-editor advisories (Dependabot #83 #85 #86 #88 #89).
+  vite@>=7.0.0 <7.3.7: '>=7.3.7 <8'
+  # Vitest manual-mock injection and Windows redirect bypass (Dependabot #90 #91).
+  '@vitest/mocker@<4.1.12': '>=4.1.12 <5'
+  # MCP SDK bearer-token, task-session, OAuth, and redirect advisories
+  # (Dependabot #79 #81 #82 #84). shadcn 4.13 allows ^1.26.0.
+  '@modelcontextprotocol/sdk@<1.32.0': '>=1.32.0 <2'
   browserslist@<4.28.7: '>=4.28.7 <5'
-  dompurify@<3.4.13: '>=3.4.13 <4'
-  fast-uri@<3.1.6: '>=3.1.6 <4'
-  hono@<4.12.34: '>=4.12.34 <5'
-  ip-address@<10.3.1: '>=10.3.1 <11'
+  dompurify@<3.4.17: '>=3.4.17 <4'
+  fast-uri@<3.1.8: '>=3.1.8 <4'
+  hono@<4.13.7: '>=4.13.7 <5'
+  # Address6 zone-identifier quadratic scan (GHSA-rxp7-6hxx-x8q5).
+  ip-address@<10.7.4: '>=10.7.4 <11'
+  # shadcn's dotenvx chain pulls systeminformation <=5.31 (Dependabot #121-#123).
+  systeminformation@<5.33.16: '>=5.33.16 <6'
   js-yaml@<4.3.1: '>=4.3.1 <5'
+  # KaTeX 0.11–0.18.1 is vulnerable to a prototype-pollution trust bypass.
+  katex@<0.18.2: '>=0.18.2 <0.19'
   lodash-es@<4.18.0: '>=4.18.0 <5'
+  # minimatch <11.0.1 globparts amplification DoS (GHSA-g3hv-75wg-m249).
+  minimatch@<11.0.1: '>=11.0.1 <12'
   mermaid@<11.16.1: '>=11.16.1 <12'
   # Scoped to 3.x: nanoid 5/6 are also installed and unaffected by the advisory.
   nanoid@<3.3.18: '>=3.3.18 <4'
   # Scoped to the vulnerable 4.x–5.1.15 range (Dependabot #42/#46/#47/#48).
   nanoid@>=4.0.0 <5.1.16: '>=5.1.16 <6'
   postcss@<8.5.23: '>=8.5.23'
-  qs@<6.16.0: '>=6.16.0 <7'
-  undici@<7.29.0: '>=7.29.0 <8'
-  '@hono/node-server@<1.19.17': '>=1.19.17 <2'
+  postcss-selector-parser@<7.1.6: '>=7.1.6 <8'
+  proxy-addr@<2.0.8: '>=2.0.8 <3'
+  qs@<6.16.1: '>=6.16.1 <7'
+  source-map-js@<1.2.2: '>=1.2.2 <2'
+  # shadcn 4.13 pins zod 3.25.76, which is below the patched 4.6.6.
+  zod@<4.6.6: '>=4.6.6 <5'
+  undici@<7.30.1: '>=7.30.1 <8'
   # Keep re-installs (e.g. pnpm patch-commit) from drifting the pinned types.
   '@types/react-dom': 19.2.3
+  # deepmerge has no patched release yet (GHSA-gcqx-w48m-w2h4); it only reaches
+  # the dev-only shadcn CLI, so there is nothing to override until 4.3.2 ships.
 patchedDependencies:
   '@embedpdf/ai@0.0.1': patches/@embedpdf__ai@0.0.1.patch
   '@embedpdf/engines@2.14.4': patches/@embedpdf__engines@2.14.4.patch
+  # Bind the failure callback so rejected deletes settle their Task instead
+  # of leaving the annotation commit permanently pending (ESM and CJS).
+  '@embedpdf/plugin-annotation@2.14.4': patches/@embedpdf__plugin-annotation@2.14.4.patch
+  # Release late worker opens when their registry is destroyed while loading.
+  '@embedpdf/plugin-document-manager@2.14.4': patches/@embedpdf__plugin-document-manager@2.14.4.patch
+  '@embedpdf/plugin-scroll@2.14.4': patches/@embedpdf__plugin-scroll@2.14.4.patch
+  '@embedpdf/plugin-selection@2.14.4': patches/@embedpdf__plugin-selection@2.14.4.patch
   '@embedpdf/plugin-tiling@2.14.4': patches/@embedpdf__plugin-tiling@2.14.4.patch
+  '@embedpdf/plugin-zoom@2.14.4': patches/@embedpdf__plugin-zoom@2.14.4.patch
+  # The heading IntersectionObserver was rebuilt on every scroll event, which
+  # showed up as a scrollbar thumb that would not follow a drag on macOS.
+  '@platejs/toc@53.0.0': patches/@platejs__toc@53.0.0.patch
+  # Clear native HTML5 overlays through their owners, including the shared
+  # anchor model; application-side DOM removal leaves stale internal handles.
+  dockview-core@7.0.4: patches/dockview-core@7.0.4.patch

@@ -30,13 +30,9 @@ const ERROR_SNIPPET_CHARS: usize = 180;
 
 static PROXY_URL: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 static SHARED_CLIENT: OnceLock<RwLock<Option<CachedClient>>> = OnceLock::new();
-/// Optional URL-prefix mirror for GitHub download hosts (Skill import, etc.).
-/// `None` = disabled. Value is a trimmed base without a trailing slash, e.g.
-/// `https://gh.llkk.cc` → requests become `{base}/https://codeload.github.com/...`.
-static GITHUB_MIRROR: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 /// Cached GitHub token discovered from environment variables or `gh auth token`.
 /// The token is never logged and is only attached to direct `api.github.com`
-/// requests, never to third-party mirror URLs.
+/// requests.
 static GITHUB_AUTH_TOKEN: OnceLock<RwLock<CachedGithubToken>> = OnceLock::new();
 /// (last detected OS system proxy, when it was checked). `None` timestamp =
 /// never checked.
@@ -93,10 +89,13 @@ fn cached_slot() -> &'static RwLock<Option<CachedClient>> {
     SHARED_CLIENT.get_or_init(|| RwLock::new(None))
 }
 
-/// The OS-wide ("system") proxy, if one is configured. reqwest only honors
-/// `HTTP_PROXY`-style env vars, so without this every Host request would
-/// bypass the system proxy that browsers and WebView2 use — the classic
-/// "browser works, app pages fail" split on Windows proxy clients.
+/// The Windows system proxy selected by Agentero's fallback policy.
+///
+/// Reqwest 0.12 also offers native discovery through `system-proxy`, but its
+/// matcher does not expose the selected URL for settings or child processes.
+/// Keep this small adapter for those consumers and our dynamic TTL; delegate
+/// URL validation and HTTP routing to `reqwest::Proxy::all`. Enabling native
+/// discovery here would also change macOS and per-scheme bypass behavior.
 pub fn system_proxy_url() -> Option<String> {
     #[cfg(windows)]
     {
@@ -215,7 +214,10 @@ pub fn shared_client() -> Result<reqwest::Client, AppError> {
             }
         }
     }
-    let client = client_builder()
+    // Build from the same snapshot used as the cache key. A settings change
+    // between two effective_proxy_url calls must not label a new client with
+    // the previous proxy.
+    let client = client_builder_with_proxy(proxy.as_deref())
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(8)
         .redirect(reqwest::redirect::Policy::limited(DEFAULT_REDIRECT_LIMIT))
@@ -242,10 +244,14 @@ pub fn shared_client() -> Result<reqwest::Client, AppError> {
 /// flow must deviate from their defaults (e.g. no timeout at all).
 pub fn client_builder() -> reqwest::ClientBuilder {
     let proxy = effective_proxy_url();
+    client_builder_with_proxy(proxy.as_deref())
+}
+
+fn client_builder_with_proxy(proxy: Option<&str>) -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder();
     match proxy {
-        Some(url) => match reqwest::Proxy::all(&url) {
-            Ok(proxy) => builder.proxy(proxy),
+        Some(url) => match reqwest::Proxy::all(url) {
+            Ok(proxy) => builder.proxy(proxy.no_proxy(loopback_bypass())),
             Err(error) => {
                 log::error!(target: "agentero::network", "invalid configured proxy: {error}");
                 builder
@@ -253,6 +259,13 @@ pub fn client_builder() -> reqwest::ClientBuilder {
         },
         None => builder,
     }
+}
+
+/// Loopback destinations never go through the proxy: a self-hosted service on
+/// this machine (MinerU behind an SSH tunnel, Ollama) is unreachable through a
+/// proxy in global mode, and the OS system proxy bypasses them too.
+fn loopback_bypass() -> Option<reqwest::NoProxy> {
+    reqwest::NoProxy::from_string("localhost,127.0.0.0/8,::1")
 }
 
 /// Standard Host HTTP client: [`USER_AGENT`], the configured proxy, `timeout`,
@@ -283,115 +296,7 @@ pub fn http_err_snippet(text: &str) -> String {
     text.chars().take(ERROR_SNIPPET_CHARS).collect()
 }
 
-fn github_mirror_slot() -> &'static RwLock<Option<String>> {
-    GITHUB_MIRROR.get_or_init(|| RwLock::new(None))
-}
-
-/// Enable / disable the process-wide GitHub URL-prefix mirror.
-///
-/// When `enabled` is true and `base_url` is non-empty, it must be an absolute
-/// `http`/`https` URL. Empty base while enabled soft-disables (no error) so the
-/// Settings switch can flip before the user pastes a mirror.
-pub fn configure_github_mirror(enabled: bool, base_url: &str) -> Result<(), AppError> {
-    let next = if enabled {
-        let normalized = base_url.trim().trim_end_matches('/').to_string();
-        if normalized.is_empty() {
-            None
-        } else {
-            Some(normalize_github_mirror_base(&normalized)?)
-        }
-    } else {
-        None
-    };
-    let mut guard = github_mirror_slot()
-        .write()
-        .map_err(|_| AppError::message("github mirror lock poisoned"))?;
-    *guard = next;
-    Ok(())
-}
-
-fn normalize_github_mirror_base(base: &str) -> Result<String, AppError> {
-    let parsed = url::Url::parse(base)
-        .map_err(|e| AppError::message(format!("invalid GitHub mirror URL: {e}")))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        other => {
-            return Err(AppError::message(format!(
-                "GitHub mirror URL must be http(s), got {other}"
-            )));
-        }
-    }
-    if parsed.host_str().is_none() {
-        return Err(AppError::message("GitHub mirror URL is missing a host"));
-    }
-    // Drop query/fragment; keep origin (+ optional non-root path without trailing /).
-    let mut out = format!(
-        "{}://{}",
-        parsed.scheme(),
-        parsed.host_str().unwrap_or_default()
-    );
-    if let Some(port) = parsed.port() {
-        out.push(':');
-        out.push_str(&port.to_string());
-    }
-    let path = parsed.path().trim_end_matches('/');
-    if !path.is_empty() && path != "/" {
-        out.push_str(path);
-    }
-    Ok(out)
-}
-
-/// Currently configured mirror base, if any.
-pub fn github_mirror_base() -> Option<String> {
-    github_mirror_slot().read().ok().and_then(|g| g.clone())
-}
-
-fn is_github_download_host(host: &str) -> bool {
-    matches!(
-        host,
-        "github.com"
-            | "api.github.com"
-            | "codeload.github.com"
-            | "raw.githubusercontent.com"
-            | "objects.githubusercontent.com"
-            | "gist.githubusercontent.com"
-    )
-}
-
-/// Prefix `canonical` with the mirror base (`{base}/{canonical}`).
-pub fn mirror_github_url(base: &str, canonical: &str) -> Option<String> {
-    let parsed = url::Url::parse(canonical).ok()?;
-    let host = parsed.host_str()?;
-    if !is_github_download_host(host) {
-        return None;
-    }
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return None;
-    }
-    let base = base.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return None;
-    }
-    Some(format!("{base}/{canonical}"))
-}
-
-/// Fetch candidates for a canonical GitHub URL: direct first, then mirror.
-pub fn github_url_candidates(canonical: &str) -> Vec<String> {
-    let mut out = vec![canonical.to_string()];
-    if let Some(base) = github_mirror_base() {
-        if let Some(mirrored) = mirror_github_url(&base, canonical) {
-            if mirrored != canonical {
-                out.push(mirrored);
-            }
-        }
-    }
-    out
-}
-
 /// Add the local GitHub CLI / env token to direct GitHub REST API requests.
-///
-/// Mirrors deliberately do not receive the token because URL-prefix mirrors are
-/// third-party hosts (`{base}/https://api.github.com/...`).
 pub fn with_github_api_auth(
     request: reqwest::RequestBuilder,
     url: &str,
@@ -445,10 +350,10 @@ fn discover_github_auth_token() -> Option<String> {
     }
 
     let gh = crate::process::resolve_command("gh")?;
-    let output = std::process::Command::new(gh)
-        .args(["auth", "token", "--hostname", "github.com"])
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new(gh);
+    command.args(["auth", "token", "--hostname", "github.com"]);
+    crate::process::hide_console_window(&mut command);
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -461,62 +366,41 @@ fn discover_github_auth_token() -> Option<String> {
     }
 }
 
-/// Whether an HTTP status should trigger trying the next GitHub mirror candidate.
-/// GitHub returns 403 for unauthenticated API quota exhaustion and some edge /
-/// regional blocks, so treat it like 429 here. Other client errors (404, etc.)
-/// are definitive and must not fall back.
-pub fn should_fallback_github_status(status: reqwest::StatusCode) -> bool {
-    is_retryable_github_status_code(status.as_u16())
-}
-
-fn is_retryable_github_status_code(code: u16) -> bool {
-    code == 403 || code == 429 || (500..600).contains(&code)
-}
-
-/// Classify `AppError` messages produced by Skill / download helpers for mirror
-/// fallback. Prefer status-aware helpers when the status is still in hand.
-pub fn should_fallback_github_error(err: &AppError) -> bool {
-    let msg = err.to_string();
-    if let Some(rest) = msg.strip_prefix("download HTTP ") {
-        let code = rest
-            .split(|c: char| c.is_whitespace() || c == '/')
-            .next()
-            .and_then(|s| s.parse::<u16>().ok());
-        return matches!(code, Some(c) if is_retryable_github_status_code(c));
-    }
-    if let Some(rest) = msg.strip_prefix("GitHub repository lookup failed: ") {
-        // `StatusCode` Display is like "502 Bad Gateway" or "404 Not Found".
-        let code = rest
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.parse::<u16>().ok());
-        return matches!(code, Some(c) if is_retryable_github_status_code(c));
-    }
-    if let Some(rest) = msg.strip_prefix("GitHub contents request failed: ") {
-        let code = rest
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.parse::<u16>().ok());
-        return matches!(code, Some(c) if is_retryable_github_status_code(c));
-    }
-    if let Some(rest) = msg.strip_prefix("GitHub blob request failed: ") {
-        let code = rest
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.parse::<u16>().ok());
-        return matches!(code, Some(c) if is_retryable_github_status_code(c));
-    }
-    msg.starts_with("download:")
-        || msg.starts_with("download body:")
-        || msg.starts_with("skill metadata request:")
-        || msg.starts_with("skill contents request:")
-        || msg.starts_with("skill blob request:")
-        || msg.starts_with("http client:")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #866: a loopback service answers even when the proxy is unreachable.
+    #[tokio::test]
+    async fn loopback_requests_bypass_the_proxy() {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = server.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+            }
+        });
+        // A proxy port nothing listens on: any proxied request fails.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        let client = client_builder_with_proxy(Some(&proxy))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let body = client
+            .get(format!("http://127.0.0.1:{port}/v1/health"))
+            .send()
+            .await
+            .expect("loopback request should not use the proxy")
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "ok");
+    }
 
     #[test]
     fn accepts_supported_proxy_urls() {
@@ -569,86 +453,10 @@ mod tests {
     }
 
     #[test]
-    fn normalize_github_mirror_base_strips_trailing_slash() {
-        assert_eq!(
-            normalize_github_mirror_base("https://gh.llkk.cc/").unwrap(),
-            "https://gh.llkk.cc"
-        );
-        assert_eq!(
-            normalize_github_mirror_base("https://example.test:8443/gh").unwrap(),
-            "https://example.test:8443/gh"
-        );
-    }
-
-    #[test]
-    fn rejects_non_http_github_mirror() {
-        let err = normalize_github_mirror_base("ftp://mirror.test").unwrap_err();
-        assert!(err.to_string().contains("http(s)"));
-    }
-
-    #[test]
-    fn github_url_candidates_direct_then_mirror() {
-        configure_github_mirror(false, "").unwrap();
-        let only = github_url_candidates("https://codeload.github.com/o/r/tar.gz/main");
-        assert_eq!(only.len(), 1);
-
-        configure_github_mirror(true, "https://gh.llkk.cc/").unwrap();
-        let both = github_url_candidates("https://api.github.com/repos/o/r");
-        assert_eq!(
-            both,
-            vec![
-                "https://api.github.com/repos/o/r".to_string(),
-                "https://gh.llkk.cc/https://api.github.com/repos/o/r".to_string(),
-            ]
-        );
-        // Non-GitHub hosts are never mirrored.
-        assert_eq!(github_url_candidates("https://example.com/x").len(), 1);
-        configure_github_mirror(false, "").unwrap();
-    }
-
-    #[test]
     fn github_api_auth_only_targets_direct_api_host() {
         assert!(is_direct_github_api_url("https://api.github.com/repos/o/r"));
         assert!(!is_direct_github_api_url(
-            "https://gh.llkk.cc/https://api.github.com/repos/o/r"
-        ));
-        assert!(!is_direct_github_api_url(
             "https://codeload.github.com/o/r/tar.gz/main"
         ));
-    }
-
-    #[test]
-    fn fallback_classifies_status_and_messages() {
-        assert!(should_fallback_github_status(
-            reqwest::StatusCode::TOO_MANY_REQUESTS
-        ));
-        assert!(should_fallback_github_status(
-            reqwest::StatusCode::BAD_GATEWAY
-        ));
-        assert!(should_fallback_github_status(
-            reqwest::StatusCode::FORBIDDEN
-        ));
-        assert!(!should_fallback_github_status(
-            reqwest::StatusCode::NOT_FOUND
-        ));
-
-        assert!(should_fallback_github_error(&AppError::message(
-            "download: error sending request"
-        )));
-        assert!(should_fallback_github_error(&AppError::message(
-            "download HTTP 502 Bad Gateway"
-        )));
-        assert!(should_fallback_github_error(&AppError::message(
-            "download HTTP 403 Forbidden"
-        )));
-        assert!(!should_fallback_github_error(&AppError::message(
-            "download HTTP 404 Not Found"
-        )));
-        assert!(should_fallback_github_error(&AppError::message(
-            "GitHub repository lookup failed: 403 Forbidden"
-        )));
-        assert!(!should_fallback_github_error(&AppError::message(
-            "GitHub repository lookup failed: 404 Not Found"
-        )));
     }
 }

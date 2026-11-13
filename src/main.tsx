@@ -2,11 +2,15 @@ import { ThemeProvider } from "next-themes";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import { HintModeProvider } from "@/components/shell/hint-mode-provider";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { errorText } from "@/lib/core/error";
 import { initLogger, logger } from "@/lib/core/logger";
-import { notifyAction, notifyError } from "@/lib/core/notify";
+import { notifyError, notifyReminder } from "@/lib/core/notify";
+import { openExternalUrl } from "@/lib/core/open-external";
+import { initPaintOptimizations } from "@/lib/core/paint-perf";
+import { perfActive, perfEmit } from "@/lib/core/perf";
 import { initAutoHideScrollbars } from "@/lib/core/scrollbars";
 import { isMobileApp, isTauri } from "@/lib/core/tauri";
 import {
@@ -20,11 +24,27 @@ import { initSettingsStore } from "@/lib/settings/react-store";
 import { applyNativeWindowTheme } from "@/lib/shell/native-window-theme";
 import { initShellLayoutFromPrefs } from "@/lib/shell/ui-store";
 import { applyUiTheme } from "@/lib/ui/theme";
-import { checkForUpdate, installAvailableUpdate } from "@/lib/update";
+import {
+	checkForUpdate,
+	getUpdateReleaseUrl,
+	installAvailableUpdate,
+} from "@/lib/update";
 import { initVaultStore } from "@/lib/vault/store";
 import { initWorkspaceStore } from "@/lib/workspace/store";
 import i18n, { applyLocale } from "./i18n";
 import "./index.css";
+
+window.addEventListener("error", (e) => {
+	const location = e.filename ? ` at ${e.filename}:${e.lineno}:${e.colno}` : "";
+	logger.error(`[window.error] ${e.message}${location}`);
+});
+window.addEventListener("unhandledrejection", (e) => {
+	const reason =
+		e.reason instanceof Error
+			? e.reason.stack || e.reason.message
+			: String(e.reason);
+	logger.error(`[unhandledrejection] ${reason}`);
+});
 
 const searchParams = new URLSearchParams(window.location.search);
 const windowKind = searchParams.get("window");
@@ -37,8 +57,12 @@ const isDocWindow = windowKind === "doc";
 // serial await chain and in dev every step is a module request, so a slow window
 // needs per-stage numbers to be actionable rather than guesswork.
 const bootElapsed = () => Math.round(performance.now());
+let bootMark = 0;
 function bootStage(name: string) {
-	logger.info(`boot stage=${name} ms=${bootElapsed()}`);
+	const now = bootElapsed();
+	logger.info(`boot stage=${name} ms=${now}`);
+	perfEmit(`boot.${name}`, (now - bootMark) * 1000);
+	bootMark = now;
 }
 
 async function boot() {
@@ -48,6 +72,8 @@ async function boot() {
 
 	// Host XDG settings.json (migrates legacy localStorage once).
 	await ensureSettingsLoaded();
+	// Every window must hydrate the React mirror before it can patch settings.
+	initSettingsStore();
 	bootStage("settings");
 	initSettingsSync();
 	const initialSettings = loadSettings();
@@ -79,10 +105,16 @@ async function boot() {
 		applyLocale(s.locale);
 	});
 	initAutoHideScrollbars();
+	initPaintOptimizations();
 	applyLocale(initialSettings.locale);
 	bootStage("i18n");
 
 	const root = document.getElementById("root") as HTMLElement;
+	// Every Tauri window is its own webview with its own document, so window
+	// level keyboard handling (F hint mode) only exists where it is mounted.
+	// The main window mounts `HintModeProvider` inside App.tsx; the settings,
+	// feature and doc roots below wrap theirs here. A new window root must do
+	// the same or `F` silently does nothing there.
 	if (isSettingsWindow) {
 		// Load the shell and the pane for the requested section together: the pane
 		// is behind `lazy()`, so leaving it until after render would stall the
@@ -99,7 +131,9 @@ async function boot() {
 				<I18nextProvider i18n={i18n}>
 					<ThemeProvider attribute="class" defaultTheme="system" enableSystem>
 						<TooltipProvider delayDuration={300}>
-							<SettingsNativeRoot />
+							<HintModeProvider>
+								<SettingsNativeRoot />
+							</HintModeProvider>
 							{/* Global error / notice stack (top-right); use notifyError from @/lib/notify */}
 							<Toaster />
 						</TooltipProvider>
@@ -129,7 +163,9 @@ async function boot() {
 				<I18nextProvider i18n={i18n}>
 					<ThemeProvider attribute="class" defaultTheme="system" enableSystem>
 						<TooltipProvider delayDuration={300}>
-							<FeatureWindowRoot />
+							<HintModeProvider>
+								<FeatureWindowRoot />
+							</HintModeProvider>
 							<SelectionChatPopover />
 							<Toaster />
 						</TooltipProvider>
@@ -167,7 +203,9 @@ async function boot() {
 								enableSystem
 							>
 								<TooltipProvider delayDuration={300}>
-									<DocWindowRoot />
+									<HintModeProvider>
+										<DocWindowRoot />
+									</HintModeProvider>
 									<SelectionChatPopover />
 									<Toaster />
 								</TooltipProvider>
@@ -197,7 +235,6 @@ async function boot() {
 			import("katex/dist/katex.min.css"),
 		]);
 	bootStage("app-module");
-	initSettingsStore();
 	initVaultStore();
 	initWorkspaceStore();
 	if (!isMobileApp()) initShellLayoutFromPrefs();
@@ -223,6 +260,8 @@ async function boot() {
 	logger.info(
 		`op end frontend_boot ok=true duration_ms=${bootElapsed()} window=main`,
 	);
+	perfEmit("frontend_boot", bootElapsed() * 1000, true, "window=main");
+	if (perfActive()) return;
 	void checkForStartupUpdate();
 	// After an in-app update relaunches the app, re-align the installed CLI
 	// shim with the new build (the updater only replaces the GUI package).
@@ -237,22 +276,21 @@ async function checkForStartupUpdate(): Promise<void> {
 	try {
 		const { getCurrentWindow } = await import("@tauri-apps/api/window");
 		if (getCurrentWindow().label !== "main") return;
-		const update = await checkForUpdate();
+		const update = await checkForUpdate({ retryOnTimeout: true });
 		if (update.phase !== "available" || !update.availableVersion) return;
-		notifyAction(
+		notifyReminder(
 			i18n.t("settings:about.update.toastTitle", {
 				version: update.availableVersion,
 			}),
 			{
 				id: "app-update-available",
 				description: i18n.t("settings:about.update.toastDescription"),
+				dismissLabel: i18n.t("settings:about.update.releaseNotes"),
+				onDismiss: () =>
+					openExternalUrl(getUpdateReleaseUrl(update.availableVersion)),
 				actionLabel: i18n.t("settings:about.update.downloadInstall"),
 				onAction: () => {
-					void installAvailableUpdate().then((next) => {
-						if (next.phase === "error") {
-							notifyError(i18n.t("settings:about.update.installFailed"));
-						}
-					});
+					void installAvailableUpdate();
 				},
 			},
 		);
@@ -275,9 +313,20 @@ async function syncInstalledCli(): Promise<void> {
 		const { getCurrentWindow } = await import("@tauri-apps/api/window");
 		if (getCurrentWindow().label !== "main") return;
 		const { syncInstalledCliWithApp } = await import("@/lib/cli/api");
-		if ((await syncInstalledCliWithApp()) === "failed") {
-			notifyError(i18n.t("settings:about.cli.syncFailed"));
+		// The updater publishes the desktop package and separate CLI archive
+		// independently. A just-relaunched app can reach the new desktop build
+		// before its matching CLI asset is downloadable, so retry an existing
+		// managed CLI instead of leaving it on the previous version forever.
+		for (const delayMs of [0, 15_000, 60_000]) {
+			if (delayMs > 0) {
+				await new Promise<void>((resolve) => {
+					window.setTimeout(resolve, delayMs);
+				});
+			}
+			const outcome = await syncInstalledCliWithApp();
+			if (outcome !== "failed") return;
 		}
+		notifyError(i18n.t("settings:about.cli.syncFailed"));
 	} catch (error) {
 		logger.warn("op end cli_sync ok=false", {
 			error: errorText(error),
